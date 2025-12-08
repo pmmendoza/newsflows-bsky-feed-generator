@@ -28,7 +28,7 @@ function buildPublisherPostsQuery(
   cursorOffset: number,
   limit: number
 ) {
-  const publisherDid = process.env.NEWSBOT_IR_DID || 'did:plc:toz4no26o2x4vsbum7cp4bxp';
+  const publisherDid = process.env.NEWSBOT_IR_DID || '';
   return db
     .selectFrom('post')
     .selectAll()
@@ -70,7 +70,7 @@ function buildFollowsPostsQuery(
   cursorOffset: number,
   limit: number
 ) {
-  const publisherDid = process.env.NEWSBOT_IR_DID || 'did:plc:toz4no26o2x4vsbum7cp4bxp';
+  const publisherDid = process.env.NEWSBOT_IR_DID || '';
   return db
     .selectFrom('post')
     .selectAll()

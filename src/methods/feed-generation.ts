@@ -28,7 +28,7 @@ export default function (server: Server, ctx: AppContext) {
     if (!enforceWhitelist) {
       // Open access mode - skip all authentication and whitelist checks
       console.warn(`[${new Date().toISOString()}] - Skipping whitelist check (open access mode)`);
-      const defaultDid = process.env.FEEDGEN_PUBLISHER_DID || 'did:plc:toz4no26o2x4vsbum7cp4bxp';
+      const defaultDid = process.env.FEEDGEN_PUBLISHER_DID || '';
       const body = await algo(ctx, params, defaultDid);
       return {
         encoding: 'application/json',

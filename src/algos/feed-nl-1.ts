@@ -47,7 +47,7 @@ function buildFollowsPostsQuery(
   cursorOffset: number,
   limit: number
 ) {
-  const publisherDid = process.env.NEWSBOT_NL_DID || 'did:plc:toz4no26o2x4vsbum7cp4bxp';
+  const publisherDid = process.env.NEWSBOT_NL_DID || '';
   return db
     .selectFrom('post')
     .selectAll()

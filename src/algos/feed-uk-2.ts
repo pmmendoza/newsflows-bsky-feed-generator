@@ -5,7 +5,7 @@ import { Kysely } from 'kysely'
 import { DatabaseSchema } from '../db/schema'
 
 // max 15 chars
-export const shortname = 'newsflow-ir-2'
+export const shortname = 'newsflow-uk-2'
 
 // Feed with priority ordering
 export const handler: FeedGenerator = async (ctx: AppContext, params: QueryParams, requesterDid: string) => {
@@ -27,7 +27,7 @@ function buildPublisherPostsQuery(
   cursorOffset: number,
   limit: number
 ) {
-  const publisherDid = process.env.NEWSBOT_IR_DID || '';
+  const publisherDid = process.env.NEWSBOT_UK_DID || '';
   return db
     .selectFrom('post')
     .selectAll()
@@ -51,7 +51,7 @@ function buildFollowsPostsQuery(
   cursorOffset: number,
   limit: number
 ) {
-  const publisherDid = process.env.NEWSBOT_IR_DID || '';
+  const publisherDid = process.env.NEWSBOT_UK_DID || '';
   return db
     .selectFrom('post')
     .selectAll()

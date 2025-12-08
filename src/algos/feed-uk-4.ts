@@ -3,11 +3,12 @@ import { AppContext } from '../config'
 import { buildFeed, FeedGenerator } from './feed-builder'
 import { Kysely } from 'kysely'
 import { DatabaseSchema } from '../db/schema'
+import { sql } from 'kysely';
 
 // max 15 chars
-export const shortname = 'newsflow-ir-2'
+export const shortname = 'newsflow-uk-4'
 
-// Feed with priority ordering
+// Feed with engagement-based and priority ordering
 export const handler: FeedGenerator = async (ctx: AppContext, params: QueryParams, requesterDid: string) => {
   return buildFeed({
     shortname,
@@ -19,7 +20,7 @@ export const handler: FeedGenerator = async (ctx: AppContext, params: QueryParam
   });
 };
 
-// Publisher posts query builder - with priority
+// Publisher posts query builder - with engagement and priority
 function buildPublisherPostsQuery(
   db: Kysely<DatabaseSchema>,
   timeLimit: string,
@@ -27,13 +28,17 @@ function buildPublisherPostsQuery(
   cursorOffset: number,
   limit: number
 ) {
-  const publisherDid = process.env.NEWSBOT_IR_DID || '';
+  const publisherDid = process.env.NEWSBOT_UK_DID || '';
   return db
     .selectFrom('post')
     .selectAll()
     .where('author', '=', publisherDid)
     .where('post.indexedAt', '>=', timeLimit)
-    // Order by priority first, then by recency
+    // Order by engagement, priority, then recency
+    .orderBy(
+      sql`COALESCE((COALESCE(likes_count, 0) + COALESCE(repost_count, 0) * 1.5 + COALESCE(comments_count, 0)), 0)`,
+      'desc'
+    )
     .orderBy((eb) => 
       eb.fn('coalesce', [eb.ref('priority'), eb.val(0)]), 'desc'
     )
@@ -43,7 +48,7 @@ function buildPublisherPostsQuery(
     .limit(limit);
 }
 
-// Follows posts query builder - with priority
+// Follows posts query builder - with engagement and priority
 function buildFollowsPostsQuery(
   db: Kysely<DatabaseSchema>,
   timeLimit: string,
@@ -51,18 +56,21 @@ function buildFollowsPostsQuery(
   cursorOffset: number,
   limit: number
 ) {
-  const publisherDid = process.env.NEWSBOT_IR_DID || '';
+  const publisherDid = process.env.NEWSBOT_UK_DID || '';
   return db
     .selectFrom('post')
     .selectAll()
     .where('author', '!=', publisherDid)
     .where('post.indexedAt', '>=', timeLimit)
     .where((eb) => eb('author', 'in', requesterFollows))
-    // Order by priority first, then by recency
+    // Order by engagement, priority, then recency
+    .orderBy(
+      sql`COALESCE((COALESCE(likes_count, 0) + COALESCE(repost_count, 0) * 1.5 + COALESCE(comments_count, 0)), 0)`,
+      'desc'
+    )
     .orderBy((eb) => 
       eb.fn('coalesce', [eb.ref('priority'), eb.val(0)]), 'desc'
     )
-    // Then by most recent
     .orderBy('indexedAt', 'desc')
     .orderBy('cid', 'desc')
     .offset(cursorOffset)

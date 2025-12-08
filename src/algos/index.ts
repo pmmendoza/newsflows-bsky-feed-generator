@@ -28,6 +28,12 @@ import * as feedCZ2 from './feed-cz-2'
 import * as feedCZ3 from './feed-cz-3'
 import * as feedCZ4 from './feed-cz-4'
 
+// UK
+import * as feedUK1 from './feed-uk-1'
+import * as feedUK2 from './feed-uk-2'
+import * as feedUK3 from './feed-uk-3'
+import * as feedUK4 from './feed-uk-4'
+
 type AlgoHandler = (ctx: AppContext, params: QueryParams, requesterDid: string) => Promise<AlgoOutput>
 
 const algos: Record<string, AlgoHandler> = {
@@ -54,6 +60,12 @@ const algos: Record<string, AlgoHandler> = {
     [feedCZ2.shortname]: feedCZ2.handler,
     [feedCZ3.shortname]: feedCZ3.handler,
     [feedCZ4.shortname]: feedCZ4.handler,
+
+    // UK
+    [feedUK1.shortname]: feedUK1.handler,
+    [feedUK2.shortname]: feedUK2.handler,
+    [feedUK3.shortname]: feedUK3.handler,
+    [feedUK4.shortname]: feedUK4.handler,
 }
 
 export default algos

@@ -3,7 +3,8 @@ accounts <- c(
   "news-flows-nl.rds",
   "news-flows-ir.rds",
   "news-flows-fr.rds",
-  "news-flows-cz.rds"
+  "news-flows-cz.rds",
+  "news-flows-uk.rds"
 )
 
 account <- accounts[1]
@@ -124,6 +125,59 @@ for (i in 1:3) {
       did = "did:web:feeds.jbgruber.online",
       displayName = paste0("novinekinfuze-", i),
       description = "Vaše příspěvky s extra českými zprávami",
+      createdAt = format.POSIXct(
+        Sys.time() - i * 60,
+        "%Y-%m-%dT%H:%M:%OS3%ZZ",
+        tz = "Z"
+      ),
+      contentMode = "app.bsky.feed.defs#contentModeUnspecified"
+    ),
+    validate = TRUE,
+    .token = tok
+  )
+
+  out <- atrrr:::make_request(
+    name = "bsky.social/xrpc/com.atproto.repo.putRecord",
+    params = params,
+    req_method = "POST"
+  )
+  message(paste("Feed", i, out$validationStatus))
+}
+
+
+## Delete feeds (if they need to be recreated)
+if (FALSE) {
+  df <- get_feeds_created_by(tok$handle, .token = tok)
+
+  rkeys <- df$uri |>
+    stringr::str_remove(".+/")
+
+  for (rkey in rkeys) {
+    out <- atrrr:::com_atproto_repo_delete_record(
+      repo = repo,
+      collection = "app.bsky.feed.generator",
+      rkey = rkey,
+      .token = tok
+    )
+    message("Feed ", rkey, " deleted")
+  }
+}
+
+account <- accounts[5]
+tok <- file.path(tools::R_user_dir("atrrr", "cache"), account) |>
+  atrrr:::read_token()
+repo <- tok$did
+message(tok$handle)
+
+for (i in 1:3) {
+  params <- list(
+    repo = repo,
+    collection = "app.bsky.feed.generator",
+    rkey = paste0("newsflow-uk-", i),
+    record = list(
+      did = "did:web:feeds.jbgruber.online",
+      displayName = paste0("newsinfusion-", i),
+      description = "Your Posts with extra UK News",
       createdAt = format.POSIXct(
         Sys.time() - i * 60,
         "%Y-%m-%dT%H:%M:%OS3%ZZ",

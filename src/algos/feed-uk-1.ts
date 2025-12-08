@@ -5,9 +5,9 @@ import { Kysely } from 'kysely'
 import { DatabaseSchema } from '../db/schema'
 
 // max 15 chars
-export const shortname = 'newsflow-ir-2'
+export const shortname = 'newsflow-uk-1'
 
-// Feed with priority ordering
+// Simple chronological feed with no special ordering
 export const handler: FeedGenerator = async (ctx: AppContext, params: QueryParams, requesterDid: string) => {
   return buildFeed({
     shortname,
@@ -19,7 +19,7 @@ export const handler: FeedGenerator = async (ctx: AppContext, params: QueryParam
   });
 };
 
-// Publisher posts query builder - with priority
+// Publisher posts query builder - chronological
 function buildPublisherPostsQuery(
   db: Kysely<DatabaseSchema>,
   timeLimit: string,
@@ -27,23 +27,19 @@ function buildPublisherPostsQuery(
   cursorOffset: number,
   limit: number
 ) {
-  const publisherDid = process.env.NEWSBOT_IR_DID || '';
+  const publisherDid = process.env.NEWSBOT_UK_DID || '';
   return db
     .selectFrom('post')
     .selectAll()
     .where('author', '=', publisherDid)
     .where('post.indexedAt', '>=', timeLimit)
-    // Order by priority first, then by recency
-    .orderBy((eb) => 
-      eb.fn('coalesce', [eb.ref('priority'), eb.val(0)]), 'desc'
-    )
     .orderBy('indexedAt', 'desc')
     .orderBy('cid', 'desc')
     .offset(cursorOffset)
     .limit(limit);
 }
 
-// Follows posts query builder - with priority
+// Follows posts query builder - chronological
 function buildFollowsPostsQuery(
   db: Kysely<DatabaseSchema>,
   timeLimit: string,
@@ -51,18 +47,13 @@ function buildFollowsPostsQuery(
   cursorOffset: number,
   limit: number
 ) {
-  const publisherDid = process.env.NEWSBOT_IR_DID || '';
+  const publisherDid = process.env.NEWSBOT_UK_DID || '';
   return db
     .selectFrom('post')
     .selectAll()
     .where('author', '!=', publisherDid)
     .where('post.indexedAt', '>=', timeLimit)
     .where((eb) => eb('author', 'in', requesterFollows))
-    // Order by priority first, then by recency
-    .orderBy((eb) => 
-      eb.fn('coalesce', [eb.ref('priority'), eb.val(0)]), 'desc'
-    )
-    // Then by most recent
     .orderBy('indexedAt', 'desc')
     .orderBy('cid', 'desc')
     .offset(cursorOffset)
