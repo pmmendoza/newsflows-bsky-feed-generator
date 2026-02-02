@@ -15,6 +15,8 @@ import { Database } from '../db'
 
 export abstract class FirehoseSubscriptionBase {
   public sub: Subscription<RepoEvent>
+  private hasLoggedStartCursor = false
+  private hasPersistedCursor = false
 
   constructor(public db: Database, public service: string) {
     this.sub = new Subscription({
@@ -38,6 +40,28 @@ export abstract class FirehoseSubscriptionBase {
 
   async run(subscriptionReconnectDelay: number) {
     try {
+      if (!this.hasLoggedStartCursor) {
+        try {
+          const start = await this.getCursor()
+          if (typeof start.cursor === 'number') {
+            console.log(
+              `[${this.service}] Starting repo subscription from cursor ${start.cursor}`,
+            )
+          } else {
+            console.log(
+              `[${this.service}] No stored cursor; starting repo subscription without cursor`,
+            )
+          }
+        } catch (err) {
+          console.error(
+            `[${this.service}] Failed to read stored cursor; starting without cursor`,
+            err,
+          )
+        } finally {
+          this.hasLoggedStartCursor = true
+        }
+      }
+
       for await (const evt of this.sub) {
         this.handleEvent(evt).catch((err) => {
           console.error('repo subscription could not handle message', err)
@@ -57,12 +81,19 @@ export abstract class FirehoseSubscriptionBase {
   }
 
   async updateCursor(cursor: number) {
-    const bigintCursor = BigInt(cursor);
+    const bigintCursor = BigInt(cursor)
     await this.db
-      .updateTable('sub_state')
-      .set({ cursor: bigintCursor })
-      .where('service', '=', this.service)
+      .insertInto('sub_state')
+      .values({ service: this.service, cursor: bigintCursor })
+      .onConflict((oc) => oc.column('service').doUpdateSet({ cursor: bigintCursor }))
       .execute()
+
+    if (!this.hasPersistedCursor) {
+      this.hasPersistedCursor = true
+      console.log(`[${this.service}] Persisted cursor ${cursor}`)
+    } else if (cursor % 10000 === 0) {
+      console.log(`[${this.service}] Persisted cursor ${cursor}`)
+    }
   }
 
   async getCursor(): Promise<{ cursor?: number }> {
