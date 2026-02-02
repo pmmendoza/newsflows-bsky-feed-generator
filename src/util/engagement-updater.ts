@@ -26,6 +26,18 @@ export async function updateEngagement(db: Database): Promise<void> {
     parseInt(process.env.ENGAGEMENT_TIME_HOURS, 10) : 72;
   const timeLimit = new Date(Date.now() - engagementTimeHours * 60 * 60 * 1000).toISOString();
   try {
+    // Postgres supports at most 65535 bind params. Kysely binds one param per array element for `IN (...)`.
+    // Chunk large URI lists to avoid protocol errors at scale.
+    const IN_CLAUSE_CHUNK_SIZE = 50000;
+    const execInChunks = async <T>(items: string[], fn: (chunk: string[]) => Promise<T[]>): Promise<T[]> => {
+      const results: T[] = [];
+      for (let i = 0; i < items.length; i += IN_CLAUSE_CHUNK_SIZE) {
+        const chunk = items.slice(i, i + IN_CLAUSE_CHUNK_SIZE);
+        results.push(...(await fn(chunk)));
+      }
+      return results;
+    };
+
     console.log(`[${new Date().toISOString()}] - Starting update of subscriber engagement (last ${engagementTimeHours} hours)...`);
 
     // Get newsbot DIDs to identify publisher posts
@@ -86,85 +98,109 @@ export async function updateEngagement(db: Database): Promise<void> {
 
     // Count likes for each post
     // For other posts: count all engagement
-    const otherLikesResult = otherPostUris.length > 0 ? await db
-      .selectFrom('engagement')
-      .where('engagement.subjectUri', 'in', otherPostUris)
-      .where('engagement.type', '=', 2) // Type 2 is for likes
-      .select([
-        'engagement.subjectUri as uri',
-        db.fn.count<number>('uri').as('count')
-      ])
-      .groupBy('engagement.subjectUri')
-      .execute() : [];
+    const otherLikesResult = otherPostUris.length > 0
+      ? await execInChunks(otherPostUris, async (chunk) => {
+        return db
+          .selectFrom('engagement')
+          .where('engagement.subjectUri', 'in', chunk)
+          .where('engagement.type', '=', 2) // Type 2 is for likes
+          .select([
+            'engagement.subjectUri as uri',
+            db.fn.count<number>('uri').as('count')
+          ])
+          .groupBy('engagement.subjectUri')
+          .execute();
+      })
+      : [];
 
     // For publisher posts: only count engagement from subscribers
-    const publisherLikesResult = (publisherPostUris.length > 0 && subscriberDids.length > 0) ? await db
-      .selectFrom('engagement')
-      .where('engagement.subjectUri', 'in', publisherPostUris)
-      .where('engagement.author', 'in', subscriberDids)
-      .where('engagement.type', '=', 2) // Type 2 is for likes
-      .select([
-        'engagement.subjectUri as uri',
-        db.fn.count<number>('uri').as('count')
-      ])
-      .groupBy('engagement.subjectUri')
-      .execute() : [];
+    const publisherLikesResult = (publisherPostUris.length > 0 && subscriberDids.length > 0)
+      ? await execInChunks(publisherPostUris, async (chunk) => {
+        return db
+          .selectFrom('engagement')
+          .where('engagement.subjectUri', 'in', chunk)
+          .where('engagement.author', 'in', subscriberDids)
+          .where('engagement.type', '=', 2) // Type 2 is for likes
+          .select([
+            'engagement.subjectUri as uri',
+            db.fn.count<number>('uri').as('count')
+          ])
+          .groupBy('engagement.subjectUri')
+          .execute();
+      })
+      : [];
 
     const likeCountsResult = [...otherLikesResult, ...publisherLikesResult];
 
     // Count reposts for each post
     // For other posts: count all engagement
-    const otherRepostsResult = otherPostUris.length > 0 ? await db
-      .selectFrom('engagement')
-      .where('engagement.subjectUri', 'in', otherPostUris)
-      .where('engagement.type', '=', 1) // Type 1 is for reposts
-      .select([
-        'engagement.subjectUri as uri',
-        db.fn.count<number>('uri').as('count')
-      ])
-      .groupBy('engagement.subjectUri')
-      .execute() : [];
+    const otherRepostsResult = otherPostUris.length > 0
+      ? await execInChunks(otherPostUris, async (chunk) => {
+        return db
+          .selectFrom('engagement')
+          .where('engagement.subjectUri', 'in', chunk)
+          .where('engagement.type', '=', 1) // Type 1 is for reposts
+          .select([
+            'engagement.subjectUri as uri',
+            db.fn.count<number>('uri').as('count')
+          ])
+          .groupBy('engagement.subjectUri')
+          .execute();
+      })
+      : [];
 
     // For publisher posts: only count engagement from subscribers
-    const publisherRepostsResult = (publisherPostUris.length > 0 && subscriberDids.length > 0) ? await db
-      .selectFrom('engagement')
-      .where('engagement.subjectUri', 'in', publisherPostUris)
-      .where('engagement.author', 'in', subscriberDids)
-      .where('engagement.type', '=', 1) // Type 1 is for reposts
-      .select([
-        'engagement.subjectUri as uri',
-        db.fn.count<number>('uri').as('count')
-      ])
-      .groupBy('engagement.subjectUri')
-      .execute() : [];
+    const publisherRepostsResult = (publisherPostUris.length > 0 && subscriberDids.length > 0)
+      ? await execInChunks(publisherPostUris, async (chunk) => {
+        return db
+          .selectFrom('engagement')
+          .where('engagement.subjectUri', 'in', chunk)
+          .where('engagement.author', 'in', subscriberDids)
+          .where('engagement.type', '=', 1) // Type 1 is for reposts
+          .select([
+            'engagement.subjectUri as uri',
+            db.fn.count<number>('uri').as('count')
+          ])
+          .groupBy('engagement.subjectUri')
+          .execute();
+      })
+      : [];
 
     const repostCountsResult = [...otherRepostsResult, ...publisherRepostsResult];
 
     // Count comments for each post (comments are posts with rootUri pointing to the original post)
     // For other posts: count all comments
-    const otherCommentsResult = otherPostUris.length > 0 ? await db
-      .selectFrom('post as comments')
-      .where('comments.rootUri', 'in', otherPostUris)
-      .where('comments.rootUri', '!=', '') // Ensure it's a real comment
-      .select([
-        'comments.rootUri as uri',
-        db.fn.count<number>('uri').as('count')
-      ])
-      .groupBy('comments.rootUri')
-      .execute() : [];
+    const otherCommentsResult = otherPostUris.length > 0
+      ? await execInChunks(otherPostUris, async (chunk) => {
+        return db
+          .selectFrom('post as comments')
+          .where('comments.rootUri', 'in', chunk)
+          .where('comments.rootUri', '!=', '') // Ensure it's a real comment
+          .select([
+            'comments.rootUri as uri',
+            db.fn.count<number>('uri').as('count')
+          ])
+          .groupBy('comments.rootUri')
+          .execute();
+      })
+      : [];
 
     // For publisher posts: only count comments from subscribers
-    const publisherCommentsResult = (publisherPostUris.length > 0 && subscriberDids.length > 0) ? await db
-      .selectFrom('post as comments')
-      .where('comments.rootUri', 'in', publisherPostUris)
-      .where('comments.author', 'in', subscriberDids)
-      .where('comments.rootUri', '!=', '') // Ensure it's a real comment
-      .select([
-        'comments.rootUri as uri',
-        db.fn.count<number>('uri').as('count')
-      ])
-      .groupBy('comments.rootUri')
-      .execute() : [];
+    const publisherCommentsResult = (publisherPostUris.length > 0 && subscriberDids.length > 0)
+      ? await execInChunks(publisherPostUris, async (chunk) => {
+        return db
+          .selectFrom('post as comments')
+          .where('comments.rootUri', 'in', chunk)
+          .where('comments.author', 'in', subscriberDids)
+          .where('comments.rootUri', '!=', '') // Ensure it's a real comment
+          .select([
+            'comments.rootUri as uri',
+            db.fn.count<number>('uri').as('count')
+          ])
+          .groupBy('comments.rootUri')
+          .execute();
+      })
+      : [];
 
     const commentCountsResult = [...otherCommentsResult, ...publisherCommentsResult];
 
