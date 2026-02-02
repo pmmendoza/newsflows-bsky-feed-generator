@@ -51,3 +51,8 @@ docker-compose down && \
 ``` bash
 docker image push jbgruber/bsky-feedgen:latest
 ```
+
+## Fork changelog (pmmendoza)
+
+- **2026-02-02** — Fix `updateEngagement()` Postgres bind-parameter overflow by chunking large URI lists in engagement/comment rollups. This prevents `08P01` crashes and allows `post.likes_count/repost_count/comments_count` to refresh correctly (branch `fix/update-engagement-parameter-limit`, commit `11ad8aa6b63ebae4f62d439b3c5f22304f87fe0f`).
+- **Validation** — Deployed and verified on `newsflowsserver1` (188.34.141.44): `POST /api/update-engagement` completed (76,054 posts processed), `08P01` errors stopped, and “smoking gun” test URIs updated `likes_count 0 → 1` (see internal deployment audit: `NEWSFLOWS/health-checks/dev/audit/feedgen_pr1_verification_20260202_151937Z/DEPLOYMENT_AUDIT_REPORT.md`).
