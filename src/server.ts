@@ -15,7 +15,7 @@ import { createDb, Database, migrateToLatest } from './db'
 import { FirehoseSubscription } from './subscription'
 import { AppContext, Config } from './config'
 import wellKnown from './well-known'
-import { setupFollowsUpdateScheduler, setupEngagmentUpdateScheduler, setupDailyFullSyncScheduler, stopAllSchedulers } from './util/scheduled-updater'
+import { setupFollowsUpdateScheduler, setupEngagmentUpdateScheduler, setupDailyFullSyncScheduler, setupRetentionScheduler, stopAllSchedulers } from './util/scheduled-updater'
 
 export class FeedGenerator {
   public app: express.Application
@@ -116,6 +116,13 @@ export class FeedGenerator {
 
     // Set up daily full sync at 4:00 AM to remove unfollowed accounts
     setupDailyFullSyncScheduler(this.db);
+
+    // Optional retention (TTL deletes) to bound storage growth
+    if (process.env.FEEDGEN_RETENTION_ENABLED === 'true') {
+      const retentionIntervalMs = parseInt(process.env.FEEDGEN_RETENTION_INTERVAL_MS || '', 10) || 6 * 60 * 60 * 1000;
+      console.log(`[${new Date().toISOString()}] - Retention enabled; running every ${Math.round(retentionIntervalMs / 1000 / 60)} minutes`);
+      setupRetentionScheduler(this.db, retentionIntervalMs);
+    }
 
     return this.server
   }
