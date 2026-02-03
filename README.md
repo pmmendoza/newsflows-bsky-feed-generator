@@ -46,6 +46,14 @@ docker-compose down && \
   docker-compose up -d
 ```
 
+### Production note (docker-compose-deploy.yml)
+
+On `newsflowsserver1`, we use a separate `docker-compose-deploy.yml` (gitignored) that **explicitly lists** environment variables instead of inheriting the full `.env`.
+
+When adding new env vars (e.g. `STUDY_*` for the study endpoints), update **both**:
+- `docker-compose.yml` (tracked, for dev/portable deploys)
+- `docker-compose-deploy.yml` (server-only)
+
 # Upload to dockerhub (for Contributors)
 
 ``` bash
