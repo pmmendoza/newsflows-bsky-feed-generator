@@ -38,11 +38,12 @@ function buildPublisherPostsQuery(
     // Order by time-decayed engagement score, then by recency
     .orderBy(
       sql`
-        -- Base engagement score (likes + weighted reposts + comments)
+        -- Base engagement score (likes + reposts + comments + quotes)
         COALESCE(
           (COALESCE(likes_count, 0) + 
-           COALESCE(repost_count, 0) * 1.5 + 
-           COALESCE(comments_count, 0)), 
+           COALESCE(repost_count, 0) + 
+           COALESCE(comments_count, 0) +
+           COALESCE(quote_count, 0)),
           0
         ) 
         * 
@@ -80,11 +81,12 @@ function buildFollowsPostsQuery(
     // Order by time-decayed engagement score, then by recency
     .orderBy(
       sql`
-        -- Base engagement score (likes + weighted reposts + comments)
+        -- Base engagement score (likes + reposts + comments + quotes)
         COALESCE(
           (COALESCE(likes_count, 0) + 
-           COALESCE(repost_count, 0) * 1.5 + 
-           COALESCE(comments_count, 0)), 
+           COALESCE(repost_count, 0) + 
+           COALESCE(comments_count, 0) +
+           COALESCE(quote_count, 0)),
           0
         ) 
         * 

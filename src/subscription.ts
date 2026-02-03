@@ -16,6 +16,32 @@ function isExternalEmbed(embed: any): embed is { external: { uri: string, title:
   return embed && embed.external && typeof embed.external.uri === 'string';
 }
 
+function isPostUri(uri: string): boolean {
+  return /^at:\/\/[^/]+\/app\.bsky\.feed\.post\//.test(uri)
+}
+
+function getQuotedRecord(embed: any): { uri: string; cid: string } | null {
+  if (!embed) return null
+
+  const direct = embed.record
+  if (direct && typeof direct.uri === 'string') {
+    return {
+      uri: direct.uri,
+      cid: typeof direct.cid === 'string' ? direct.cid : '',
+    }
+  }
+
+  const withMedia = embed.record?.record
+  if (withMedia && typeof withMedia.uri === 'string') {
+    return {
+      uri: withMedia.uri,
+      cid: typeof withMedia.cid === 'string' ? withMedia.cid : '',
+    }
+  }
+
+  return null
+}
+
 // Helper function to sanitize strings for PostgreSQL
 function sanitizeForPostgres(text: string | null | undefined): string {
   if (text === null || text === undefined) return '';
@@ -59,9 +85,17 @@ export class FirehoseSubscription extends FirehoseSubscriptionBase {
     const shouldStoreEngagement = (
       create: { author: string; record: any },
     ): boolean => {
+      const subjectUri = create.record?.subject?.uri
+      return shouldStoreEngagementFor(create.author, subjectUri)
+    }
+
+    const shouldStoreEngagementFor = (
+      author: string,
+      subjectUri: string | null | undefined,
+    ): boolean => {
+      if (!subjectUri || !isPostUri(subjectUri)) return false
       if (!scopedIngestion || !scope) return true
 
-      const subjectUri = create.record?.subject?.uri
       const subjectDid = didFromAtUri(subjectUri)
       if (subjectDid && scope.allowlistedAuthorDids.has(subjectDid)) {
         if (
@@ -69,12 +103,27 @@ export class FirehoseSubscription extends FirehoseSubscriptionBase {
           scope.publisherDids.has(subjectDid) &&
           scope.subscriberDids.size > 0
         ) {
-          return scope.subscriberDids.has(create.author)
+          return scope.subscriberDids.has(author)
         }
         return true
       }
 
-      if (trackSubscriberActivity && scope.subscriberDids.has(create.author)) return true
+      if (trackSubscriberActivity && scope.subscriberDids.has(author)) return true
+
+      return false
+    }
+
+    const shouldStoreQuoteEngagement = (
+      author: string,
+      subjectUri: string | null | undefined,
+    ): boolean => {
+      if (!subjectUri || !isPostUri(subjectUri)) return false
+      if (!scopedIngestion || !scope) return true
+
+      if (trackSubscriberActivity && scope.subscriberDids.has(author)) return true
+
+      const subjectDid = didFromAtUri(subjectUri)
+      if (subjectDid && scope.publisherDids.has(subjectDid)) return true
 
       return false
     }
@@ -112,9 +161,11 @@ export class FirehoseSubscription extends FirehoseSubscriptionBase {
       })
 
       
-    // likes + reposts = engagement
+    // likes + reposts + quotes = engagement
     const engagementsToDelete = ops.reposts.deletes.map((del) => del.uri).concat(
       ops.likes.deletes.map((del) => del.uri)
+    ).concat(
+      ops.posts.deletes.map((del) => del.uri)
     )
     const engagementsToCreate = ops.reposts.creates
       .filter(shouldStoreEngagement)
@@ -143,6 +194,23 @@ export class FirehoseSubscription extends FirehoseSubscriptionBase {
               createdAt: create.record.createdAt,
               author: create.author,
             }
+          })
+      ).concat(
+        ops.posts.creates
+          .flatMap((create) => {
+            const quoted = getQuotedRecord(create.record?.embed)
+            if (!quoted) return []
+            if (!shouldStoreQuoteEngagement(create.author, quoted.uri)) return []
+            return [{
+              uri: create.uri,
+              cid: create.cid,
+              subjectUri: quoted.uri,
+              subjectCid: quoted.cid,
+              type: 3,
+              indexedAt: new Date().toISOString(),
+              createdAt: create.record.createdAt,
+              author: create.author,
+            }]
           })
       )
 
