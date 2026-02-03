@@ -3,6 +3,13 @@ import {
   isCommit,
 } from './lexicon/types/com/atproto/sync/subscribeRepos'
 import { FirehoseSubscriptionBase, getOpsByType } from './util/subscription'
+import {
+  didFromAtUri,
+  getIngestionScope,
+  scopedIngestionEnabled,
+  trackSubscriberActivityEnabled,
+  restrictPublisherEngagementToSubscribersEnabled,
+} from './util/ingestion-scope'
 
 // for saving embedded preview cards
 function isExternalEmbed(embed: any): embed is { external: { uri: string, title: string, description: string } } {
@@ -22,6 +29,56 @@ export class FirehoseSubscription extends FirehoseSubscriptionBase {
 
     const ops = await getOpsByType(evt)
 
+    const scopedIngestion = scopedIngestionEnabled()
+    const trackSubscriberActivity = scopedIngestion && trackSubscriberActivityEnabled()
+    const restrictPublisherEngagementToSubscribers =
+      scopedIngestion && restrictPublisherEngagementToSubscribersEnabled()
+
+    const scope =
+      scopedIngestion || trackSubscriberActivity || restrictPublisherEngagementToSubscribers
+        ? await getIngestionScope(this.db)
+        : null
+
+    const shouldStorePost = (create: { author: string; record: any }): boolean => {
+      if (!scopedIngestion || !scope) return true
+
+      if (scope.allowlistedAuthorDids.has(create.author)) return true
+
+      const reply = create.record?.reply
+      const rootDid = didFromAtUri(reply?.root?.uri)
+      const parentDid = didFromAtUri(reply?.parent?.uri)
+
+      if (rootDid && scope.allowlistedAuthorDids.has(rootDid)) return true
+      if (parentDid && scope.allowlistedAuthorDids.has(parentDid)) return true
+
+      if (trackSubscriberActivity && scope.subscriberDids.has(create.author)) return true
+
+      return false
+    }
+
+    const shouldStoreEngagement = (
+      create: { author: string; record: any },
+    ): boolean => {
+      if (!scopedIngestion || !scope) return true
+
+      const subjectUri = create.record?.subject?.uri
+      const subjectDid = didFromAtUri(subjectUri)
+      if (subjectDid && scope.allowlistedAuthorDids.has(subjectDid)) {
+        if (
+          restrictPublisherEngagementToSubscribers &&
+          scope.publisherDids.has(subjectDid) &&
+          scope.subscriberDids.size > 0
+        ) {
+          return scope.subscriberDids.has(create.author)
+        }
+        return true
+      }
+
+      if (trackSubscriberActivity && scope.subscriberDids.has(create.author)) return true
+
+      return false
+    }
+
     // This logs the text of every post off the firehose.
     // Just for fun :)
     // Delete before actually using
@@ -32,6 +89,7 @@ export class FirehoseSubscription extends FirehoseSubscriptionBase {
 
     const postsToDelete = ops.posts.deletes.map((del) => del.uri)
     const postsToCreate = ops.posts.creates
+      .filter(shouldStorePost)
       .map((create) => {
         return {
           uri: create.uri,
@@ -59,6 +117,7 @@ export class FirehoseSubscription extends FirehoseSubscriptionBase {
       ops.likes.deletes.map((del) => del.uri)
     )
     const engagementsToCreate = ops.reposts.creates
+      .filter(shouldStoreEngagement)
       .map((create) => {
         return {
           uri: create.uri,
@@ -72,6 +131,7 @@ export class FirehoseSubscription extends FirehoseSubscriptionBase {
         }
       }).concat(
         ops.likes.creates
+          .filter(shouldStoreEngagement)
           .map((create) => {
             return {
               uri: create.uri,

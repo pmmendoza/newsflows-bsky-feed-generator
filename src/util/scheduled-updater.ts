@@ -1,6 +1,7 @@
 import { Database } from '../db';
 import { getFollowsApi } from './queries';
 import { updateEngagement } from './engagement-updater';
+import { runRetentionOnce } from './retention';
 
 // Get all NEWSBOT_*_DID environment variables
 function getNewsbotDids(): string[] {
@@ -111,20 +112,41 @@ export function setupEngagmentUpdateScheduler(
 
   if (runImmediately) {
     updateEngagement(db).catch(err => {
-      console.error('Error in initial follows update:', err);
+      console.error('Error in initial engagement update:', err);
     });
   }
 
   // Set up recurring interval
   const timerId = setInterval(() => {
     updateEngagement(db).catch(err => {
-      console.error('Error in scheduled follows update:', err);
+      console.error('Error in scheduled engagement update:', err);
     });
   }, intervalMs);
 
   // Add to active timers list
   activeTimers.push(timerId);
   return timerId;
+}
+
+export function setupRetentionScheduler(
+  db: Database,
+  intervalMs: number = 6 * 60 * 60 * 1000, // Default: 6 hours
+  runImmediately: boolean = true,
+): NodeJS.Timeout {
+  if (runImmediately) {
+    runRetentionOnce(db).catch((err) => {
+      console.error('Error in initial retention run:', err)
+    })
+  }
+
+  const timerId = setInterval(() => {
+    runRetentionOnce(db).catch((err) => {
+      console.error('Error in scheduled retention run:', err)
+    })
+  }, intervalMs)
+
+  activeTimers.push(timerId)
+  return timerId
 }
 
 
