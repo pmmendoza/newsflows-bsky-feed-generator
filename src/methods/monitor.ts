@@ -1,6 +1,66 @@
 import { Server } from '../lexicon'
 import { AppContext } from '../config'
 import { sql } from 'kysely'
+import { getPublisherDidsFromEnv } from '../util/ingestion-scope'
+
+type EngagementExportType = 'like' | 'repost' | 'comment' | 'quote'
+type EngagementExportScope = 'union' | 'publisher' | 'subscriber' | 'subscriber_on_publisher'
+
+type EngagementExportEvent = {
+  type: EngagementExportType
+  event_uri: string
+  subject_uri: string
+  author_did: string
+  created_at: string
+}
+
+function parseHeaderValue(value: unknown): string | undefined {
+  if (typeof value === 'string') return value
+  if (Array.isArray(value) && typeof value[0] === 'string') return value[0]
+  return undefined
+}
+
+function parseBoolParam(raw: unknown): boolean | undefined {
+  if (raw === undefined) return undefined
+  if (typeof raw !== 'string') return undefined
+  if (raw.toLowerCase() === 'true') return true
+  if (raw.toLowerCase() === 'false') return false
+  if (raw === '1') return true
+  if (raw === '0') return false
+  return undefined
+}
+
+function parseNonNegInt(raw: unknown): number | undefined {
+  if (raw === undefined) return undefined
+  if (typeof raw !== 'string' || raw.length === 0) return undefined
+  const parsed = parseInt(raw, 10)
+  if (!Number.isFinite(parsed) || parsed < 0) return undefined
+  return parsed
+}
+
+function parseDidParam(raw: unknown): string | undefined {
+  if (raw === undefined) return undefined
+  if (typeof raw !== 'string' || raw.length === 0) return undefined
+  if (!raw.startsWith('did:') || raw.length < 6) return undefined
+  return raw
+}
+
+function parseIsoOrThrow(raw: unknown, name: string): string {
+  if (typeof raw !== 'string' || raw.length === 0) {
+    throw new Error(`${name} must be a non-empty ISO timestamp string`)
+  }
+  const d = new Date(raw)
+  if (Number.isNaN(d.getTime())) {
+    throw new Error(`${name} must be a valid ISO timestamp string`)
+  }
+  return d.toISOString()
+}
+
+function getDefaultSinceUntil(): { since: string; until: string } {
+  const untilDate = new Date()
+  const sinceDate = new Date(untilDate.getTime() - 24 * 60 * 60 * 1000)
+  return { since: sinceDate.toISOString(), until: untilDate.toISOString() }
+}
 
 export default function registerMonitorEndpoints(server: Server, ctx: AppContext) {
   server.xrpc.router.get('/api/subscribers', async (req, res) => {
@@ -117,6 +177,302 @@ export default function registerMonitorEndpoints(server: Server, ctx: AppContext
       });
     }
   });
+
+  server.xrpc.router.get('/api/compliance/engagement', async (req, res) => {
+    const apiKey = parseHeaderValue(req.headers['api-key'])
+    if (!apiKey || apiKey !== process.env.PRIORITIZE_API_KEY) {
+      return res.status(401).json({ error: 'Unauthorized' })
+    }
+
+    const publisherDids = getPublisherDidsFromEnv()
+
+    const { since: defaultSince, until: defaultUntil } = getDefaultSinceUntil()
+
+    let since: string
+    let until: string
+    let scope: EngagementExportScope
+    let page: number
+    let limit: number
+    let subscriberDid: string | undefined
+    let includeOtherSubscriberActivity = false
+    let types: EngagementExportType[]
+
+    try {
+      since = req.query?.since ? parseIsoOrThrow(req.query.since, 'since') : defaultSince
+      until = req.query?.until ? parseIsoOrThrow(req.query.until, 'until') : defaultUntil
+
+      if (since >= until) {
+        throw new Error('since must be earlier than until')
+      }
+
+      const scopeRaw = req.query?.scope
+      if (scopeRaw === undefined) {
+        scope = 'union'
+      } else if (typeof scopeRaw === 'string') {
+        if (
+          scopeRaw === 'publisher' ||
+          scopeRaw === 'subscriber' ||
+          scopeRaw === 'subscriber_on_publisher' ||
+          scopeRaw === 'union'
+        ) {
+          scope = scopeRaw
+        } else {
+          throw new Error('scope must be one of: union|publisher|subscriber|subscriber_on_publisher')
+        }
+      } else {
+        throw new Error('scope must be one of: union|publisher|subscriber|subscriber_on_publisher')
+      }
+
+      const pageRaw = req.query?.page
+      if (pageRaw === undefined) {
+        page = 0
+      } else {
+        const parsed = parseNonNegInt(pageRaw)
+        if (parsed === undefined) throw new Error('page must be a non-negative integer')
+        page = parsed
+      }
+
+      const limitRaw = req.query?.limit
+      if (limitRaw === undefined) {
+        limit = 1000
+      } else {
+        const parsed = parseNonNegInt(limitRaw)
+        if (parsed === undefined) throw new Error('limit must be a non-negative integer')
+        limit = parsed
+      }
+      if (limit <= 0) throw new Error('limit must be a positive integer')
+      if (limit > 5000) throw new Error('limit must be <= 5000')
+
+      subscriberDid = parseDidParam(req.query?.subscriber_did)
+      if (req.query?.subscriber_did !== undefined && !subscriberDid) {
+        throw new Error('subscriber_did must be a DID (did:...)')
+      }
+
+      const includeRaw = parseBoolParam(req.query?.include_other_subscriber_activity)
+      if (req.query?.include_other_subscriber_activity !== undefined && includeRaw === undefined) {
+        throw new Error('include_other_subscriber_activity must be true|false|1|0')
+      }
+      includeOtherSubscriberActivity = includeRaw ?? false
+
+      const typesRaw = typeof req.query?.types === 'string' ? req.query.types : undefined
+      if (!typesRaw) {
+        types = ['like', 'repost', 'comment', 'quote']
+      } else {
+        const parsed = typesRaw
+          .split(',')
+          .map((t) => t.trim().toLowerCase())
+          .filter((t) => t.length > 0)
+        const allowed: EngagementExportType[] = []
+        for (const t of parsed) {
+          if (t === 'like' || t === 'repost' || t === 'comment' || t === 'quote') {
+            allowed.push(t)
+          } else {
+            throw new Error(`types contains invalid value: ${t}`)
+          }
+        }
+        // De-dupe
+        types = Array.from(new Set(allowed))
+        if (types.length === 0) throw new Error('types must include at least one type')
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'BadRequest'
+      return res.status(400).json({ error: 'BadRequest', message })
+    }
+
+    const offset = page * limit
+
+    // When no publisher DIDs are configured, publisher-target scopes cannot match anything.
+    const publisherTargetExpr =
+      publisherDids.length > 0
+        ? sql<boolean>`split_part(b.subject_uri, '/', 3) in (${sql.join(publisherDids)})`
+        : sql<boolean>`false`
+
+    const typeFilter = sql<boolean>`type in (${sql.join(types)})`
+    const subscriberDidFilter = subscriberDid
+      ? sql<boolean>`author_did = ${subscriberDid}`
+      : sql<boolean>`true`
+
+    const scopeFilter =
+      scope === 'publisher'
+        ? sql<boolean>`is_publisher_target`
+        : scope === 'subscriber'
+          ? sql<boolean>`is_subscriber_actor`
+          : scope === 'subscriber_on_publisher'
+            ? sql<boolean>`is_publisher_target AND is_subscriber_actor`
+            : sql<boolean>`is_publisher_target OR is_subscriber_actor`
+
+    try {
+      res.header('Cache-Control', 'no-store')
+
+      const { rows } = await sql<EngagementExportEvent>`
+        WITH base AS (
+          SELECT
+            CASE e.type
+              WHEN 1 THEN 'repost'
+              WHEN 2 THEN 'like'
+              WHEN 3 THEN 'quote'
+              ELSE 'unknown'
+            END AS type,
+            e.uri AS event_uri,
+            e."subjectUri" AS subject_uri,
+            e.author AS author_did,
+            e."createdAt" AS created_at
+          FROM engagement e
+          WHERE e."createdAt" >= ${since} AND e."createdAt" < ${until}
+
+          UNION ALL
+
+          SELECT
+            'comment' AS type,
+            p.uri AS event_uri,
+            p."rootUri" AS subject_uri,
+            p.author AS author_did,
+            p."createdAt" AS created_at
+          FROM post p
+          WHERE p."rootUri" != '' AND p."createdAt" >= ${since} AND p."createdAt" < ${until}
+        ),
+        enriched AS (
+          SELECT
+            b.type,
+            b.event_uri,
+            b.subject_uri,
+            b.author_did,
+            b.created_at,
+            (${publisherTargetExpr}) AS is_publisher_target,
+            EXISTS (SELECT 1 FROM subscriber s WHERE s.did = b.author_did) AS is_subscriber_actor,
+            CASE b.type
+              WHEN 'like' THEN 1
+              WHEN 'repost' THEN 2
+              WHEN 'comment' THEN 3
+              WHEN 'quote' THEN 4
+              ELSE 0
+            END AS type_rank
+          FROM base b
+        ),
+        scoped AS (
+          SELECT * FROM enriched
+          WHERE (${typeFilter}) AND (${subscriberDidFilter}) AND (${scopeFilter})
+        ),
+        deduped AS (
+          SELECT DISTINCT ON (event_uri)
+            type,
+            event_uri,
+            subject_uri,
+            author_did,
+            created_at
+          FROM scoped
+          ORDER BY event_uri, created_at DESC, type_rank DESC
+        )
+        SELECT
+          type,
+          event_uri,
+          subject_uri,
+          author_did,
+          created_at
+        FROM deduped
+        ORDER BY created_at DESC, event_uri DESC
+        LIMIT ${limit} OFFSET ${offset}
+      `.execute(ctx.db)
+
+      const response: any = {
+        since,
+        until,
+        scope,
+        page,
+        limit,
+        count: rows.length,
+        events: rows,
+      }
+
+      if (
+        includeOtherSubscriberActivity &&
+        (scope === 'publisher' || scope === 'subscriber_on_publisher')
+      ) {
+        const otherScopeFilter = sql<boolean>`is_subscriber_actor AND NOT is_publisher_target`
+
+        const other = await sql<EngagementExportEvent>`
+          WITH base AS (
+          SELECT
+            CASE e.type
+              WHEN 1 THEN 'repost'
+              WHEN 2 THEN 'like'
+              WHEN 3 THEN 'quote'
+              ELSE 'unknown'
+            END AS type,
+            e.uri AS event_uri,
+            e."subjectUri" AS subject_uri,
+            e.author AS author_did,
+            e."createdAt" AS created_at
+            FROM engagement e
+            WHERE e."createdAt" >= ${since} AND e."createdAt" < ${until}
+
+            UNION ALL
+
+            SELECT
+              'comment' AS type,
+              p.uri AS event_uri,
+              p."rootUri" AS subject_uri,
+              p.author AS author_did,
+              p."createdAt" AS created_at
+            FROM post p
+            WHERE p."rootUri" != '' AND p."createdAt" >= ${since} AND p."createdAt" < ${until}
+          ),
+          enriched AS (
+            SELECT
+              b.type,
+              b.event_uri,
+              b.subject_uri,
+              b.author_did,
+              b.created_at,
+              (${publisherTargetExpr}) AS is_publisher_target,
+              EXISTS (SELECT 1 FROM subscriber s WHERE s.did = b.author_did) AS is_subscriber_actor,
+              CASE b.type
+                WHEN 'like' THEN 1
+                WHEN 'repost' THEN 2
+                WHEN 'comment' THEN 3
+                WHEN 'quote' THEN 4
+                ELSE 0
+              END AS type_rank
+            FROM base b
+          ),
+          scoped AS (
+            SELECT * FROM enriched
+            WHERE (${typeFilter}) AND (${subscriberDidFilter}) AND (${otherScopeFilter})
+          ),
+          deduped AS (
+            SELECT DISTINCT ON (event_uri)
+              type,
+              event_uri,
+              subject_uri,
+              author_did,
+              created_at
+            FROM scoped
+            ORDER BY event_uri, created_at DESC, type_rank DESC
+          )
+          SELECT
+            type,
+            event_uri,
+            subject_uri,
+            author_did,
+            created_at
+          FROM deduped
+          ORDER BY created_at DESC, event_uri DESC
+          LIMIT ${limit} OFFSET ${offset}
+        `.execute(ctx.db)
+
+        response.other_subscriber_count = other.rows.length
+        response.other_subscriber_events = other.rows
+      }
+
+      return res.json(response)
+    } catch (error) {
+      console.error('Error retrieving compliance engagement export:', error)
+      return res.status(500).json({
+        error: 'InternalServerError',
+        message: 'An unexpected error occurred',
+      })
+    }
+  })
 
   server.xrpc.router.get('/api/engagement', async (req, res) => {
     const apiKey = req.headers['api-key']
