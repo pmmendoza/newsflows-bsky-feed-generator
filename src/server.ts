@@ -24,6 +24,7 @@ export class FeedGenerator {
   public firehose: FirehoseSubscription
   public cfg: Config
   private followsUpdateTimer?: NodeJS.Timeout
+  private engagementUpdateTimer?: NodeJS.Timeout
 
   constructor(
     app: express.Application,
@@ -112,7 +113,7 @@ export class FeedGenerator {
     const updateInterval = parseInt(process.env.FOLLOWS_UPDATE_INTERVAL_MS || '', 10) || 60 * 60 * 1000;
     console.log(`[${new Date().toISOString()}] - Setting up follows updater to run every ${updateInterval / 1000} seconds`);
     this.followsUpdateTimer = setupFollowsUpdateScheduler(this.db, updateInterval);
-    this.followsUpdateTimer = setupEngagmentUpdateScheduler(this.db, updateInterval);
+    this.engagementUpdateTimer = setupEngagmentUpdateScheduler(this.db, updateInterval);
 
     // Set up daily full sync at 4:00 AM to remove unfollowed accounts
     setupDailyFullSyncScheduler(this.db);
