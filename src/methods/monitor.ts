@@ -1,7 +1,17 @@
 import { Server } from '../lexicon'
 import { AppContext } from '../config'
 import { sql } from 'kysely'
-import { getPublisherDidsFromEnv } from '../util/ingestion-scope'
+import { createHash } from 'crypto'
+import fs from 'fs'
+import path from 'path'
+import {
+  allowlistRefreshMs,
+  getPublisherDidsFromEnv,
+  restrictPublisherEngagementToSubscribersEnabled,
+  scopedIngestionEnabled,
+  trackSubscriberActivityEnabled,
+} from '../util/ingestion-scope'
+import { getRetentionConfig } from '../util/retention'
 
 type EngagementExportType = 'like' | 'repost' | 'comment' | 'quote'
 type EngagementExportScope = 'union' | 'publisher' | 'subscriber' | 'subscriber_on_publisher'
@@ -12,6 +22,112 @@ type EngagementExportEvent = {
   subject_uri: string
   author_did: string
   created_at: string
+}
+
+type EngagementFilters = {
+  since: string
+  until: string
+  scope: EngagementExportScope
+  limit: number
+  types: EngagementExportType[]
+  subscriberDid: string | null
+  includeOtherSubscriberActivity: boolean
+}
+
+type EngagementCursor = {
+  created_at: string
+  event_uri: string
+  filter_sig: string
+}
+
+let cachedPackageVersion: string | null | undefined
+
+function getPackageVersion(): string | undefined {
+  if (cachedPackageVersion !== undefined) {
+    return cachedPackageVersion ?? undefined
+  }
+  try {
+    const pkgPath = path.resolve(__dirname, '../../package.json')
+    const raw = fs.readFileSync(pkgPath, 'utf8')
+    const parsed = JSON.parse(raw)
+    cachedPackageVersion = typeof parsed?.version === 'string' ? parsed.version : null
+  } catch (error) {
+    cachedPackageVersion = null
+  }
+  return cachedPackageVersion ?? undefined
+}
+
+function getEngagementTimeHours(): number {
+  const raw = process.env.ENGAGEMENT_TIME_HOURS
+  if (!raw) return 72
+  const parsed = parseInt(raw, 10)
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 72
+}
+
+function normalizeCount(value: unknown): number {
+  if (typeof value === 'number') return value
+  if (typeof value === 'bigint') return Number(value)
+  if (typeof value === 'string') {
+    const parsed = parseInt(value, 10)
+    return Number.isFinite(parsed) ? parsed : 0
+  }
+  return 0
+}
+
+function base64UrlEncode(input: string): string {
+  return Buffer.from(input, 'utf8')
+    .toString('base64')
+    .replace(/\+/g, '-')
+    .replace(/\//g, '_')
+    .replace(/=+$/g, '')
+}
+
+function base64UrlDecode(input: string): string {
+  let base64 = input.replace(/-/g, '+').replace(/_/g, '/')
+  while (base64.length % 4 !== 0) {
+    base64 += '='
+  }
+  return Buffer.from(base64, 'base64').toString('utf8')
+}
+
+function buildFilterSignature(filters: EngagementFilters): string {
+  const normalized = {
+    since: filters.since,
+    until: filters.until,
+    scope: filters.scope,
+    limit: filters.limit,
+    types: [...filters.types].sort(),
+    subscriber_did: filters.subscriberDid ?? null,
+    include_other_subscriber_activity: filters.includeOtherSubscriberActivity,
+  }
+  const json = JSON.stringify(normalized)
+  return createHash('sha256').update(json).digest('hex')
+}
+
+function encodeEngagementCursor(cursor: EngagementCursor): string {
+  return base64UrlEncode(JSON.stringify(cursor))
+}
+
+function decodeEngagementCursor(raw: string): EngagementCursor {
+  let parsed: any
+  try {
+    parsed = JSON.parse(base64UrlDecode(raw))
+  } catch (error) {
+    throw new Error('cursor must be valid base64url JSON')
+  }
+  if (!parsed || typeof parsed !== 'object') {
+    throw new Error('cursor must be a JSON object')
+  }
+  const created_at = parseIsoOrThrow(parsed.created_at, 'cursor.created_at')
+  const event_uri = typeof parsed.event_uri === 'string' ? parsed.event_uri : ''
+  const filter_sig = typeof parsed.filter_sig === 'string' ? parsed.filter_sig : ''
+  if (!event_uri) {
+    throw new Error('cursor.event_uri must be a non-empty string')
+  }
+  if (!filter_sig) {
+    throw new Error('cursor.filter_sig must be a non-empty string')
+  }
+  return { created_at, event_uri, filter_sig }
 }
 
 function parseHeaderValue(value: unknown): string | undefined {
@@ -123,6 +239,85 @@ export default function registerMonitorEndpoints(server: Server, ctx: AppContext
     }
   });
 
+  server.xrpc.router.get('/api/config', async (req, res) => {
+    const apiKey = parseHeaderValue(req.headers['api-key'])
+    if (!apiKey || apiKey !== process.env.PRIORITIZE_API_KEY) {
+      return res.status(401).json({ error: 'Unauthorized' })
+    }
+
+    try {
+      res.header('Cache-Control', 'no-store')
+
+      const publisherDids = getPublisherDidsFromEnv().sort()
+      const retention = getRetentionConfig()
+      const version = getPackageVersion()
+      const buildSha = process.env.FEEDGEN_BUILD_SHA || undefined
+
+      const subscriberCountRow = await ctx.db
+        .selectFrom('subscriber')
+        .select(sql<number>`count(*)`.as('count'))
+        .executeTakeFirst()
+      const followsCountRow = await ctx.db
+        .selectFrom('follows')
+        .select(sql<number>`count(*)`.as('count'))
+        .executeTakeFirst()
+
+      const subscriberCount = normalizeCount(subscriberCountRow?.count)
+      const followsCount = normalizeCount(followsCountRow?.count)
+
+      const warnings: string[] = []
+      if (publisherDids.length === 0) {
+        warnings.push('no_publisher_dids_configured')
+      }
+      if (scopedIngestionEnabled() && publisherDids.length === 0 && followsCount === 0) {
+        warnings.push('scoped_ingestion_enabled_but_allowlist_empty')
+      }
+
+      let firehoseHost: string | undefined
+      try {
+        firehoseHost = new URL(ctx.cfg.subscriptionEndpoint).host
+      } catch (error) {
+        firehoseHost = undefined
+      }
+
+      return res.json({
+        service_did: ctx.cfg.serviceDid,
+        hostname: ctx.cfg.hostname,
+        version: version ?? null,
+        build_sha: buildSha ?? null,
+        ingestion: {
+          scoped_ingestion_enabled: scopedIngestionEnabled(),
+          track_subscriber_activity: trackSubscriberActivityEnabled(),
+          publisher_engagement_subscriber_only: restrictPublisherEngagementToSubscribersEnabled(),
+          allowlist_refresh_ms: allowlistRefreshMs(),
+        },
+        retention: {
+          enabled: retention.enabled,
+          post_retention_days: retention.postRetentionDays,
+          engagement_retention_days: retention.engagementRetentionDays,
+          delete_batch_size: retention.deleteBatchSize,
+        },
+        engagement: {
+          time_hours: getEngagementTimeHours(),
+        },
+        publisher_dids: publisherDids,
+        subscriber_count: subscriberCount,
+        firehose: {
+          subscription_endpoint: ctx.cfg.subscriptionEndpoint,
+          subscription_endpoint_host: firehoseHost ?? null,
+          reconnect_delay_ms: ctx.cfg.subscriptionReconnectDelay,
+        },
+        warnings,
+      })
+    } catch (error) {
+      console.error('Error retrieving config:', error)
+      return res.status(500).json({
+        error: 'InternalServerError',
+        message: 'An unexpected error occurred',
+      })
+    }
+  })
+
   server.xrpc.router.get('/api/compliance', async (req, res) => {
     const apiKey = req.headers['api-key']
 
@@ -196,8 +391,25 @@ export default function registerMonitorEndpoints(server: Server, ctx: AppContext
     let subscriberDid: string | undefined
     let includeOtherSubscriberActivity = false
     let types: EngagementExportType[]
+    let cursor: EngagementCursor | null = null
+    let otherCursor: EngagementCursor | null = null
+    let filterSig = ''
+    let useCursor = false
+    let useOtherCursor = false
 
     try {
+      const cursorRaw = typeof req.query?.cursor === 'string' ? req.query.cursor : undefined
+      if (cursorRaw !== undefined && cursorRaw.length === 0) {
+        throw new Error('cursor must be a non-empty string')
+      }
+      const otherCursorRaw =
+        typeof req.query?.other_cursor === 'string' ? req.query.other_cursor : undefined
+      if (otherCursorRaw !== undefined && otherCursorRaw.length === 0) {
+        throw new Error('other_cursor must be a non-empty string')
+      }
+      useCursor = cursorRaw !== undefined
+      const otherCursorProvided = otherCursorRaw !== undefined
+
       since = req.query?.since ? parseIsoOrThrow(req.query.since, 'since') : defaultSince
       until = req.query?.until ? parseIsoOrThrow(req.query.until, 'until') : defaultUntil
 
@@ -223,13 +435,17 @@ export default function registerMonitorEndpoints(server: Server, ctx: AppContext
         throw new Error('scope must be one of: union|publisher|subscriber|subscriber_on_publisher')
       }
 
-      const pageRaw = req.query?.page
-      if (pageRaw === undefined) {
-        page = 0
+      if (!useCursor) {
+        const pageRaw = req.query?.page
+        if (pageRaw === undefined) {
+          page = 0
+        } else {
+          const parsed = parseNonNegInt(pageRaw)
+          if (parsed === undefined) throw new Error('page must be a non-negative integer')
+          page = parsed
+        }
       } else {
-        const parsed = parseNonNegInt(pageRaw)
-        if (parsed === undefined) throw new Error('page must be a non-negative integer')
-        page = parsed
+        page = 0
       }
 
       const limitRaw = req.query?.limit
@@ -253,6 +469,9 @@ export default function registerMonitorEndpoints(server: Server, ctx: AppContext
         throw new Error('include_other_subscriber_activity must be true|false|1|0')
       }
       includeOtherSubscriberActivity = includeRaw ?? false
+      if (otherCursorProvided && !includeOtherSubscriberActivity) {
+        throw new Error('other_cursor requires include_other_subscriber_activity=true')
+      }
 
       const typesRaw = typeof req.query?.types === 'string' ? req.query.types : undefined
       if (!typesRaw) {
@@ -274,12 +493,37 @@ export default function registerMonitorEndpoints(server: Server, ctx: AppContext
         types = Array.from(new Set(allowed))
         if (types.length === 0) throw new Error('types must include at least one type')
       }
+      const filters: EngagementFilters = {
+        since,
+        until,
+        scope,
+        limit,
+        types,
+        subscriberDid: subscriberDid ?? null,
+        includeOtherSubscriberActivity,
+      }
+      filterSig = buildFilterSignature(filters)
+
+      if (useCursor && cursorRaw) {
+        cursor = decodeEngagementCursor(cursorRaw)
+        if (cursor.filter_sig !== filterSig) {
+          throw new Error('cursor does not match request filters')
+        }
+      }
+      if (otherCursorProvided && otherCursorRaw) {
+        otherCursor = decodeEngagementCursor(otherCursorRaw)
+        if (otherCursor.filter_sig !== filterSig) {
+          throw new Error('other_cursor does not match request filters')
+        }
+      }
+      useOtherCursor = includeOtherSubscriberActivity && (otherCursorProvided || useCursor)
     } catch (error) {
       const message = error instanceof Error ? error.message : 'BadRequest'
       return res.status(400).json({ error: 'BadRequest', message })
     }
 
-    const offset = page * limit
+    const offset = useCursor ? 0 : page * limit
+    const effectiveLimit = useCursor ? limit + 1 : limit
 
     // When no publisher DIDs are configured, publisher-target scopes cannot match anything.
     const publisherTargetExpr =
@@ -300,6 +544,18 @@ export default function registerMonitorEndpoints(server: Server, ctx: AppContext
           : scope === 'subscriber_on_publisher'
             ? sql<boolean>`is_publisher_target AND is_subscriber_actor`
             : sql<boolean>`is_publisher_target OR is_subscriber_actor`
+
+    const cursorFilter =
+      useCursor && cursor
+        ? sql<boolean>`(created_at < ${cursor.created_at} OR (created_at = ${cursor.created_at} AND event_uri < ${cursor.event_uri}))`
+        : sql<boolean>`true`
+    const otherCursorForFilter = useOtherCursor ? otherCursor ?? cursor : null
+    const otherCursorFilter =
+      useOtherCursor && otherCursorForFilter
+        ? sql<boolean>`(created_at < ${otherCursorForFilter.created_at} OR (created_at = ${otherCursorForFilter.created_at} AND event_uri < ${otherCursorForFilter.event_uri}))`
+        : sql<boolean>`true`
+    const otherOffset = useOtherCursor ? 0 : offset
+    const otherEffectiveLimit = useOtherCursor ? limit + 1 : limit
 
     try {
       res.header('Cache-Control', 'no-store')
@@ -370,9 +626,24 @@ export default function registerMonitorEndpoints(server: Server, ctx: AppContext
           author_did,
           created_at
         FROM deduped
+        WHERE (${cursorFilter})
         ORDER BY created_at DESC, event_uri DESC
-        LIMIT ${limit} OFFSET ${offset}
+        LIMIT ${effectiveLimit} OFFSET ${offset}
       `.execute(ctx.db)
+
+      let events = rows
+      let nextCursor: string | undefined
+      if (useCursor && rows.length > limit) {
+        events = rows.slice(0, limit)
+        const last = events[events.length - 1]
+        if (last) {
+          nextCursor = encodeEngagementCursor({
+            created_at: last.created_at,
+            event_uri: last.event_uri,
+            filter_sig: filterSig,
+          })
+        }
+      }
 
       const response: any = {
         since,
@@ -380,8 +651,11 @@ export default function registerMonitorEndpoints(server: Server, ctx: AppContext
         scope,
         page,
         limit,
-        count: rows.length,
-        events: rows,
+        count: events.length,
+        events,
+      }
+      if (useCursor && nextCursor) {
+        response.next_cursor = nextCursor
       }
 
       if (
@@ -456,12 +730,30 @@ export default function registerMonitorEndpoints(server: Server, ctx: AppContext
             author_did,
             created_at
           FROM deduped
+          WHERE (${otherCursorFilter})
           ORDER BY created_at DESC, event_uri DESC
-          LIMIT ${limit} OFFSET ${offset}
+          LIMIT ${otherEffectiveLimit} OFFSET ${otherOffset}
         `.execute(ctx.db)
 
-        response.other_subscriber_count = other.rows.length
-        response.other_subscriber_events = other.rows
+        let otherEvents = other.rows
+        let otherNextCursor: string | undefined
+        if (useOtherCursor && other.rows.length > limit) {
+          otherEvents = other.rows.slice(0, limit)
+          const last = otherEvents[otherEvents.length - 1]
+          if (last) {
+            otherNextCursor = encodeEngagementCursor({
+              created_at: last.created_at,
+              event_uri: last.event_uri,
+              filter_sig: filterSig,
+            })
+          }
+        }
+
+        response.other_subscriber_count = otherEvents.length
+        response.other_subscriber_events = otherEvents
+        if (useOtherCursor && otherNextCursor) {
+          response.other_next_cursor = otherNextCursor
+        }
       }
 
       return res.json(response)
