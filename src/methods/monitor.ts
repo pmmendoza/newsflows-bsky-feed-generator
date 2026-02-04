@@ -523,7 +523,7 @@ export default function registerMonitorEndpoints(server: Server, ctx: AppContext
     }
 
     const offset = useCursor ? 0 : page * limit
-    const effectiveLimit = useCursor ? limit + 1 : limit
+    const effectiveLimit = limit + 1
 
     // When no publisher DIDs are configured, publisher-target scopes cannot match anything.
     const publisherTargetExpr =
@@ -555,7 +555,7 @@ export default function registerMonitorEndpoints(server: Server, ctx: AppContext
         ? sql<boolean>`(created_at < ${otherCursorForFilter.created_at} OR (created_at = ${otherCursorForFilter.created_at} AND event_uri < ${otherCursorForFilter.event_uri}))`
         : sql<boolean>`true`
     const otherOffset = useOtherCursor ? 0 : offset
-    const otherEffectiveLimit = useOtherCursor ? limit + 1 : limit
+    const otherEffectiveLimit = limit + 1
 
     try {
       res.header('Cache-Control', 'no-store')
@@ -633,7 +633,7 @@ export default function registerMonitorEndpoints(server: Server, ctx: AppContext
 
       let events = rows
       let nextCursor: string | undefined
-      if (useCursor && rows.length > limit) {
+      if (rows.length > limit) {
         events = rows.slice(0, limit)
         const last = events[events.length - 1]
         if (last) {
@@ -654,7 +654,7 @@ export default function registerMonitorEndpoints(server: Server, ctx: AppContext
         count: events.length,
         events,
       }
-      if (useCursor && nextCursor) {
+      if (nextCursor) {
         response.next_cursor = nextCursor
       }
 
@@ -737,7 +737,7 @@ export default function registerMonitorEndpoints(server: Server, ctx: AppContext
 
         let otherEvents = other.rows
         let otherNextCursor: string | undefined
-        if (useOtherCursor && other.rows.length > limit) {
+        if (other.rows.length > limit) {
           otherEvents = other.rows.slice(0, limit)
           const last = otherEvents[otherEvents.length - 1]
           if (last) {
@@ -751,7 +751,7 @@ export default function registerMonitorEndpoints(server: Server, ctx: AppContext
 
         response.other_subscriber_count = otherEvents.length
         response.other_subscriber_events = otherEvents
-        if (useOtherCursor && otherNextCursor) {
+        if (otherNextCursor) {
           response.other_next_cursor = otherNextCursor
         }
       }
