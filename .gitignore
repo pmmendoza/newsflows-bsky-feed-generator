@@ -139,5 +139,7 @@ passwords.csv
 lab.R
 nl.csv
 docker-compose-deploy.yml
+docker-compose.local.yml
+docker-compose.override.yml
 scripts/reminder.r
 scripts/compliance.r

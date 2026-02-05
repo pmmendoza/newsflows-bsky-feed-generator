@@ -15,6 +15,76 @@ type StudyTokenPayload = {
 const STUDY_JWT_ISSUER = 'newsflows-bsky-feed-generator'
 const STUDY_JWT_AUDIENCE = 'newsflows-study'
 
+type RateLimitState = {
+  count: number
+  resetAt: number
+}
+
+type RateLimitConfig = {
+  max: number
+  windowMs: number
+}
+
+const complianceSummaryRateLimit = new Map<string, RateLimitState>()
+let lastComplianceSummaryRateLimitPruneMs = 0
+
+function parseIntOrUndefined(raw: string | undefined): number | undefined {
+  if (!raw) return undefined
+  const parsed = parseInt(raw, 10)
+  return Number.isFinite(parsed) ? parsed : undefined
+}
+
+function getComplianceSummaryRateLimitConfig(): RateLimitConfig | null {
+  // Defaults: 60 requests per 60 seconds per DID
+  const maxRaw = parseIntOrUndefined(process.env.STUDY_COMPLIANCE_RATE_LIMIT_MAX)
+  if (maxRaw === 0) return null
+  const max = typeof maxRaw === 'number' && maxRaw > 0 ? maxRaw : 60
+
+  const windowSecondsRaw = parseIntOrUndefined(
+    process.env.STUDY_COMPLIANCE_RATE_LIMIT_WINDOW_SECONDS,
+  )
+  const windowSeconds =
+    typeof windowSecondsRaw === 'number' && windowSecondsRaw > 0 ? windowSecondsRaw : 60
+
+  return { max, windowMs: windowSeconds * 1000 }
+}
+
+function pruneComplianceSummaryRateLimit(nowMs: number, windowMs: number) {
+  // Prevent unbounded growth if many unique DIDs hit the endpoint.
+  if (nowMs - lastComplianceSummaryRateLimitPruneMs < 10 * 60 * 1000) return
+  lastComplianceSummaryRateLimitPruneMs = nowMs
+
+  for (const [key, state] of complianceSummaryRateLimit) {
+    if (nowMs > state.resetAt + windowMs) {
+      complianceSummaryRateLimit.delete(key)
+    }
+  }
+}
+
+function checkComplianceSummaryRateLimit(
+  key: string,
+  config: RateLimitConfig,
+): { ok: true } | { ok: false; retryAfterSeconds: number } {
+  const nowMs = Date.now()
+  pruneComplianceSummaryRateLimit(nowMs, config.windowMs)
+
+  const state = complianceSummaryRateLimit.get(key)
+  if (!state || nowMs >= state.resetAt) {
+    complianceSummaryRateLimit.set(key, { count: 1, resetAt: nowMs + config.windowMs })
+    return { ok: true }
+  }
+
+  if (state.count >= config.max) {
+    return {
+      ok: false,
+      retryAfterSeconds: Math.max(1, Math.ceil((state.resetAt - nowMs) / 1000)),
+    }
+  }
+
+  state.count += 1
+  return { ok: true }
+}
+
 function parseHeaderValue(value: unknown): string | undefined {
   if (typeof value === 'string') return value
   if (Array.isArray(value) && typeof value[0] === 'string') return value[0]
@@ -57,11 +127,11 @@ export default function registerStudyEndpoints(server: Server, ctx: AppContext) 
   server.xrpc.router.post(
     '/api/study/token',
     async (req: express.Request, res: express.Response) => {
-      const expectedApiKey = process.env.STUDY_TOKEN_API_KEY
+      const expectedApiKey = process.env.PRIORITIZE_API_KEY
       if (!expectedApiKey) {
         return res.status(500).json({
           error: 'InternalServerError',
-          message: 'Study token API key is not configured',
+          message: 'PRIORITIZE_API_KEY is not configured',
         })
       }
 
@@ -159,6 +229,20 @@ export default function registerStudyEndpoints(server: Server, ctx: AppContext) 
         did = sub
       } catch (_err) {
         return res.status(401).json({ error: 'Unauthorized' })
+      }
+
+      const rateLimitConfig = getComplianceSummaryRateLimitConfig()
+      if (rateLimitConfig) {
+        const check = checkComplianceSummaryRateLimit(did, rateLimitConfig)
+        if (!check.ok) {
+          res.header('Cache-Control', 'no-store')
+          res.header('Retry-After', String(check.retryAfterSeconds))
+          res.header('X-RateLimited', '1')
+          return res.status(429).json({
+            error: 'TooManyRequests',
+            message: 'Rate limit exceeded',
+          })
+        }
       }
 
       const minDate =

@@ -15,6 +15,12 @@ const run = async () => {
     pgUser: maybeStr(process.env.FEEDGEN_DB_USER) ?? 'feedgen',
     pgPassword: maybeStr(process.env.FEEDGEN_DB_PASSWORD) ?? 'feedgen',
     pgDatabase: maybeStr(process.env.FEEDGEN_DB_DATABASE) ?? 'feedgen-db',
+    legacyPostgresUrl: maybeStr(process.env.FEEDGEN_LEGACY_POSTGRES_URL),
+    legacyPgHost: maybeStr(process.env.FEEDGEN_LEGACY_DB_HOST),
+    legacyPgPort: maybeInt(process.env.FEEDGEN_LEGACY_DB_PORT),
+    legacyPgUser: maybeStr(process.env.FEEDGEN_LEGACY_DB_USER),
+    legacyPgPassword: maybeStr(process.env.FEEDGEN_LEGACY_DB_PASSWORD),
+    legacyPgDatabase: maybeStr(process.env.FEEDGEN_LEGACY_DB_DATABASE),
     subscriptionEndpoint:
       maybeStr(process.env.FEEDGEN_SUBSCRIPTION_ENDPOINT) ??
       'wss://bsky.network',

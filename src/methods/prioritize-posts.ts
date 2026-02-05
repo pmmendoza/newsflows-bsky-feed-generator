@@ -13,7 +13,7 @@ export default function registerPrioritizeEndpoint(server: Server, ctx: AppConte
   // Register the prioritize endpoint
   server.xrpc.router.post('/api/prioritize', async (req: express.Request, res: express.Response) => {
     try {
-      const { keywords, test = true, priority = 1, maxdays = 1 } = req.query
+      const { keywords, test = true, priority = 1, maxhours = 1 } = req.query
       const apiKey = req.headers['api-key']
 
       if (!apiKey || apiKey !== process.env.PRIORITIZE_API_KEY) {
@@ -31,8 +31,8 @@ export default function registerPrioritizeEndpoint(server: Server, ctx: AppConte
         return res.status(400).json({ error: 'Missing required parameter: keywords (or provide JSON body with URIs)' })
       }
 
-      const maxdaysNumber = Number(maxdays) || 1;
-      const timeLimit = new Date(Date.now() - maxdaysNumber * 60 * 60 * 1000).toISOString();
+      const maxhoursNumber = Number(maxhours) || 1;
+      const timeLimit = new Date(Date.now() - maxhoursNumber * 60 * 60 * 1000).toISOString();
       const priorityNumber = Number(priority) || 1;
 
       // Convert keywords to array if it's a string
@@ -116,7 +116,7 @@ export default function registerPrioritizeEndpoint(server: Server, ctx: AppConte
   // Also provide a GET endpoint for convenience (keywords only)
   server.xrpc.router.get('/api/prioritize', async (req: express.Request, res: express.Response) => {
     try {
-      const { keywords, test = true, priority = 1, maxdays = 1 } = req.query
+      const { keywords, test = true, priority = 1, maxhours = 1 } = req.query
       const apiKey = req.headers['api-key']
 
       if (!apiKey || apiKey !== process.env.PRIORITIZE_API_KEY) {
@@ -128,8 +128,8 @@ export default function registerPrioritizeEndpoint(server: Server, ctx: AppConte
         return res.status(400).json({ error: 'Missing required parameter: keywords' })
       }
 
-      const maxdaysNumber = Number(maxdays) || 1;
-      const timeLimit = new Date(Date.now() - maxdaysNumber * 60 * 60 * 1000).toISOString();
+      const maxhoursNumber = Number(maxhours) || 1;
+      const timeLimit = new Date(Date.now() - maxhoursNumber * 60 * 60 * 1000).toISOString();
       const priorityNumber = Number(priority) || 1;
 
       // Convert keywords to array if it's a string

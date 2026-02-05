@@ -24,6 +24,7 @@ export type Post = {
   likes_count?: number
   repost_count?: number
   comments_count?: number
+  quote_count?: number
 }
 
 export type Engagement = {

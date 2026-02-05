@@ -1,6 +1,10 @@
 import { Database } from '../db';
 import { sql } from 'kysely';
 
+const ENGAGEMENT_TYPE_REPOST = 1
+const ENGAGEMENT_TYPE_LIKE = 2
+const ENGAGEMENT_TYPE_QUOTE = 3
+
 // Get all NEWSBOT_*_DID environment variables
 function getNewsbotDids(): string[] {
   const newsbotDids: string[] = [];
@@ -103,7 +107,7 @@ export async function updateEngagement(db: Database): Promise<void> {
         return db
           .selectFrom('engagement')
           .where('engagement.subjectUri', 'in', chunk)
-          .where('engagement.type', '=', 2) // Type 2 is for likes
+          .where('engagement.type', '=', ENGAGEMENT_TYPE_LIKE)
           .select([
             'engagement.subjectUri as uri',
             db.fn.count<number>('uri').as('count')
@@ -120,7 +124,7 @@ export async function updateEngagement(db: Database): Promise<void> {
           .selectFrom('engagement')
           .where('engagement.subjectUri', 'in', chunk)
           .where('engagement.author', 'in', subscriberDids)
-          .where('engagement.type', '=', 2) // Type 2 is for likes
+          .where('engagement.type', '=', ENGAGEMENT_TYPE_LIKE)
           .select([
             'engagement.subjectUri as uri',
             db.fn.count<number>('uri').as('count')
@@ -139,7 +143,7 @@ export async function updateEngagement(db: Database): Promise<void> {
         return db
           .selectFrom('engagement')
           .where('engagement.subjectUri', 'in', chunk)
-          .where('engagement.type', '=', 1) // Type 1 is for reposts
+          .where('engagement.type', '=', ENGAGEMENT_TYPE_REPOST)
           .select([
             'engagement.subjectUri as uri',
             db.fn.count<number>('uri').as('count')
@@ -156,7 +160,7 @@ export async function updateEngagement(db: Database): Promise<void> {
           .selectFrom('engagement')
           .where('engagement.subjectUri', 'in', chunk)
           .where('engagement.author', 'in', subscriberDids)
-          .where('engagement.type', '=', 1) // Type 1 is for reposts
+          .where('engagement.type', '=', ENGAGEMENT_TYPE_REPOST)
           .select([
             'engagement.subjectUri as uri',
             db.fn.count<number>('uri').as('count')
@@ -167,6 +171,42 @@ export async function updateEngagement(db: Database): Promise<void> {
       : [];
 
     const repostCountsResult = [...otherRepostsResult, ...publisherRepostsResult];
+
+    // Count quotes for each post
+    // For other posts: count all engagement
+    const otherQuotesResult = otherPostUris.length > 0
+      ? await execInChunks(otherPostUris, async (chunk) => {
+        return db
+          .selectFrom('engagement')
+          .where('engagement.subjectUri', 'in', chunk)
+          .where('engagement.type', '=', ENGAGEMENT_TYPE_QUOTE)
+          .select([
+            'engagement.subjectUri as uri',
+            db.fn.count<number>('uri').as('count')
+          ])
+          .groupBy('engagement.subjectUri')
+          .execute();
+      })
+      : [];
+
+    // For publisher posts: only count engagement from subscribers
+    const publisherQuotesResult = (publisherPostUris.length > 0 && subscriberDids.length > 0)
+      ? await execInChunks(publisherPostUris, async (chunk) => {
+        return db
+          .selectFrom('engagement')
+          .where('engagement.subjectUri', 'in', chunk)
+          .where('engagement.author', 'in', subscriberDids)
+          .where('engagement.type', '=', ENGAGEMENT_TYPE_QUOTE)
+          .select([
+            'engagement.subjectUri as uri',
+            db.fn.count<number>('uri').as('count')
+          ])
+          .groupBy('engagement.subjectUri')
+          .execute();
+      })
+      : [];
+
+    const quoteCountsResult = [...otherQuotesResult, ...publisherQuotesResult];
 
     // Count comments for each post (comments are posts with rootUri pointing to the original post)
     // For other posts: count all comments
@@ -217,6 +257,10 @@ export async function updateEngagement(db: Database): Promise<void> {
       commentCountsResult.map(result => [result.uri, Number(result.count)])
     );
 
+    const quotesMap = new Map(
+      quoteCountsResult.map(result => [result.uri, Number(result.count)])
+    );
+
     // Update posts with counts
     const batchSize = 5000;
     for (let i = 0; i < postUris.length; i += batchSize) {
@@ -238,13 +282,19 @@ export async function updateEngagement(db: Database): Promise<void> {
         sql` `
       );
 
+      const quotesCases = sql.join(
+        batchUris.map(uri => sql`WHEN uri = ${uri} THEN ${quotesMap.get(uri) || 0}`),
+        sql` `
+      );
+
       // Execute single UPDATE with CASE for the entire batch
       await sql`
         UPDATE post
         SET
           likes_count = CASE ${likesCases} ELSE likes_count END,
           repost_count = CASE ${repostsCases} ELSE repost_count END,
-          comments_count = CASE ${commentsCases} ELSE comments_count END
+          comments_count = CASE ${commentsCases} ELSE comments_count END,
+          quote_count = CASE ${quotesCases} ELSE quote_count END
         WHERE uri IN (${sql.join(batchUris.map(uri => sql`${uri}`), sql`, `)})
       `.execute(db);
 
