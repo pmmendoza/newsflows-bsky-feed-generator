@@ -4,6 +4,7 @@ import { sql } from 'kysely'
 import { createHash } from 'crypto'
 import fs from 'fs'
 import path from 'path'
+import { Database } from '../db'
 import {
   allowlistRefreshMs,
   getPublisherDidsFromEnv,
@@ -22,6 +23,11 @@ type EngagementExportEvent = {
   subject_uri: string
   author_did: string
   created_at: string
+  comment_root_uri: string | null
+  quote_subject_uri: string | null
+  publisher_target_any: boolean
+  publisher_target_comment_root: boolean
+  publisher_target_quote_subject: boolean
 }
 
 type EngagementFilters = {
@@ -373,7 +379,12 @@ export default function registerMonitorEndpoints(server: Server, ctx: AppContext
     }
   });
 
-  server.xrpc.router.get('/api/compliance/engagement', async (req, res) => {
+  const handleEngagementExport = async (
+    req: any,
+    res: any,
+    db: Database,
+    responseSource?: string,
+  ) => {
     const apiKey = parseHeaderValue(req.headers['api-key'])
     if (!apiKey || apiKey !== process.env.PRIORITIZE_API_KEY) {
       return res.status(401).json({ error: 'Unauthorized' })
@@ -489,7 +500,6 @@ export default function registerMonitorEndpoints(server: Server, ctx: AppContext
             throw new Error(`types contains invalid value: ${t}`)
           }
         }
-        // De-dupe
         types = Array.from(new Set(allowed))
         if (types.length === 0) throw new Error('types must include at least one type')
       }
@@ -525,7 +535,6 @@ export default function registerMonitorEndpoints(server: Server, ctx: AppContext
     const offset = useCursor ? 0 : page * limit
     const effectiveLimit = limit + 1
 
-    // When no publisher DIDs are configured, publisher-target scopes cannot match anything.
     const publisherTargetExpr =
       publisherDids.length > 0
         ? sql<boolean>`split_part(b.subject_uri, '/', 3) in (${sql.join(publisherDids)})`
@@ -547,12 +556,12 @@ export default function registerMonitorEndpoints(server: Server, ctx: AppContext
 
     const cursorFilter =
       useCursor && cursor
-        ? sql<boolean>`(created_at < ${cursor.created_at} OR (created_at = ${cursor.created_at} AND event_uri < ${cursor.event_uri}))`
+        ? sql<boolean>`(d.created_at < ${cursor.created_at} OR (d.created_at = ${cursor.created_at} AND d.event_uri < ${cursor.event_uri}))`
         : sql<boolean>`true`
     const otherCursorForFilter = useOtherCursor ? otherCursor ?? cursor : null
     const otherCursorFilter =
       useOtherCursor && otherCursorForFilter
-        ? sql<boolean>`(created_at < ${otherCursorForFilter.created_at} OR (created_at = ${otherCursorForFilter.created_at} AND event_uri < ${otherCursorForFilter.event_uri}))`
+        ? sql<boolean>`(d.created_at < ${otherCursorForFilter.created_at} OR (d.created_at = ${otherCursorForFilter.created_at} AND d.event_uri < ${otherCursorForFilter.event_uri}))`
         : sql<boolean>`true`
     const otherOffset = useOtherCursor ? 0 : offset
     const otherEffectiveLimit = limit + 1
@@ -609,6 +618,17 @@ export default function registerMonitorEndpoints(server: Server, ctx: AppContext
           SELECT * FROM enriched
           WHERE (${typeFilter}) AND (${subscriberDidFilter}) AND (${scopeFilter})
         ),
+        aggregated AS (
+          SELECT
+            event_uri,
+            MAX(CASE WHEN type = 'comment' THEN subject_uri ELSE NULL END) AS comment_root_uri,
+            MAX(CASE WHEN type = 'quote' THEN subject_uri ELSE NULL END) AS quote_subject_uri,
+            BOOL_OR(is_publisher_target) AS publisher_target_any,
+            BOOL_OR(type = 'comment' AND is_publisher_target) AS publisher_target_comment_root,
+            BOOL_OR(type = 'quote' AND is_publisher_target) AS publisher_target_quote_subject
+          FROM scoped
+          GROUP BY event_uri
+        ),
         deduped AS (
           SELECT DISTINCT ON (event_uri)
             type,
@@ -620,16 +640,22 @@ export default function registerMonitorEndpoints(server: Server, ctx: AppContext
           ORDER BY event_uri, created_at DESC, type_rank DESC
         )
         SELECT
-          type,
-          event_uri,
-          subject_uri,
-          author_did,
-          created_at
-        FROM deduped
+          d.type,
+          d.event_uri,
+          d.subject_uri,
+          d.author_did,
+          d.created_at,
+          a.comment_root_uri,
+          a.quote_subject_uri,
+          COALESCE(a.publisher_target_any, false) AS publisher_target_any,
+          COALESCE(a.publisher_target_comment_root, false) AS publisher_target_comment_root,
+          COALESCE(a.publisher_target_quote_subject, false) AS publisher_target_quote_subject
+        FROM deduped d
+        LEFT JOIN aggregated a ON a.event_uri = d.event_uri
         WHERE (${cursorFilter})
-        ORDER BY created_at DESC, event_uri DESC
+        ORDER BY d.created_at DESC, d.event_uri DESC
         LIMIT ${effectiveLimit} OFFSET ${offset}
-      `.execute(ctx.db)
+      `.execute(db)
 
       let events = rows
       let nextCursor: string | undefined
@@ -656,6 +682,9 @@ export default function registerMonitorEndpoints(server: Server, ctx: AppContext
       }
       if (nextCursor) {
         response.next_cursor = nextCursor
+      }
+      if (responseSource) {
+        response.source = responseSource
       }
 
       if (
@@ -713,6 +742,17 @@ export default function registerMonitorEndpoints(server: Server, ctx: AppContext
             SELECT * FROM enriched
             WHERE (${typeFilter}) AND (${subscriberDidFilter}) AND (${otherScopeFilter})
           ),
+          aggregated AS (
+            SELECT
+              event_uri,
+              MAX(CASE WHEN type = 'comment' THEN subject_uri ELSE NULL END) AS comment_root_uri,
+              MAX(CASE WHEN type = 'quote' THEN subject_uri ELSE NULL END) AS quote_subject_uri,
+              BOOL_OR(is_publisher_target) AS publisher_target_any,
+              BOOL_OR(type = 'comment' AND is_publisher_target) AS publisher_target_comment_root,
+              BOOL_OR(type = 'quote' AND is_publisher_target) AS publisher_target_quote_subject
+            FROM scoped
+            GROUP BY event_uri
+          ),
           deduped AS (
             SELECT DISTINCT ON (event_uri)
               type,
@@ -724,16 +764,22 @@ export default function registerMonitorEndpoints(server: Server, ctx: AppContext
             ORDER BY event_uri, created_at DESC, type_rank DESC
           )
           SELECT
-            type,
-            event_uri,
-            subject_uri,
-            author_did,
-            created_at
-          FROM deduped
+            d.type,
+            d.event_uri,
+            d.subject_uri,
+            d.author_did,
+            d.created_at,
+            a.comment_root_uri,
+            a.quote_subject_uri,
+            COALESCE(a.publisher_target_any, false) AS publisher_target_any,
+            COALESCE(a.publisher_target_comment_root, false) AS publisher_target_comment_root,
+            COALESCE(a.publisher_target_quote_subject, false) AS publisher_target_quote_subject
+          FROM deduped d
+          LEFT JOIN aggregated a ON a.event_uri = d.event_uri
           WHERE (${otherCursorFilter})
-          ORDER BY created_at DESC, event_uri DESC
+          ORDER BY d.created_at DESC, d.event_uri DESC
           LIMIT ${otherEffectiveLimit} OFFSET ${otherOffset}
-        `.execute(ctx.db)
+        `.execute(db)
 
         let otherEvents = other.rows
         let otherNextCursor: string | undefined
@@ -764,6 +810,20 @@ export default function registerMonitorEndpoints(server: Server, ctx: AppContext
         message: 'An unexpected error occurred',
       })
     }
+  }
+
+  server.xrpc.router.get('/api/compliance/engagement', async (req, res) => {
+    return handleEngagementExport(req, res, ctx.db)
+  })
+
+  server.xrpc.router.get('/api/compliance/engagement_legacy', async (req, res) => {
+    if (!ctx.legacyDb) {
+      return res.status(503).json({
+        error: 'LegacyDbUnavailable',
+        message: 'Legacy database is not configured for this service',
+      })
+    }
+    return handleEngagementExport(req, res, ctx.legacyDb, 'legacy_db')
   })
 
   server.xrpc.router.get('/api/engagement', async (req, res) => {

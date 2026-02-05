@@ -21,6 +21,7 @@ export class FeedGenerator {
   public app: express.Application
   public server?: http.Server
   public db: Database
+  public legacyDb?: Database
   public firehose: FirehoseSubscription
   public cfg: Config
   private followsUpdateTimer?: NodeJS.Timeout
@@ -29,11 +30,13 @@ export class FeedGenerator {
   constructor(
     app: express.Application,
     db: Database,
+    legacyDb: Database | undefined,
     firehose: FirehoseSubscription,
     cfg: Config,
   ) {
     this.app = app
     this.db = db
+    this.legacyDb = legacyDb
     this.firehose = firehose
     this.cfg = cfg
   }
@@ -57,8 +60,16 @@ export class FeedGenerator {
       }
     })
     
-    const db = createDb(cfg.postgresUrl ||
-      `postgres://${cfg.pgUser}:${cfg.pgPassword}@${cfg.pgHost}:${cfg.pgPort}/${cfg.pgDatabase}`)
+    const db = createDb(
+      cfg.postgresUrl ||
+        `postgres://${cfg.pgUser}:${cfg.pgPassword}@${cfg.pgHost}:${cfg.pgPort}/${cfg.pgDatabase}`,
+    )
+    const legacyDb = cfg.legacyPostgresUrl || cfg.legacyPgHost
+      ? createDb(
+          cfg.legacyPostgresUrl ||
+            `postgres://${cfg.legacyPgUser ?? 'feedgen'}:${cfg.legacyPgPassword ?? 'feedgen'}@${cfg.legacyPgHost ?? 'localhost'}:${cfg.legacyPgPort ?? 5432}/${cfg.legacyPgDatabase ?? 'feedgen-db'}`,
+        )
+      : undefined
     const firehose = new FirehoseSubscription(db, cfg.subscriptionEndpoint)
 
     const didCache = new MemoryCache()
@@ -77,6 +88,7 @@ export class FeedGenerator {
     })
     const ctx: AppContext = {
       db,
+      legacyDb,
       didResolver,
       cfg,
     }
@@ -92,7 +104,7 @@ export class FeedGenerator {
     registerUpdaterEndpoints(server, ctx);
     registerStudyEndpoints(server, ctx);
 
-    return new FeedGenerator(app, db, firehose, cfg)
+    return new FeedGenerator(app, db, legacyDb, firehose, cfg)
   }
 
   async start(): Promise<http.Server> {
@@ -134,6 +146,10 @@ export class FeedGenerator {
     
     if (this.db) {
       await this.db.destroy();
+    }
+
+    if (this.legacyDb) {
+      await this.legacyDb.destroy();
     }
     
     // Close the server if it's running
