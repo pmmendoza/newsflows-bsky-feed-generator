@@ -540,7 +540,15 @@ export default function registerMonitorEndpoints(server: Server, ctx: AppContext
         ? sql<boolean>`split_part(b.subject_uri, '/', 3) in (${sql.join(publisherDids)})`
         : sql<boolean>`false`
 
-    const typeFilter = sql<boolean>`type in (${sql.join(types)})`
+    const engagementTypeCodes = types
+      .filter((type): type is Exclude<EngagementExportType, 'comment'> => type !== 'comment')
+      .map((type) => {
+        if (type === 'repost') return 1
+        if (type === 'like') return 2
+        return 3 // quote
+      })
+    const includeCommentEvents = types.includes('comment')
+
     const subscriberDidFilter = subscriberDid
       ? sql<boolean>`author_did = ${subscriberDid}`
       : sql<boolean>`true`
@@ -565,12 +573,28 @@ export default function registerMonitorEndpoints(server: Server, ctx: AppContext
         : sql<boolean>`true`
     const otherOffset = useOtherCursor ? 0 : offset
     const otherEffectiveLimit = limit + 1
+    const scopeRequiresSubscriberActors =
+      scope === 'subscriber' || scope === 'subscriber_on_publisher'
 
-    try {
-      res.header('Cache-Control', 'no-store')
+    const buildBaseUnion = (requireSubscriberActors: boolean) => {
+      const engagementJoin = requireSubscriberActors
+        ? sql`JOIN subscriber s_sub ON s_sub.did = e.author`
+        : sql``
+      const postJoin = requireSubscriberActors
+        ? sql`JOIN subscriber s_sub ON s_sub.did = p.author`
+        : sql``
 
-      const { rows } = await sql<EngagementExportEvent>`
-        WITH base AS (
+      const engagementAuthorFilter = subscriberDid
+        ? sql<boolean>`e.author = ${subscriberDid}`
+        : sql<boolean>`true`
+      const postAuthorFilter = subscriberDid
+        ? sql<boolean>`p.author = ${subscriberDid}`
+        : sql<boolean>`true`
+
+      const baseParts: Array<ReturnType<typeof sql>> = []
+
+      if (engagementTypeCodes.length > 0) {
+        baseParts.push(sql`
           SELECT
             CASE e.type
               WHEN 1 THEN 'repost'
@@ -583,10 +607,17 @@ export default function registerMonitorEndpoints(server: Server, ctx: AppContext
             e.author AS author_did,
             e."createdAt" AS created_at
           FROM engagement e
-          WHERE e."createdAt" >= ${since} AND e."createdAt" < ${until}
+          ${engagementJoin}
+          WHERE
+            e."createdAt" >= ${since}
+            AND e."createdAt" < ${until}
+            AND e.type in (${sql.join(engagementTypeCodes)})
+            AND (${engagementAuthorFilter})
+        `)
+      }
 
-          UNION ALL
-
+      if (includeCommentEvents) {
+        baseParts.push(sql`
           SELECT
             'comment' AS type,
             p.uri AS event_uri,
@@ -594,7 +625,47 @@ export default function registerMonitorEndpoints(server: Server, ctx: AppContext
             p.author AS author_did,
             p."createdAt" AS created_at
           FROM post p
-          WHERE p."rootUri" != '' AND p."createdAt" >= ${since} AND p."createdAt" < ${until}
+          ${postJoin}
+          WHERE
+            p."rootUri" != ''
+            AND p."createdAt" >= ${since}
+            AND p."createdAt" < ${until}
+            AND (${postAuthorFilter})
+        `)
+      }
+
+      if (baseParts.length === 0) {
+        return sql`
+          SELECT
+            'like' AS type,
+            '' AS event_uri,
+            '' AS subject_uri,
+            '' AS author_did,
+            '' AS created_at
+          WHERE false
+        `
+      }
+      if (baseParts.length === 1) {
+        return baseParts[0]
+      }
+      return sql.join(baseParts, sql` UNION ALL `)
+    }
+
+    const mainBaseRequiresSubscriberActors = scopeRequiresSubscriberActors || Boolean(subscriberDid)
+    const mainBaseUnion = buildBaseUnion(mainBaseRequiresSubscriberActors)
+    const mainSubscriberActorExpr = mainBaseRequiresSubscriberActors
+      ? sql<boolean>`true`
+      : sql<boolean>`EXISTS (SELECT 1 FROM subscriber s WHERE s.did = b.author_did)`
+    const otherBaseUnion = buildBaseUnion(true)
+    const otherSubscriberActorExpr = sql<boolean>`true`
+
+    try {
+      res.header('Cache-Control', 'no-store')
+      const exportQueryStartedAt = Date.now()
+
+      const { rows } = await sql<EngagementExportEvent>`
+        WITH base AS (
+          ${mainBaseUnion}
         ),
         enriched AS (
           SELECT
@@ -604,7 +675,7 @@ export default function registerMonitorEndpoints(server: Server, ctx: AppContext
             b.author_did,
             b.created_at,
             (${publisherTargetExpr}) AS is_publisher_target,
-            EXISTS (SELECT 1 FROM subscriber s WHERE s.did = b.author_did) AS is_subscriber_actor,
+            (${mainSubscriberActorExpr}) AS is_subscriber_actor,
             CASE b.type
               WHEN 'like' THEN 1
               WHEN 'repost' THEN 2
@@ -616,7 +687,7 @@ export default function registerMonitorEndpoints(server: Server, ctx: AppContext
         ),
         scoped AS (
           SELECT * FROM enriched
-          WHERE (${typeFilter}) AND (${subscriberDidFilter}) AND (${scopeFilter})
+          WHERE (${subscriberDidFilter}) AND (${scopeFilter})
         ),
         aggregated AS (
           SELECT
@@ -686,39 +757,21 @@ export default function registerMonitorEndpoints(server: Server, ctx: AppContext
       if (responseSource) {
         response.source = responseSource
       }
+      const exportQueryDurationMs = Date.now() - exportQueryStartedAt
+      console.log(
+        `[${new Date().toISOString()}] - Compliance engagement export source=${responseSource ?? 'primary'} scope=${scope} window=${since}..${until} limit=${limit} returned=${events.length} duration_ms=${exportQueryDurationMs}`,
+      )
 
       if (
         includeOtherSubscriberActivity &&
         (scope === 'publisher' || scope === 'subscriber_on_publisher')
       ) {
         const otherScopeFilter = sql<boolean>`is_subscriber_actor AND NOT is_publisher_target`
+        const otherQueryStartedAt = Date.now()
 
         const other = await sql<EngagementExportEvent>`
           WITH base AS (
-          SELECT
-            CASE e.type
-              WHEN 1 THEN 'repost'
-              WHEN 2 THEN 'like'
-              WHEN 3 THEN 'quote'
-              ELSE 'unknown'
-            END AS type,
-            e.uri AS event_uri,
-            e."subjectUri" AS subject_uri,
-            e.author AS author_did,
-            e."createdAt" AS created_at
-            FROM engagement e
-            WHERE e."createdAt" >= ${since} AND e."createdAt" < ${until}
-
-            UNION ALL
-
-            SELECT
-              'comment' AS type,
-              p.uri AS event_uri,
-              p."rootUri" AS subject_uri,
-              p.author AS author_did,
-              p."createdAt" AS created_at
-            FROM post p
-            WHERE p."rootUri" != '' AND p."createdAt" >= ${since} AND p."createdAt" < ${until}
+          ${otherBaseUnion}
           ),
           enriched AS (
             SELECT
@@ -728,7 +781,7 @@ export default function registerMonitorEndpoints(server: Server, ctx: AppContext
               b.author_did,
               b.created_at,
               (${publisherTargetExpr}) AS is_publisher_target,
-              EXISTS (SELECT 1 FROM subscriber s WHERE s.did = b.author_did) AS is_subscriber_actor,
+              (${otherSubscriberActorExpr}) AS is_subscriber_actor,
               CASE b.type
                 WHEN 'like' THEN 1
                 WHEN 'repost' THEN 2
@@ -740,7 +793,7 @@ export default function registerMonitorEndpoints(server: Server, ctx: AppContext
           ),
           scoped AS (
             SELECT * FROM enriched
-            WHERE (${typeFilter}) AND (${subscriberDidFilter}) AND (${otherScopeFilter})
+            WHERE (${subscriberDidFilter}) AND (${otherScopeFilter})
           ),
           aggregated AS (
             SELECT
@@ -800,6 +853,10 @@ export default function registerMonitorEndpoints(server: Server, ctx: AppContext
         if (otherNextCursor) {
           response.other_next_cursor = otherNextCursor
         }
+        const otherQueryDurationMs = Date.now() - otherQueryStartedAt
+        console.log(
+          `[${new Date().toISOString()}] - Compliance engagement export (other subscriber) source=${responseSource ?? 'primary'} scope=${scope} window=${since}..${until} limit=${limit} returned=${otherEvents.length} duration_ms=${otherQueryDurationMs}`,
+        )
       }
 
       return res.json(response)
