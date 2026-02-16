@@ -57,7 +57,13 @@ export type RequestLog = {
   id?: number
   algo: string
   requester_did: string
-  timestamp: string
+  timestamp: string | Date
+  cursor_in?: string | null
+  cursor_out?: string | null
+  requested_limit?: number | null
+  publisher_count?: number | null
+  follows_count?: number | null
+  result_count?: number | null
 }
 
 export type RequestPosts = {

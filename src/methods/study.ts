@@ -255,7 +255,7 @@ export default function registerStudyEndpoints(server: Server, ctx: AppContext) 
           .selectFrom('request_log')
           .select([
             sql<number>`COUNT(*)::int`.as('count'),
-            sql<string | null>`MAX(timestamp)`.as('last_timestamp'),
+            sql<string | null>`MAX(timestamp)::text`.as('last_timestamp'),
             sql<string[]>`COALESCE(ARRAY_AGG(DISTINCT algo), '{}')`.as('algos'),
           ])
           .where('requester_did', '=', did)

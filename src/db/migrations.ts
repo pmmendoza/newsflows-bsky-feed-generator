@@ -1,4 +1,4 @@
-import { Kysely, Migration, MigrationProvider } from 'kysely'
+import { Kysely, Migration, MigrationProvider, sql } from 'kysely'
 
 const migrations: Record<string, Migration> = {}
 
@@ -110,5 +110,90 @@ migrations['002'] = {
       .alterTable('post')
       .dropColumn('quote_count')
       .execute()
+  },
+}
+
+migrations['003'] = {
+  async up(db: Kysely<unknown>) {
+    // Store timestamps as proper timestamptz for reliable filtering/indexing.
+    // Guarded for idempotency in case schema was patched before deploy.
+    await sql`
+      DO $$
+      BEGIN
+        IF EXISTS (
+          SELECT 1
+          FROM information_schema.columns
+          WHERE table_schema = 'public'
+            AND table_name = 'request_log'
+            AND column_name = 'timestamp'
+            AND data_type = 'character varying'
+        ) THEN
+          ALTER TABLE request_log
+          ALTER COLUMN timestamp TYPE timestamptz
+          USING NULLIF(timestamp, '')::timestamptz;
+        END IF;
+      END $$;
+    `.execute(db)
+
+    // Add request-shape/result metadata so empty pages can be diagnosed from DB alone.
+    await sql`
+      ALTER TABLE request_log
+      ADD COLUMN IF NOT EXISTS cursor_in varchar,
+      ADD COLUMN IF NOT EXISTS cursor_out varchar,
+      ADD COLUMN IF NOT EXISTS requested_limit integer,
+      ADD COLUMN IF NOT EXISTS publisher_count integer,
+      ADD COLUMN IF NOT EXISTS follows_count integer,
+      ADD COLUMN IF NOT EXISTS result_count integer
+    `.execute(db)
+
+    // Backfill total result counts for historical rows.
+    await sql`
+      UPDATE request_log
+      SET result_count = 0
+      WHERE result_count IS NULL
+    `.execute(db)
+    await sql`
+      UPDATE request_log rl
+      SET result_count = agg.cnt
+      FROM (
+        SELECT request_id, COUNT(*)::int AS cnt
+        FROM request_posts
+        GROUP BY request_id
+      ) AS agg
+      WHERE rl.id = agg.request_id
+    `.execute(db)
+
+    await sql`
+      CREATE INDEX IF NOT EXISTS request_log_requester_timestamp_index
+      ON request_log (requester_did, timestamp)
+    `.execute(db)
+    await sql`
+      CREATE INDEX IF NOT EXISTS request_log_algo_timestamp_index
+      ON request_log (algo, timestamp)
+    `.execute(db)
+  },
+  async down(db: Kysely<unknown>) {
+    await db.schema
+      .dropIndex('request_log_requester_timestamp_index')
+      .ifExists()
+      .execute()
+    await db.schema
+      .dropIndex('request_log_algo_timestamp_index')
+      .ifExists()
+      .execute()
+    await db.schema
+      .alterTable('request_log')
+      .dropColumn('cursor_in')
+      .dropColumn('cursor_out')
+      .dropColumn('requested_limit')
+      .dropColumn('publisher_count')
+      .dropColumn('follows_count')
+      .dropColumn('result_count')
+      .execute()
+    await sql`
+      ALTER TABLE request_log
+      ALTER COLUMN timestamp TYPE varchar
+      USING to_char(timestamp AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"')
+    `.execute(db)
   },
 }

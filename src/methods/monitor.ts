@@ -343,7 +343,13 @@ export default function registerMonitorEndpoints(server: Server, ctx: AppContext
           'rl.id',
           'rl.algo',
           'rl.requester_did',
-          'rl.timestamp',
+          sql<string>`rl.timestamp::text`.as('timestamp'),
+          'rl.cursor_in',
+          'rl.cursor_out',
+          'rl.requested_limit',
+          'rl.publisher_count',
+          'rl.follows_count',
+          'rl.result_count',
           sql<any>`COALESCE(
             JSON_AGG(
               JSON_BUILD_OBJECT('uri', rp.post_uri, 'position', rp.position)
@@ -351,7 +357,18 @@ export default function registerMonitorEndpoints(server: Server, ctx: AppContext
             '[]'::json
           )`.as('posts')
         ])
-        .groupBy(['rl.id', 'rl.algo', 'rl.requester_did', 'rl.timestamp'])
+        .groupBy([
+          'rl.id',
+          'rl.algo',
+          'rl.requester_did',
+          'rl.timestamp',
+          'rl.cursor_in',
+          'rl.cursor_out',
+          'rl.requested_limit',
+          'rl.publisher_count',
+          'rl.follows_count',
+          'rl.result_count',
+        ])
 
       // Apply optional filters
       if (user_did) {

@@ -3,7 +3,6 @@ import { QueryParams, OutputSchema as AlgoOutput } from '../lexicon/types/app/bs
 import { DatabaseSchema } from '../db/schema'
 import { AppContext } from '../config'
 import { SkeletonFeedPost } from '../lexicon/types/app/bsky/feed/defs'
-import { sql } from 'kysely'
 
 // Type definition for FeedGenerator handler
 export type FeedGenerator = (ctx: AppContext, params: QueryParams, requesterDid: string) => Promise<AlgoOutput>
@@ -107,12 +106,22 @@ export async function buildFeed({
   setTimeout(async () => {
     try {
       const timestamp = new Date().toISOString();
+      const requestedLimit =
+        typeof params.limit === 'number' && Number.isFinite(params.limit)
+          ? params.limit
+          : null
       const requestInsertResult = await ctx.db
         .insertInto('request_log')
         .values({
           algo: shortname,
           requester_did: requesterDid,
-          timestamp: timestamp
+          timestamp: timestamp,
+          cursor_in: params.cursor ?? null,
+          cursor_out: cursor ?? null,
+          requested_limit: requestedLimit,
+          publisher_count: publisherPosts.length,
+          follows_count: otherPosts.length,
+          result_count: feed.length,
         })
         .returning('id')
         .executeTakeFirstOrThrow();
