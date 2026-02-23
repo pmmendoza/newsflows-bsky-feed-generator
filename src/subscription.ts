@@ -49,6 +49,24 @@ function sanitizeForPostgres(text: string | null | undefined): string {
   return text.replace(/\0/g, '');
 }
 
+// Clamp client-supplied createdAt to a sane range.
+// ATProto createdAt is set by the client device and can be bogus.
+// Falls back to indexedAt (server time) if out of range.
+function clampCreatedAt(raw: string | undefined | null, indexedAt: string): string {
+  if (!raw) return indexedAt
+  try {
+    const d = new Date(raw)
+    const i = new Date(indexedAt)
+    if (isNaN(d.getTime())) return indexedAt
+    // Reject if more than 1 day in the future or more than 2 years in the past
+    if (d.getTime() > i.getTime() + 86_400_000) return indexedAt
+    if (d.getTime() < i.getTime() - 2 * 365 * 86_400_000) return indexedAt
+    return raw
+  } catch {
+    return indexedAt
+  }
+}
+
 export class FirehoseSubscription extends FirehoseSubscriptionBase {
   async handleEvent(evt: RepoEvent) {
     if (!isCommit(evt)) return
@@ -140,11 +158,12 @@ export class FirehoseSubscription extends FirehoseSubscriptionBase {
     const postsToCreate = ops.posts.creates
       .filter(shouldStorePost)
       .map((create) => {
+        const postIndexedAt = new Date().toISOString()
         return {
           uri: create.uri,
           cid: create.cid,
-          indexedAt: new Date().toISOString(),
-          createdAt: create.record.createdAt,
+          indexedAt: postIndexedAt,
+          createdAt: clampCreatedAt(create.record.createdAt, postIndexedAt),
           author: create.author,
           text: sanitizeForPostgres(create.record.text),
           rootUri: create.record.reply?.root?.uri || "",
@@ -170,28 +189,30 @@ export class FirehoseSubscription extends FirehoseSubscriptionBase {
     const engagementsToCreate = ops.reposts.creates
       .filter(shouldStoreEngagement)
       .map((create) => {
+        const engIndexedAt = new Date().toISOString()
         return {
           uri: create.uri,
           cid: create.cid,
           subjectUri: create.record.subject.uri,
           subjectCid: create.record.subject.cid,
           type: 1,
-          indexedAt: new Date().toISOString(),
-          createdAt: create.record.createdAt,
+          indexedAt: engIndexedAt,
+          createdAt: clampCreatedAt(create.record.createdAt, engIndexedAt),
           author: create.author,
         }
       }).concat(
         ops.likes.creates
           .filter(shouldStoreEngagement)
           .map((create) => {
+            const engIndexedAt = new Date().toISOString()
             return {
               uri: create.uri,
               cid: create.cid,
               subjectUri: create.record.subject.uri,
               subjectCid: create.record.subject.cid,
               type: 2,
-              indexedAt: new Date().toISOString(),
-              createdAt: create.record.createdAt,
+              indexedAt: engIndexedAt,
+              createdAt: clampCreatedAt(create.record.createdAt, engIndexedAt),
               author: create.author,
             }
           })
@@ -201,14 +222,15 @@ export class FirehoseSubscription extends FirehoseSubscriptionBase {
             const quoted = getQuotedRecord(create.record?.embed)
             if (!quoted) return []
             if (!shouldStoreQuoteEngagement(create.author, quoted.uri)) return []
+            const engIndexedAt = new Date().toISOString()
             return [{
               uri: create.uri,
               cid: create.cid,
               subjectUri: quoted.uri,
               subjectCid: quoted.cid,
               type: 3,
-              indexedAt: new Date().toISOString(),
-              createdAt: create.record.createdAt,
+              indexedAt: engIndexedAt,
+              createdAt: clampCreatedAt(create.record.createdAt, engIndexedAt),
               author: create.author,
             }]
           })

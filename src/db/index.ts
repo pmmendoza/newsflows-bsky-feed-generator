@@ -8,6 +8,10 @@ export const createDb = (connectionString: string): Database => {
     dialect: new PostgresDialect({
       pool: new Pool({
         connectionString,
+        max: 30,
+        connectionTimeoutMillis: 5000,
+        idleTimeoutMillis: 30000,
+        statement_timeout: 30000,
       }),
     }),
   })
