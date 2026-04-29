@@ -32,7 +32,7 @@ export async function updateEngagement(db: Database): Promise<void> {
   try {
     // Postgres supports at most 65535 bind params. Kysely binds one param per array element for `IN (...)`.
     // Chunk large URI lists to avoid protocol errors at scale.
-    const IN_CLAUSE_CHUNK_SIZE = 50000;
+    const IN_CLAUSE_CHUNK_SIZE = 5000;
     const execInChunks = async <T>(items: string[], fn: (chunk: string[]) => Promise<T[]>): Promise<T[]> => {
       const results: T[] = [];
       for (let i = 0; i < items.length; i += IN_CLAUSE_CHUNK_SIZE) {
