@@ -28,6 +28,7 @@ const run = async () => {
       maybeStr(process.env.FEEDGEN_PUBLISHER_DID) ?? 'did:example:alice',
     subscriptionReconnectDelay:
       maybeInt(process.env.FEEDGEN_SUBSCRIPTION_RECONNECT_DELAY) ?? 3000,
+    readOnlyMode: maybeBool(process.env.FEEDGEN_READ_ONLY_MODE) ?? false,
     hostname,
     serviceDid,
   })
@@ -47,6 +48,13 @@ const maybeInt = (val?: string) => {
   const int = parseInt(val, 10)
   if (isNaN(int)) return undefined
   return int
+}
+
+const maybeBool = (val?: string) => {
+  if (!val) return undefined
+  if (val === 'true') return true
+  if (val === 'false') return false
+  return undefined
 }
 
 run()

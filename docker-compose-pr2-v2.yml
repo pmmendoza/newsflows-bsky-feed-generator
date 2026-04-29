@@ -1,0 +1,111 @@
+services:
+  feedgen:
+    image: jbgruber/bsky-feedgen
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: feedgen-v2
+    hostname: feedgen-v2
+    restart: unless-stopped
+    ports:
+      - 127.0.0.1:3021:3020
+    logging:
+      options:
+        max-size: 10m
+    volumes:
+      - data_v2:/app/data
+      - ./subscribers.csv:/app/subscribers.csv
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      NODE_ENV: production
+      FEEDGEN_PORT: 3020
+      FEEDGEN_SUBSCRIBER_ONLY: ${FEEDGEN_SUBSCRIBER_ONLY:-'false'}
+      PRIORITIZE_API_KEY: ${PRIORITIZE_API_KEY:-''}
+      FEEDGEN_SUBSCRIPTION_ENDPOINT: ${FEEDGEN_SUBSCRIPTION_ENDPOINT:-wss://bsky.network}
+      FEEDGEN_HOSTNAME: ${FEEDGEN_HOSTNAME:-example.com}
+      FEEDGEN_BUILD_SHA: ${FEEDGEN_BUILD_SHA:-""}
+      FEEDGEN_PUBLISHER_DID: ${FEEDGEN_PUBLISHER_DID}
+      NEWSBOT_CZ_DID: ${NEWSBOT_CZ_DID}
+      NEWSBOT_FR_DID: ${NEWSBOT_FR_DID}
+      NEWSBOT_IR_DID: ${NEWSBOT_IR_DID}
+      NEWSBOT_NL_DID: ${NEWSBOT_NL_DID}
+      NEWSBOT_UK_DID: ${NEWSBOT_UK_DID}
+      FEEDGEN_SQLITE_LOCATION: ${FEEDGEN_SQLITE_LOCATION:-/app/data/db.sqlite}
+      FOLLOWS_UPDATE_INTERVAL_MS: ${FOLLOWS_UPDATE_INTERVAL_MS:-3600000}
+      # Database connection
+      FEEDGEN_DB_HOST: ${FEEDGEN_DB_HOST:-feedgen-db-v2}
+      FEEDGEN_DB_PORT: ${FEEDGEN_DB_PORT:-5432}
+      FEEDGEN_DB_USER: ${FEEDGEN_DB_USER:-feedgen}
+      FEEDGEN_DB_PASSWORD: ${FEEDGEN_DB_PASSWORD:-feedgen}
+      FEEDGEN_DB_BASE: ${FEEDGEN_DB_BASE:-feedgen-db}
+      FEEDGEN_LEGACY_DB_HOST: ${FEEDGEN_LEGACY_DB_HOST:-host.docker.internal}
+      FEEDGEN_LEGACY_DB_PORT: ${FEEDGEN_LEGACY_DB_PORT:-5434}
+      FEEDGEN_LEGACY_DB_USER: ${FEEDGEN_LEGACY_DB_USER:-feedgen}
+      FEEDGEN_LEGACY_DB_PASSWORD: ${FEEDGEN_LEGACY_DB_PASSWORD:-feedgen}
+      FEEDGEN_LEGACY_DB_DATABASE: ${FEEDGEN_LEGACY_DB_DATABASE:-feedgen-db}
+      ENGAGEMENT_TIME_HOURS: ${ENGAGEMENT_TIME_HOURS:-72}
+      # Study endpoints
+      STUDY_TOKEN_API_KEY: ${STUDY_TOKEN_API_KEY:-""}
+      STUDY_JWT_SECRET: ${STUDY_JWT_SECRET:-""}
+      STUDY_JWT_TTL_SECONDS: ${STUDY_JWT_TTL_SECONDS:-345600}
+      # PR#2: scoped ingestion + retention
+      FEEDGEN_SCOPED_INGESTION: ${FEEDGEN_SCOPED_INGESTION:-'false'}
+      FEEDGEN_RETENTION_ENABLED: ${FEEDGEN_RETENTION_ENABLED:-'false'}
+      FEEDGEN_RETENTION_POST_DAYS: ${FEEDGEN_RETENTION_POST_DAYS:-14}
+      FEEDGEN_RETENTION_ENGAGEMENT_DAYS: ${FEEDGEN_RETENTION_ENGAGEMENT_DAYS:-14}
+      FEEDGEN_RETENTION_DELETE_BATCH_SIZE: ${FEEDGEN_RETENTION_DELETE_BATCH_SIZE:-50000}
+      FEEDGEN_RETENTION_INTERVAL_MS: ${FEEDGEN_RETENTION_INTERVAL_MS:-21600000}
+      FEEDGEN_ALLOWLIST_REFRESH_MS: ${FEEDGEN_ALLOWLIST_REFRESH_MS:-60000}
+      FEEDGEN_TRACK_SUBSCRIBER_ACTIVITY: ${FEEDGEN_TRACK_SUBSCRIBER_ACTIVITY:-'false'}
+      FEEDGEN_PUBLISHER_ENGAGEMENT_SUBSCRIBER_ONLY: ${FEEDGEN_PUBLISHER_ENGAGEMENT_SUBSCRIBER_ONLY:-'false'}
+    depends_on:
+      - feedgen-db
+    networks:
+      - caddy_network
+      - feedgen_network
+
+  feedgen-db:
+    image: postgres:17
+    container_name: feedgen-db-v2
+    hostname: feedgen-db-v2
+    restart: unless-stopped
+    ports:
+      - 127.0.0.1:5435:5432
+    logging:
+      options:
+        max-size: 10m
+    volumes:
+      - db_v2:/var/lib/postgresql/data
+    environment:
+      POSTGRES_DB: ${FEEDGEN_DBBASE:-feedgen-db}
+      POSTGRES_USER: ${FEEDGEN_DBUSER:-feedgen}
+      POSTGRES_PASSWORD: ${FEEDGEN_DBPASSWORD:-feedgen}
+    shm_size: 2gb
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    command:
+      - postgres
+      - -c
+      - shared_buffers=1GB
+      - -c
+      - work_mem=32MB
+      - -c
+      - max_parallel_workers_per_gather=4
+      - -c
+      - max_parallel_workers=8
+    networks:
+      - feedgen_network
+
+volumes:
+  data_v2:
+  db_v2:
+
+networks:
+  caddy_network:
+    name: caddy_network
+    external: true
+  feedgen_network:
+    driver: bridge

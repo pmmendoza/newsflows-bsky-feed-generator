@@ -43,7 +43,7 @@ export class FeedGenerator {
 
   static create(cfg: Config) {
     const app = express()
-    
+
     // Add JSON body parser middleware
     app.use(express.json({ limit: '10mb' })) // Adjust limit as needed
     app.use(express.urlencoded({ extended: true, limit: '10mb' }))
@@ -59,7 +59,7 @@ export class FeedGenerator {
         next()
       }
     })
-    
+
     const db = createDb(
       cfg.postgresUrl ||
         `postgres://${cfg.pgUser}:${cfg.pgPassword}@${cfg.pgHost}:${cfg.pgPort}/${cfg.pgDatabase}`,
@@ -99,42 +99,52 @@ export class FeedGenerator {
 
     // register api endpoints
     registerSubscribeEndpoint(server, ctx)
-    registerPrioritizeEndpoint(server, ctx);
-    registerMonitorEndpoints(server, ctx);
-    registerUpdaterEndpoints(server, ctx);
-    registerStudyEndpoints(server, ctx);
+    registerPrioritizeEndpoint(server, ctx)
+    registerMonitorEndpoints(server, ctx)
+    registerUpdaterEndpoints(server, ctx)
+    registerStudyEndpoints(server, ctx)
 
     return new FeedGenerator(app, db, legacyDb, firehose, cfg)
   }
 
   async start(): Promise<http.Server> {
-    await migrateToLatest(this.db)
-    this.firehose.run(this.cfg.subscriptionReconnectDelay)
+    if (!this.cfg.readOnlyMode) {
+      await migrateToLatest(this.db)
+      this.firehose.run(this.cfg.subscriptionReconnectDelay)
+    }
+
     this.server = this.app.listen(this.cfg.port, this.cfg.listenhost)
     await events.once(this.server, 'listening')
 
+    if (this.cfg.readOnlyMode) {
+      console.log(
+        `[${new Date().toISOString()}] - Read-only mode enabled: skipped migrations, firehose, subscriber import, and schedulers`,
+      )
+      return this.server
+    }
+
     // Import subscribers at startup
     try {
-      await importSubscribersFromCSV(this.db);
+      await importSubscribersFromCSV(this.db)
     } catch (err) {
-      console.error('Failed to import subscribers:', err);
+      console.error('Failed to import subscribers:', err)
     }
 
     // Set up the scheduler to update follows
     // Run once every hour by default (or override with env var) for incremental updates
-    const updateInterval = parseInt(process.env.FOLLOWS_UPDATE_INTERVAL_MS || '', 10) || 60 * 60 * 1000;
-    console.log(`[${new Date().toISOString()}] - Setting up follows updater to run every ${updateInterval / 1000} seconds`);
-    this.followsUpdateTimer = setupFollowsUpdateScheduler(this.db, updateInterval);
-    this.engagementUpdateTimer = setupEngagmentUpdateScheduler(this.db, updateInterval);
+    const updateInterval = parseInt(process.env.FOLLOWS_UPDATE_INTERVAL_MS || '', 10) || 60 * 60 * 1000
+    console.log(`[${new Date().toISOString()}] - Setting up follows updater to run every ${updateInterval / 1000} seconds`)
+    this.followsUpdateTimer = setupFollowsUpdateScheduler(this.db, updateInterval)
+    this.engagementUpdateTimer = setupEngagmentUpdateScheduler(this.db, updateInterval)
 
     // Set up daily full sync at 4:00 AM to remove unfollowed accounts
-    setupDailyFullSyncScheduler(this.db);
+    setupDailyFullSyncScheduler(this.db)
 
     // Optional retention (TTL deletes) to bound storage growth
     if (process.env.FEEDGEN_RETENTION_ENABLED === 'true') {
-      const retentionIntervalMs = parseInt(process.env.FEEDGEN_RETENTION_INTERVAL_MS || '', 10) || 6 * 60 * 60 * 1000;
-      console.log(`[${new Date().toISOString()}] - Retention enabled; running every ${Math.round(retentionIntervalMs / 1000 / 60)} minutes`);
-      setupRetentionScheduler(this.db, retentionIntervalMs);
+      const retentionIntervalMs = parseInt(process.env.FEEDGEN_RETENTION_INTERVAL_MS || '', 10) || 6 * 60 * 60 * 1000
+      console.log(`[${new Date().toISOString()}] - Retention enabled; running every ${Math.round(retentionIntervalMs / 1000 / 60)} minutes`)
+      setupRetentionScheduler(this.db, retentionIntervalMs)
     }
 
     return this.server
@@ -142,24 +152,24 @@ export class FeedGenerator {
 
   async stop(): Promise<void> {
     // Stop the scheduler
-    stopAllSchedulers();
-    
+    stopAllSchedulers()
+
     if (this.db) {
-      await this.db.destroy();
+      await this.db.destroy()
     }
 
     if (this.legacyDb) {
-      await this.legacyDb.destroy();
+      await this.legacyDb.destroy()
     }
-    
+
     // Close the server if it's running
     if (this.server) {
       await new Promise<void>((resolve, reject) => {
         this.server?.close((err) => {
-          if (err) reject(err);
-          else resolve();
-        });
-      });
+          if (err) reject(err)
+          else resolve()
+        })
+      })
     }
   }
 }
