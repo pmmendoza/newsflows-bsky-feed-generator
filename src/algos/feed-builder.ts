@@ -178,6 +178,33 @@ async function logRequest(
     const requestId = requestInsertResult.id as number;
 
     if (input.servedPosts.length === 0) {
+      // Empty-result request. Still write a single archive_outbox row
+      // with null post_uri / post_cid so the archive worker can produce
+      // a research_archive.request_event row for this request. The
+      // post-level archive surfaces stay untouched. Nothing else
+      // changes for the public.request_log / public.request_posts
+      // serving contract.
+      if (includeArchiveOutbox) {
+        await trx
+          .insertInto('feedgen_ops.archive_outbox')
+          .values({
+            request_id: requestId,
+            position: 0,
+            feed_id: input.shortname,
+            study_id: null,
+            requester_did: input.requesterDid,
+            requested_at: timestamp,
+            post_uri: null,
+            post_cid: null,
+            payload_json: buildEmptyRequestPayload({
+              requestId,
+              timestamp,
+              requestedLimit,
+              input,
+            }),
+          })
+          .execute();
+      }
       return;
     }
 
@@ -268,6 +295,38 @@ function buildArchivePayload({
       comments_count: post.comments_count ?? null,
       quote_count: post.quote_count ?? null,
     },
+  };
+}
+
+function buildEmptyRequestPayload({
+  requestId,
+  timestamp,
+  requestedLimit,
+  input,
+}: {
+  requestId: number
+  timestamp: string
+  requestedLimit: number | null
+  input: RequestLogInput
+}) {
+  return {
+    schema_version: 1,
+    captured_from: 'served',
+    request: {
+      request_id: requestId,
+      position: 0,
+      feed_id: input.shortname,
+      study_id: null,
+      requester_did: input.requesterDid,
+      requested_at: timestamp,
+      cursor_in: input.params.cursor ?? null,
+      cursor_out: input.cursor ?? null,
+      requested_limit: requestedLimit,
+      result_count: 0,
+      feedgen_build_sha: process.env.FEEDGEN_BUILD_SHA || null,
+      algo_policy_id: input.shortname,
+    },
+    post: null,
   };
 }
 

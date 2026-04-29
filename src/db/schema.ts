@@ -86,8 +86,10 @@ export type ArchiveOutbox = {
   study_id?: string | null
   requester_did?: string | null
   requested_at: string | Date
-  post_uri: string
-  post_cid: string
+  // Null for empty-result request rows (position = 0); non-null for
+  // per-served-post rows (position > 0). See migration 002.
+  post_uri?: string | null
+  post_cid?: string | null
   payload_json: any
   payload_schema_version?: number
   enqueued_at?: string | Date
@@ -103,7 +105,8 @@ export type ArchiveOutboxDlq = {
   feed_id?: string | null
   study_id?: string | null
   requested_at?: string | Date | null
-  post_uri: string
+  // Nullable per migration 002 to mirror archive_outbox.post_uri.
+  post_uri?: string | null
   post_cid?: string | null
   payload_json: any
   payload_schema_version?: number

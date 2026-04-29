@@ -88,13 +88,18 @@ async function archiveRow(db: Database, row: ArchiveOutbox) {
   const request = payload.request ?? {}
   const post = payload.post
 
-  if (!post) {
-    throw new Error(`archive outbox row ${row.outbox_id} has no payload.post`)
+  if (post && row.post_uri == null) {
+    throw new Error(
+      `archive outbox row ${row.outbox_id} has post payload but null post_uri (inconsistent state)`,
+    )
+  }
+  if (!post && row.post_uri != null) {
+    throw new Error(
+      `archive outbox row ${row.outbox_id} has post_uri but no payload.post (inconsistent state)`,
+    )
   }
 
   const requestedAt = parseDate(row.requested_at) ?? new Date()
-  const createdAt = parseDate(post.createdAt)
-  const indexedAt = parseDate(post.indexedAt)
 
   await db.transaction().execute(async (trx) => {
     await trx
@@ -115,6 +120,20 @@ async function archiveRow(db: Database, row: ArchiveOutbox) {
       })
       .onConflict((oc) => oc.column('request_id').doNothing())
       .execute()
+
+    if (!post) {
+      // Empty-result request: only request_event is written. No
+      // post_snapshot, no served_post_event. Drop the outbox row and
+      // return.
+      await trx
+        .deleteFrom('feedgen_ops.archive_outbox')
+        .where('outbox_id', '=', row.outbox_id as any)
+        .execute()
+      return
+    }
+
+    const createdAt = parseDate(post.createdAt)
+    const indexedAt = parseDate(post.indexedAt)
 
     await trx
       .insertInto('research_archive.post_snapshot')
