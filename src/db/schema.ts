@@ -6,6 +6,12 @@ export type DatabaseSchema = {
   subscriber: Subscriber
   request_log: RequestLog
   request_posts: RequestPosts
+  'feedgen_ops.archive_outbox': ArchiveOutbox
+  'feedgen_ops.archive_outbox_dlq': ArchiveOutboxDlq
+  'research_archive.post_snapshot': PostSnapshot
+  'research_archive.post_snapshot_capture_source': PostSnapshotCaptureSource
+  'research_archive.request_event': RequestEvent
+  'research_archive.served_post_event': ServedPostEvent
 }
 
 export type Post = {
@@ -70,4 +76,103 @@ export type RequestPosts = {
   position: number
   request_id: number
   post_uri: string
+}
+
+export type ArchiveOutbox = {
+  outbox_id?: number | string
+  request_id: number
+  position: number
+  feed_id?: string | null
+  study_id?: string | null
+  requester_did?: string | null
+  requested_at: string | Date
+  post_uri: string
+  post_cid: string
+  payload_json: any
+  payload_schema_version?: number
+  enqueued_at?: string | Date
+  attempts?: number
+  last_attempt_at?: string | Date | null
+  last_error?: string | null
+}
+
+export type ArchiveOutboxDlq = {
+  outbox_id: number | string
+  request_id: number
+  position: number
+  feed_id?: string | null
+  study_id?: string | null
+  requested_at?: string | Date | null
+  post_uri: string
+  post_cid?: string | null
+  payload_json: any
+  payload_schema_version?: number
+  failed_at?: string | Date
+  attempts: number
+  last_error: string
+}
+
+export type PostSnapshot = {
+  post_uri: string
+  cid: string
+  author_did?: string | null
+  created_at?: string | Date | null
+  indexed_at?: string | Date | null
+  created_at_raw?: string | null
+  indexed_at_raw?: string | null
+  text?: string | null
+  root_uri?: string | null
+  root_cid?: string | null
+  link_url?: string | null
+  link_title?: string | null
+  link_description?: string | null
+  raw_record_json?: any
+  first_seen_at?: string | Date | null
+  first_captured_from: string
+  captured_at?: string | Date
+}
+
+export type PostSnapshotCaptureSource = {
+  post_uri: string
+  cid: string
+  captured_from: string
+  first_captured_at?: string | Date
+  last_captured_at?: string | Date
+  observation_count?: number | string
+}
+
+export type RequestEvent = {
+  request_id: number
+  feed_id?: string | null
+  study_id?: string | null
+  requester_ref?: string | null
+  requester_did_hash?: string | null
+  requested_at: string | Date
+  cursor_in?: string | null
+  cursor_out?: string | null
+  requested_limit?: number | null
+  result_count?: number | null
+  feedgen_build_sha?: string | null
+  algo_policy_id?: string | null
+  ranker_run_id?: string | null
+  captured_at?: string | Date
+}
+
+export type ServedPostEvent = {
+  request_id: number
+  position: number
+  feed_id?: string | null
+  study_id?: string | null
+  post_uri: string
+  post_cid?: string | null
+  likes_count?: number | null
+  repost_count?: number | null
+  comments_count?: number | null
+  quote_count?: number | null
+  priority?: number | null
+  priority_source?: string | null
+  selection_reason_json?: any
+  ranker_run_id?: string | null
+  payload_status?: string
+  captured_at?: string | Date
 }

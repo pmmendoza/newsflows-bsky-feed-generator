@@ -1,6 +1,6 @@
 import { Kysely } from 'kysely'
 import { QueryParams, OutputSchema as AlgoOutput } from '../lexicon/types/app/bsky/feed/getFeedSkeleton'
-import { DatabaseSchema } from '../db/schema'
+import { DatabaseSchema, Post } from '../db/schema'
 import { AppContext } from '../config'
 import { SkeletonFeedPost } from '../lexicon/types/app/bsky/feed/defs'
 
@@ -77,19 +77,24 @@ export async function buildFeed({
 
   // Merge both post lists in a 1:2 pattern (1 publisher post, 2 other posts)
   const feed: SkeletonFeedPost[] = [];
+  const servedPosts: Post[] = [];
   let publisherIndex = 0;
   let otherIndex = 0;
 
   while (publisherIndex < publisherPosts.length || otherIndex < otherPosts.length) {
     // Add 1 publisher post
     if (publisherIndex < publisherPosts.length) {
-      feed.push({ post: publisherPosts[publisherIndex].uri });
+      const post = publisherPosts[publisherIndex] as Post;
+      feed.push({ post: post.uri });
+      servedPosts.push(post);
       publisherIndex++;
     }
 
     // Add 2 other posts
     for (let i = 0; i < 2 && otherIndex < otherPosts.length; i++) {
-      feed.push({ post: otherPosts[otherIndex].uri });
+      const post = otherPosts[otherIndex] as Post;
+      feed.push({ post: post.uri });
+      servedPosts.push(post);
       otherIndex++;
     }
   }
@@ -102,51 +107,167 @@ export async function buildFeed({
     cursor = (cursorOffset + limit * 2).toString();
   }
 
-  // Log request to database (non-blocking)
-  setTimeout(async () => {
-    try {
-      const timestamp = new Date().toISOString();
-      const requestedLimit =
-        typeof params.limit === 'number' && Number.isFinite(params.limit)
-          ? params.limit
-          : null
-      const requestInsertResult = await ctx.db
-        .insertInto('request_log')
-        .values({
-          algo: shortname,
-          requester_did: requesterDid,
-          timestamp: timestamp,
-          cursor_in: params.cursor ?? null,
-          cursor_out: cursor ?? null,
-          requested_limit: requestedLimit,
-          publisher_count: publisherPosts.length,
-          follows_count: otherPosts.length,
-          result_count: feed.length,
-        })
-        .returning('id')
-        .executeTakeFirstOrThrow();
+  const archiveOutboxEnabled = process.env.FEEDGEN_ARCHIVE_OUTBOX_ENABLED === 'true';
+  const requestLogInput = {
+    shortname,
+    requesterDid,
+    params,
+    cursor,
+    publisherCount: publisherPosts.length,
+    followsCount: otherPosts.length,
+    servedPosts,
+  };
 
-      if (feed.length > 0) {
-        const postValues = feed.map((post, index) => ({
-          position: index + 1,
-          request_id: requestInsertResult.id as number,
-          post_uri: post.post
-        }));
-
-        // Use batch insert for better performance
-        await ctx.db
-          .insertInto('request_posts')
-          .values(postValues)
-          .execute();
+  if (archiveOutboxEnabled) {
+    await logRequest(ctx, requestLogInput, true);
+  } else {
+    // Preserve the current non-blocking behavior until the archive cut-over flag is enabled.
+    setTimeout(async () => {
+      try {
+        await logRequest(ctx, requestLogInput, false);
+      } catch (error) {
+        console.error('Error logging request:', error);
       }
-    } catch (error) {
-      console.error('Error logging request:', error);
-    }
-  }, 0);
+    }, 0);
+  }
 
   return {
     cursor,
     feed,
+  };
+}
+
+type RequestLogInput = {
+  shortname: string
+  requesterDid: string
+  params: QueryParams
+  cursor?: string
+  publisherCount: number
+  followsCount: number
+  servedPosts: Post[]
+}
+
+async function logRequest(
+  ctx: AppContext,
+  input: RequestLogInput,
+  includeArchiveOutbox: boolean,
+) {
+  const timestamp = new Date().toISOString();
+  const requestedLimit =
+    typeof input.params.limit === 'number' && Number.isFinite(input.params.limit)
+      ? input.params.limit
+      : null;
+
+  await ctx.db.transaction().execute(async (trx) => {
+    const requestInsertResult = await trx
+      .insertInto('request_log')
+      .values({
+        algo: input.shortname,
+        requester_did: input.requesterDid,
+        timestamp,
+        cursor_in: input.params.cursor ?? null,
+        cursor_out: input.cursor ?? null,
+        requested_limit: requestedLimit,
+        publisher_count: input.publisherCount,
+        follows_count: input.followsCount,
+        result_count: input.servedPosts.length,
+      })
+      .returning('id')
+      .executeTakeFirstOrThrow();
+
+    const requestId = requestInsertResult.id as number;
+
+    if (input.servedPosts.length === 0) {
+      return;
+    }
+
+    await trx
+      .insertInto('request_posts')
+      .values(input.servedPosts.map((post, index) => ({
+        position: index + 1,
+        request_id: requestId,
+        post_uri: post.uri,
+      })))
+      .execute();
+
+    if (!includeArchiveOutbox) {
+      return;
+    }
+
+    await trx
+      .insertInto('feedgen_ops.archive_outbox')
+      .values(input.servedPosts.map((post, index) => ({
+        request_id: requestId,
+        position: index + 1,
+        feed_id: input.shortname,
+        study_id: null,
+        requester_did: input.requesterDid,
+        requested_at: timestamp,
+        post_uri: post.uri,
+        post_cid: post.cid,
+        payload_json: buildArchivePayload({
+          requestId,
+          position: index + 1,
+          timestamp,
+          requestedLimit,
+          input,
+          post,
+        }),
+      })))
+      .execute();
+  });
+}
+
+function buildArchivePayload({
+  requestId,
+  position,
+  timestamp,
+  requestedLimit,
+  input,
+  post,
+}: {
+  requestId: number
+  position: number
+  timestamp: string
+  requestedLimit: number | null
+  input: RequestLogInput
+  post: Post
+}) {
+  return {
+    schema_version: 1,
+    captured_from: 'served',
+    request: {
+      request_id: requestId,
+      position,
+      feed_id: input.shortname,
+      study_id: null,
+      requester_did: input.requesterDid,
+      requested_at: timestamp,
+      cursor_in: input.params.cursor ?? null,
+      cursor_out: input.cursor ?? null,
+      requested_limit: requestedLimit,
+      result_count: input.servedPosts.length,
+      feedgen_build_sha: process.env.FEEDGEN_BUILD_SHA || null,
+      algo_policy_id: input.shortname,
+    },
+    post: {
+      uri: post.uri,
+      cid: post.cid,
+      author: post.author,
+      createdAt: post.createdAt,
+      indexedAt: post.indexedAt,
+      text: post.text,
+      rootUri: post.rootUri,
+      rootCid: post.rootCid,
+      linkUrl: post.linkUrl,
+      linkTitle: post.linkTitle,
+      linkDescription: post.linkDescription,
+      priority: post.priority ?? null,
+      likes_count: post.likes_count ?? null,
+      repost_count: post.repost_count ?? null,
+      comments_count: post.comments_count ?? null,
+      quote_count: post.quote_count ?? null,
+    },
   };
 }
 
