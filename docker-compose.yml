@@ -4,8 +4,8 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: feedgen
-    hostname: feedgen
+    container_name: feedgen-v2
+    hostname: feedgen-v2
     restart: unless-stopped
     ports:
       - "3020:3020"
@@ -41,16 +41,20 @@ services:
       STUDY_JWT_TTL_SECONDS: ${STUDY_JWT_TTL_SECONDS:-345600}
       STUDY_COMPLIANCE_RATE_LIMIT_WINDOW_SECONDS: ${STUDY_COMPLIANCE_RATE_LIMIT_WINDOW_SECONDS:-60}
       STUDY_COMPLIANCE_RATE_LIMIT_MAX: ${STUDY_COMPLIANCE_RATE_LIMIT_MAX:-60}
+    networks:
+      - default
+      - caddy_network
     depends_on:
       - feedgen-db
 
   feedgen-db:
     image: postgres:17
-    container_name: feedgen-db
-    hostname: feedgen-db
+    container_name: feedgen-db-v2
+    hostname: feedgen-db-v2
     restart: unless-stopped
     ports:
       - "5434:5432"
+      - "127.0.0.1:5435:5432"
     logging:
       options:
         max-size: 10m
@@ -60,7 +64,7 @@ services:
       POSTGRES_DB: ${FEEDGEN_DBBASE:-feedgen-db}
       POSTGRES_USER: ${FEEDGEN_DBUSER:-feedgen}
       POSTGRES_PASSWORD: ${FEEDGEN_DBPASSWORD:-feedgen}
-    shm_size: 2gb
+    shm_size: 8gb
     ulimits:
       memlock:
         soft: -1
@@ -68,9 +72,9 @@ services:
     command:
       - postgres
       - -c
-      - shared_buffers=1GB
+      - shared_buffers=32GB
       - -c
-      - work_mem=32MB
+      - work_mem=256MB
       - -c
       - max_parallel_workers_per_gather=4
       - -c
@@ -80,4 +84,11 @@ volumes:
   data:
   extensions:
   db:
+    external: true
+    name: newsflows-bsky-feed-generator-v2_db_v2
   
+
+networks:
+  default:
+  caddy_network:
+    external: true
