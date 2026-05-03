@@ -1,5 +1,11 @@
-.env
-node_modules/
-*.R
-subscribers.csv
-passwords.csv
+# Keep the Docker build context explicit. The image is public, so never let
+# local env files, git metadata, operator notes, or data files enter it.
+*
+
+!Dockerfile
+!.dockerignore
+!package.json
+!yarn.lock
+!tsconfig.json
+!src/
+!src/**

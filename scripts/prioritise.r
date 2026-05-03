@@ -1,5 +1,11 @@
 library(httr2)
 readRenviron(".env")
+feedgen_priority_key <- function() {
+  key <- Sys.getenv("FEEDGEN_PRIORITY_API_KEY", "")
+  if (key == "") key <- Sys.getenv("FEEDGEN_RANKER_API_KEY", "")
+  if (key == "") key <- Sys.getenv("FEEDGEN_ADMIN_API_KEY", "")
+  key
+}
 
 
 #' Prioritise Posts for Feeds 2
@@ -41,7 +47,7 @@ prioritize <- function(
         priority = priority,
         maxdays = maxdays
       ) |>
-      req_headers("api-key" = Sys.getenv("PRIORITIZE_API_KEY")) |>
+      req_headers("api-key" = feedgen_priority_key()) |>
       req_error(body = \(resp) {
         switch(
           resp_content_type(resp),
@@ -65,7 +71,7 @@ prioritize <- function(
         test = test
       ) |>
       req_body_json(post_list) |>
-      req_headers("api-key" = Sys.getenv("PRIORITIZE_API_KEY")) |>
+      req_headers("api-key" = feedgen_priority_key()) |>
       req_error(body = \(resp) {
         switch(
           resp_content_type(resp),

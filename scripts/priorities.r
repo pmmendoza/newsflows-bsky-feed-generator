@@ -1,5 +1,11 @@
 library(httr2)
 readRenviron(".env")
+feedgen_read_key <- function() {
+  key <- Sys.getenv("FEEDGEN_READ_API_KEY", "")
+  if (key == "") key <- Sys.getenv("FEEDGEN_MONITOR_API_KEY", "")
+  if (key == "") key <- Sys.getenv("FEEDGEN_RANKER_API_KEY", "")
+  key
+}
 # for https servers use
 # base_req <- request(paste0(
 #   "https://",
@@ -17,7 +23,7 @@ priorities <- base_req |>
     publisher_did = "did:plc:toz4no26o2x4vsbum7cp4bxp"
   ) |>
   req_headers(
-    "api-key" = Sys.getenv("PRIORITIZE_API_KEY"),
+    "api-key" = feedgen_read_key(),
     .redact = "api-key"
   ) |>
   req_perform() |>
@@ -35,7 +41,7 @@ priorities <- base_req |>
     requester_did = atrrr::get_user_info("jbgruber.bsky.social")$did
   ) |>
   req_headers(
-    "api-key" = Sys.getenv("PRIORITIZE_API_KEY"),
+    "api-key" = feedgen_read_key(),
     .redact = "api-key"
   ) |>
   req_perform() |>

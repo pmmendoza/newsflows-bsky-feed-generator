@@ -3,10 +3,15 @@ import express from 'express'
 import { AppContext } from '../config'
 import { Server } from '../lexicon'
 import { sql, SqlBool } from 'kysely'
+import { ApiKeyAuthConfig, isApiKeyAuthorized, logUnauthorized } from '../util/api-auth'
 
 interface PriorityUpdate {
   uri: string;
   priority: number;
+}
+
+const priorityWriteAuth: ApiKeyAuthConfig = {
+  primaryEnv: ['FEEDGEN_PRIORITY_API_KEY', 'FEEDGEN_RANKER_API_KEY', 'FEEDGEN_ADMIN_API_KEY'],
 }
 
 export default function registerPrioritizeEndpoint(server: Server, ctx: AppContext) {
@@ -14,10 +19,8 @@ export default function registerPrioritizeEndpoint(server: Server, ctx: AppConte
   server.xrpc.router.post('/api/prioritize', async (req: express.Request, res: express.Response) => {
     try {
       const { keywords, test = true, priority = 1, maxhours = 1 } = req.query
-      const apiKey = req.headers['api-key']
-
-      if (!apiKey || apiKey !== process.env.PRIORITIZE_API_KEY) {
-        console.log(`[${new Date().toISOString()}] - Attempted unauthorized access with API key ${apiKey}`);
+      if (!isApiKeyAuthorized(req, priorityWriteAuth)) {
+        logUnauthorized('/api/prioritize')
         return res.status(401).json({ error: 'Unauthorized: Invalid API key' })
       }
 
@@ -117,10 +120,8 @@ export default function registerPrioritizeEndpoint(server: Server, ctx: AppConte
   server.xrpc.router.get('/api/prioritize', async (req: express.Request, res: express.Response) => {
     try {
       const { keywords, test = true, priority = 1, maxhours = 1 } = req.query
-      const apiKey = req.headers['api-key']
-
-      if (!apiKey || apiKey !== process.env.PRIORITIZE_API_KEY) {
-        console.log(`[${new Date().toISOString()}] - Attempted unauthorized access with API key ${apiKey}`);
+      if (!isApiKeyAuthorized(req, priorityWriteAuth)) {
+        logUnauthorized('/api/prioritize')
         return res.status(401).json({ error: 'Unauthorized: Invalid API key' })
       }
 
