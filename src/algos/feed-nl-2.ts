@@ -3,11 +3,18 @@ import { AppContext } from '../config'
 import { buildFeed, FeedGenerator } from './feed-builder'
 import { Kysely } from 'kysely'
 import { DatabaseSchema } from '../db/schema'
+import { applyPriorityOrderForFeed } from './ranker-priority-helper'
 
 // max 15 chars
 export const shortname = 'newsflow-nl-2'
 
-// Feed with priority ordering
+// Feed with priority ordering. Sprint 5 Lane C (2026-05-03) added
+// per-feed canary support: when env
+// `FEEDGEN_PRIORITY_FROM_RANKER_PROD_NEWSFLOW_NL_2=true` (or the
+// master flag `FEEDGEN_PRIORITY_FROM_RANKER_PROD=true`), the handler
+// joins `ranker_prod.feed_current_priority` and orders by that
+// table's `priority` instead of legacy `post.priority`. Default
+// behaviour is unchanged.
 export const handler: FeedGenerator = async (ctx: AppContext, params: QueryParams, requesterDid: string) => {
   return buildFeed({
     shortname,
@@ -19,7 +26,6 @@ export const handler: FeedGenerator = async (ctx: AppContext, params: QueryParam
   });
 };
 
-// Publisher posts query builder - with priority
 function buildPublisherPostsQuery(
   db: Kysely<DatabaseSchema>,
   timeLimit: string,
@@ -28,22 +34,16 @@ function buildPublisherPostsQuery(
   limit: number
 ) {
   const publisherDid = process.env.NEWSBOT_NL_DID || '';
-  return db
+  const base = db
     .selectFrom('post')
-    .selectAll()
+    .selectAll('post')
     .where('author', '=', publisherDid)
-    .where('post.indexedAt', '>=', timeLimit)
-    // Order by priority first, then by recency
-    .orderBy((eb) => 
-      eb.fn('coalesce', [eb.ref('priority'), eb.val(0)]), 'desc'
-    )
-    .orderBy('indexedAt', 'desc')
-    .orderBy('cid', 'desc')
+    .where('post.indexedAt', '>=', timeLimit);
+  return applyPriorityOrderForFeed(base, shortname)
     .offset(cursorOffset)
     .limit(limit);
 }
 
-// Follows posts query builder - with priority
 function buildFollowsPostsQuery(
   db: Kysely<DatabaseSchema>,
   timeLimit: string,
@@ -52,19 +52,13 @@ function buildFollowsPostsQuery(
   limit: number
 ) {
   const publisherDid = process.env.NEWSBOT_NL_DID || '';
-  return db
+  const base = db
     .selectFrom('post')
-    .selectAll()
+    .selectAll('post')
     .where('author', '!=', publisherDid)
     .where('post.indexedAt', '>=', timeLimit)
-    .where((eb) => eb('author', 'in', requesterFollows))
-    // Order by priority first, then by recency
-    .orderBy((eb) => 
-      eb.fn('coalesce', [eb.ref('priority'), eb.val(0)]), 'desc'
-    )
-    // Then by most recent
-    .orderBy('indexedAt', 'desc')
-    .orderBy('cid', 'desc')
+    .where((eb) => eb('author', 'in', requesterFollows));
+  return applyPriorityOrderForFeed(base, shortname)
     .offset(cursorOffset)
     .limit(limit);
 }

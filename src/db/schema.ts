@@ -11,6 +11,7 @@ export type DatabaseSchema = {
   'feedgen_ops.feed_catalog': FeedCatalog
   'feedgen_ops.study_catalog': StudyCatalog
   'feedgen_ops.study_registry': StudyRegistry
+  'ranker_prod.feed_current_priority': FeedCurrentPriority
   'research_archive.post_snapshot': PostSnapshot
   'research_archive.post_snapshot_capture_source': PostSnapshotCaptureSource
   'research_archive.request_event': RequestEvent
@@ -203,6 +204,20 @@ export type StudyRegistry = {
   active_until?: string | Date | null
   source?: string | null
   status: string
+}
+
+// Sprint 5 Lane A — ranker_prod.feed_current_priority. Current
+// per-(feed, post) priority surface, maintained by the ranker via
+// upserts from each ranker_run. The serving query (Sprint 5 Lane C)
+// joins this table for variant-2 feed handlers when the per-feed
+// canary flag is enabled.
+export type FeedCurrentPriority = {
+  feed_id: string
+  post_uri: string
+  priority?: number | null
+  score?: number | null
+  run_id: string
+  updated_at?: string | Date
 }
 
 export type ServedPostEvent = {
