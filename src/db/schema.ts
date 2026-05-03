@@ -8,6 +8,9 @@ export type DatabaseSchema = {
   request_posts: RequestPosts
   'feedgen_ops.archive_outbox': ArchiveOutbox
   'feedgen_ops.archive_outbox_dlq': ArchiveOutboxDlq
+  'feedgen_ops.feed_catalog': FeedCatalog
+  'feedgen_ops.study_catalog': StudyCatalog
+  'feedgen_ops.study_registry': StudyRegistry
   'research_archive.post_snapshot': PostSnapshot
   'research_archive.post_snapshot_capture_source': PostSnapshotCaptureSource
   'research_archive.request_event': RequestEvent
@@ -159,6 +162,47 @@ export type RequestEvent = {
   algo_policy_id?: string | null
   ranker_run_id?: string | null
   captured_at?: string | Date
+}
+
+// Sprint 6 Lane A — feedgen_ops.feed_catalog. One row per active or
+// retired feed. Mirrors migration 003. Used by describeFeedGenerator
+// (Sprint 6 Lane D) to enumerate enabled feeds from the database
+// rather than the static handler registry.
+export type FeedCatalog = {
+  feed_id: string
+  rkey: string
+  display_name: string
+  country?: string | null
+  publisher_did?: string | null
+  study_id?: string | null
+  algo_policy_id: string
+  ranker_policy_id?: string | null
+  access_policy_id: string
+  enabled: boolean
+  created_at?: string | Date
+  retired_at?: string | Date | null
+}
+
+export type StudyCatalog = {
+  study_id: string
+  name: string
+  starts_at?: string | Date | null
+  ends_at?: string | Date | null
+  status: string
+  created_at?: string | Date
+}
+
+// Sprint 6 Lane A — feedgen_ops.study_registry. Governance layer on
+// top of subscriber. A DID without a row is "in scope" by default;
+// only an explicit ':stop_tracking' status terminates engagement
+// archive enqueue (per Sprint 6 Lane D contract).
+export type StudyRegistry = {
+  study_id: string
+  did: string
+  active_from: string | Date
+  active_until?: string | Date | null
+  source?: string | null
+  status: string
 }
 
 export type ServedPostEvent = {
