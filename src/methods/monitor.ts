@@ -13,9 +13,12 @@ import {
   trackSubscriberActivityEnabled,
 } from '../util/ingestion-scope'
 import { getRetentionConfig } from '../util/retention'
+import { ApiKeyAuthConfig, isApiKeyAuthorized, logUnauthorized } from '../util/api-auth'
 
 type EngagementExportType = 'like' | 'repost' | 'comment' | 'quote'
 type EngagementExportScope = 'union' | 'publisher' | 'subscriber' | 'subscriber_on_publisher'
+type ActivityScope = 'publisher_posts' | 'feed_posts' | 'all_tracked'
+type EngagementTargetMode = 'any' | 'publisher' | 'non_publisher'
 
 type EngagementExportEvent = {
   type: EngagementExportType
@@ -46,7 +49,50 @@ type EngagementCursor = {
   filter_sig: string
 }
 
+type ActivityFilters = {
+  since: string
+  until: string
+  scope: ActivityScope
+  limit: number
+  types: EngagementExportType[]
+  subscriberDid: string | null
+  includeRetrievals: boolean
+  includeEngagements: boolean
+}
+
+type ActivityRetrievalRow = {
+  request_id: number
+  timestamp: string
+  algo: string
+  result_count: number | null
+  posts: Array<{ uri: string; position: number }>
+}
+
+type ActivityEngagementRow = {
+  type: EngagementExportType
+  event_uri: string
+  target_uri: string
+  author_did: string
+  created_at: string
+  indexed_at: string | null
+  publisher_target: boolean
+  served_to_subscriber: boolean
+}
+
+type ActivityEngagementResponseRow = ActivityEngagementRow & {
+  bluesky_url: string | null
+}
+
 let cachedPackageVersion: string | null | undefined
+
+const monitorReadAuth: ApiKeyAuthConfig = {
+  primaryEnv: [
+    'FEEDGEN_MONITOR_API_KEY',
+    'FEEDGEN_READ_API_KEY',
+    'FEEDGEN_RANKER_API_KEY',
+    'FEEDGEN_ADMIN_API_KEY',
+  ],
+}
 
 function getPackageVersion(): string | undefined {
   if (cachedPackageVersion !== undefined) {
@@ -110,6 +156,64 @@ function buildFilterSignature(filters: EngagementFilters): string {
   return createHash('sha256').update(json).digest('hex')
 }
 
+function buildActivityFilterSignature(filters: ActivityFilters): string {
+  const normalized = {
+    since: filters.since,
+    until: filters.until,
+    scope: filters.scope,
+    limit: filters.limit,
+    types: [...filters.types].sort(),
+    subscriber_did: filters.subscriberDid,
+    include_retrievals: filters.includeRetrievals,
+    include_engagements: filters.includeEngagements,
+  }
+  return createHash('sha256').update(JSON.stringify(normalized)).digest('hex')
+}
+
+/**
+ * Build a SQL predicate that tests whether an AT URI column refers to a
+ * post owned by one of the given DIDs.
+ *
+ * Implementation: `split_part(<column>::text, '/', 3) IN (<dids>)`. The
+ * third '/'-separated component of any AT URI is the author DID
+ * (`at://<did>/<collection>/<rkey>`), so equality on that component is
+ * equivalent to "the URI is owned by one of these DIDs".
+ *
+ * Why split_part and not a range comparison: the prior implementation
+ * built `column >= 'at://<did>/' AND column < 'at://<did>0'` on the
+ * assumption that ASCII ordering applies (where '/' < '0'). The
+ * `feedgen-db` Postgres cluster runs with `en_US.utf8` collation, in
+ * which `'/' < '0'` is FALSE for textual comparison — so every range
+ * built that way evaluated as empty. The endpoint silently returned 0
+ * events for `scope=publisher` and `scope=subscriber_on_publisher`,
+ * which crashed the ranker pipeline (polars schema mismatch on an
+ * empty `scores_df`). `split_part(...)` is collation-independent
+ * because it compares the extracted DID for equality, not URI
+ * prefixes for range membership.
+ *
+ * Cross-references for the next maintainer:
+ *   - The same `split_part(uri, '/', 3) IN (...)` shape is used in
+ *     this file at line ~1090 (publisherTargetExpr inside
+ *     handleEngagementExport) and in `methods/study.ts:466`.
+ *     Adopting it here removes a duplication.
+ *   - Incident write-up:
+ *     `BSKY/dev_feeds/blueskyranker_v2/dev/storage/incident_publisher_did_filter_collation_2026-05-03.md`.
+ *
+ * Exported for unit testing in `scripts/test_publisher_did_filter.ts`.
+ */
+export function buildAtUriDidMembershipFilter(
+  column: ReturnType<typeof sql>,
+  dids: string[],
+  include: boolean,
+): ReturnType<typeof sql> {
+  if (dids.length === 0) {
+    return include ? sql<boolean>`false` : sql<boolean>`true`
+  }
+
+  const expr = sql<boolean>`split_part(${column}::text, '/', 3) IN (${sql.join(dids)})`
+  return include ? expr : sql<boolean>`NOT (${expr})`
+}
+
 function encodeEngagementCursor(cursor: EngagementCursor): string {
   return base64UrlEncode(JSON.stringify(cursor))
 }
@@ -134,12 +238,6 @@ function decodeEngagementCursor(raw: string): EngagementCursor {
     throw new Error('cursor.filter_sig must be a non-empty string')
   }
   return { created_at, event_uri, filter_sig }
-}
-
-function parseHeaderValue(value: unknown): string | undefined {
-  if (typeof value === 'string') return value
-  if (Array.isArray(value) && typeof value[0] === 'string') return value[0]
-  return undefined
 }
 
 function parseBoolParam(raw: unknown): boolean | undefined {
@@ -184,12 +282,406 @@ function getDefaultSinceUntil(): { since: string; until: string } {
   return { since: sinceDate.toISOString(), until: untilDate.toISOString() }
 }
 
+function getDefaultActivitySinceUntil(): { since: string; until: string } {
+  const untilDate = new Date()
+  const sinceDate = new Date(untilDate.getTime() - 2 * 24 * 60 * 60 * 1000)
+  return { since: sinceDate.toISOString(), until: untilDate.toISOString() }
+}
+
+function parseActivityTypes(raw: unknown): EngagementExportType[] {
+  if (raw === undefined) return ['like', 'repost', 'comment', 'quote']
+  if (typeof raw !== 'string') {
+    throw new Error('types must be a comma-separated string')
+  }
+  const parsed = raw
+    .split(',')
+    .map((t) => t.trim().toLowerCase())
+    .filter((t) => t.length > 0)
+  const allowed: EngagementExportType[] = []
+  for (const t of parsed) {
+    if (t === 'like' || t === 'repost' || t === 'comment' || t === 'quote') {
+      allowed.push(t)
+    } else {
+      throw new Error(`types contains invalid value: ${t}`)
+    }
+  }
+  const unique = Array.from(new Set(allowed))
+  if (unique.length === 0) throw new Error('types must include at least one type')
+  return unique
+}
+
+function parseActivityScope(raw: unknown): ActivityScope {
+  if (raw === undefined) return 'all_tracked'
+  if (
+    raw === 'publisher_posts' ||
+    raw === 'feed_posts' ||
+    raw === 'all_tracked'
+  ) {
+    return raw
+  }
+  throw new Error('scope must be one of: feed_posts|publisher_posts|all_tracked')
+}
+
+function parseActivityFilters(req: any): { filters: ActivityFilters; cursor: EngagementCursor | null; filterSig: string } {
+  const cursorRaw = typeof req.query?.cursor === 'string' ? req.query.cursor : undefined
+  if (cursorRaw !== undefined && cursorRaw.length === 0) {
+    throw new Error('cursor must be a non-empty string')
+  }
+
+  const subscriberDid = parseDidParam(req.query?.subscriber_did) ?? null
+  if (req.query?.subscriber_did !== undefined && !subscriberDid) {
+    throw new Error('subscriber_did must be a DID (did:...)')
+  }
+
+  const includeRetrievalsRaw = parseBoolParam(req.query?.include_retrievals)
+  if (req.query?.include_retrievals !== undefined && includeRetrievalsRaw === undefined) {
+    throw new Error('include_retrievals must be true|false|1|0')
+  }
+  const includeEngagementsRaw = parseBoolParam(req.query?.include_engagements)
+  if (req.query?.include_engagements !== undefined && includeEngagementsRaw === undefined) {
+    throw new Error('include_engagements must be true|false|1|0')
+  }
+
+  const includeRetrievals = includeRetrievalsRaw ?? Boolean(subscriberDid)
+  const includeEngagements = includeEngagementsRaw ?? true
+  if (includeRetrievals && !subscriberDid) {
+    throw new Error('include_retrievals=true requires subscriber_did')
+  }
+  if (!includeEngagements && cursorRaw) {
+    throw new Error('cursor requires include_engagements=true')
+  }
+
+  const scope = parseActivityScope(req.query?.scope)
+  if (scope === 'feed_posts' && !subscriberDid) {
+    throw new Error('scope=feed_posts requires subscriber_did')
+  }
+
+  const limitRaw = req.query?.limit
+  const limit = limitRaw === undefined ? 100 : parseNonNegInt(limitRaw)
+  if (limit === undefined || limit <= 0) throw new Error('limit must be a positive integer')
+  if (limit > 1000) throw new Error('limit must be <= 1000')
+
+  const { since: defaultSince, until: defaultUntil } = getDefaultActivitySinceUntil()
+  let until = req.query?.until ? parseIsoOrThrow(req.query.until, 'until') : defaultUntil
+  let since: string
+
+  if (req.query?.days !== undefined) {
+    if (req.query?.since !== undefined) {
+      throw new Error('days cannot be combined with since')
+    }
+    const days = parseNonNegInt(req.query.days)
+    if (days === undefined || days <= 0) throw new Error('days must be a positive integer')
+    if (days > 7) throw new Error('days must be <= 7')
+    since = new Date(new Date(until).getTime() - days * 24 * 60 * 60 * 1000).toISOString()
+  } else {
+    since = req.query?.since ? parseIsoOrThrow(req.query.since, 'since') : defaultSince
+    if (req.query?.until === undefined) until = defaultUntil
+  }
+
+  const sinceMs = new Date(since).getTime()
+  const untilMs = new Date(until).getTime()
+  if (sinceMs >= untilMs) {
+    throw new Error('since must be earlier than until')
+  }
+  if (untilMs - sinceMs > 7 * 24 * 60 * 60 * 1000) {
+    throw new Error('window must be <= 7 days')
+  }
+
+  const filters: ActivityFilters = {
+    since,
+    until,
+    scope,
+    limit,
+    types: parseActivityTypes(req.query?.types),
+    subscriberDid,
+    includeRetrievals,
+    includeEngagements,
+  }
+  const filterSig = buildActivityFilterSignature(filters)
+  let cursor: EngagementCursor | null = null
+  if (cursorRaw) {
+    cursor = decodeEngagementCursor(cursorRaw)
+    if (cursor.filter_sig !== filterSig) {
+      throw new Error('cursor does not match request filters')
+    }
+  }
+
+  return { filters, cursor, filterSig }
+}
+
+function blueskyPostUrlFromAtUri(uri: string | null | undefined): string | null {
+  if (!uri) return null
+  const match = /^at:\/\/([^/]+)\/app\.bsky\.feed\.post\/([^/]+)$/.exec(uri)
+  if (!match) return null
+  return `https://bsky.app/profile/${match[1]}/post/${match[2]}`
+}
+
+async function fetchActivityRetrievalRows(
+  db: Database,
+  filters: ActivityFilters,
+): Promise<ActivityRetrievalRow[]> {
+  if (!filters.subscriberDid) return []
+
+  const { rows } = await sql<ActivityRetrievalRow>`
+    WITH base AS (
+      SELECT
+        rl.id AS request_id,
+        rl.timestamp::text AS timestamp,
+        rl.algo,
+        rl.result_count
+      FROM request_log rl
+      WHERE
+        rl.requester_did = ${filters.subscriberDid}
+        AND rl.timestamp >= ${filters.since}
+        AND rl.timestamp < ${filters.until}
+        AND COALESCE(rl.result_count, 0) > 0
+      ORDER BY rl.timestamp DESC, rl.id DESC
+      LIMIT ${filters.limit}
+    ),
+    posts AS (
+      SELECT
+        rp.request_id,
+        JSON_AGG(
+          JSON_BUILD_OBJECT('uri', rp.post_uri, 'position', rp.position)
+          ORDER BY rp.position ASC
+        ) AS posts
+      FROM request_posts rp
+      JOIN base b ON b.request_id = rp.request_id
+      GROUP BY rp.request_id
+    )
+    SELECT
+      b.request_id,
+      b.timestamp,
+      b.algo,
+      b.result_count,
+      COALESCE(p.posts, '[]'::json) AS posts
+    FROM base b
+    LEFT JOIN posts p ON p.request_id = b.request_id
+    ORDER BY b.timestamp DESC, b.request_id DESC
+  `.execute(db)
+
+  return rows
+}
+
+async function fetchActivityEngagementRows(
+  db: Database,
+  filters: ActivityFilters,
+  cursor: EngagementCursor | null,
+  filterSig: string,
+  publisherDids: string[],
+): Promise<{ rows: ActivityEngagementResponseRow[]; nextCursor?: string }> {
+  const engagementTypeCodes = filters.types
+    .filter((type): type is Exclude<EngagementExportType, 'comment'> => type !== 'comment')
+    .map((type) => {
+      if (type === 'repost') return 1
+      if (type === 'like') return 2
+      return 3
+    })
+  const includeCommentEvents = filters.types.includes('comment')
+
+  const servedToSubscriberExpr = filters.subscriberDid
+    ? sql<boolean>`EXISTS (SELECT 1 FROM served s WHERE s.post_uri = b.target_uri)`
+    : sql<boolean>`false`
+  const scopeFilter =
+    filters.scope === 'publisher_posts'
+      ? sql<boolean>`publisher_target`
+      : filters.scope === 'feed_posts'
+        ? sql<boolean>`served_to_subscriber`
+        : sql<boolean>`publisher_target OR subscriber_actor`
+  const cursorFilter = cursor
+    ? sql<boolean>`(created_at < ${cursor.created_at} OR (created_at = ${cursor.created_at} AND event_uri < ${cursor.event_uri}))`
+    : sql<boolean>`true`
+
+  const buildActivityBaseUnion = (requireSubscriberActors: boolean, targetMode: EngagementTargetMode) => {
+    const engagementJoin = requireSubscriberActors
+      ? sql`JOIN subscriber s_sub ON s_sub.did = e.author`
+      : sql``
+    const postJoin = requireSubscriberActors
+      ? sql`JOIN subscriber s_sub ON s_sub.did = p.author`
+      : sql``
+    const engagementAuthorFilter = filters.subscriberDid
+      ? sql<boolean>`e.author = ${filters.subscriberDid}`
+      : sql<boolean>`true`
+    const postAuthorFilter = filters.subscriberDid
+      ? sql<boolean>`p.author = ${filters.subscriberDid}`
+      : sql<boolean>`true`
+    const subscriberActorExpr = (authorColumn: ReturnType<typeof sql>) =>
+      requireSubscriberActors || Boolean(filters.subscriberDid)
+        ? sql<boolean>`true`
+        : sql<boolean>`EXISTS (SELECT 1 FROM subscriber s WHERE s.did = ${authorColumn})`
+    const publisherTargetExpr = (targetColumn: ReturnType<typeof sql>) =>
+      targetMode === 'publisher'
+        ? sql<boolean>`true`
+        : targetMode === 'non_publisher'
+          ? sql<boolean>`false`
+          : buildAtUriDidMembershipFilter(targetColumn, publisherDids, true)
+    const engagementTargetFilter =
+      targetMode === 'publisher'
+        ? buildAtUriDidMembershipFilter(sql`e."subjectUri"`, publisherDids, true)
+        : targetMode === 'non_publisher'
+          ? buildAtUriDidMembershipFilter(sql`e."subjectUri"`, publisherDids, false)
+          : sql<boolean>`true`
+    const postTargetFilter =
+      targetMode === 'publisher'
+        ? buildAtUriDidMembershipFilter(sql`p."rootUri"`, publisherDids, true)
+        : targetMode === 'non_publisher'
+          ? buildAtUriDidMembershipFilter(sql`p."rootUri"`, publisherDids, false)
+          : sql<boolean>`true`
+
+    const baseParts: Array<ReturnType<typeof sql>> = []
+    if (engagementTypeCodes.length > 0) {
+      baseParts.push(sql`
+        SELECT
+          CASE e.type
+            WHEN 1 THEN 'repost'
+            WHEN 2 THEN 'like'
+            WHEN 3 THEN 'quote'
+            ELSE 'unknown'
+          END AS type,
+          e.uri AS event_uri,
+          e."subjectUri" AS target_uri,
+          e.author AS author_did,
+          e."createdAt" AS created_at,
+          e."indexedAt" AS indexed_at,
+          (${publisherTargetExpr(sql`e."subjectUri"`)}) AS publisher_target,
+          (${subscriberActorExpr(sql`e.author`)}) AS subscriber_actor
+        FROM engagement e
+        ${engagementJoin}
+        WHERE
+          e."createdAt" >= ${filters.since}
+          AND e."createdAt" < ${filters.until}
+          AND e.type in (${sql.join(engagementTypeCodes)})
+          AND (${engagementAuthorFilter})
+          AND (${engagementTargetFilter})
+      `)
+    }
+    if (includeCommentEvents) {
+      baseParts.push(sql`
+        SELECT
+          'comment' AS type,
+          p.uri AS event_uri,
+          p."rootUri" AS target_uri,
+          p.author AS author_did,
+          p."createdAt" AS created_at,
+          p."indexedAt" AS indexed_at,
+          (${publisherTargetExpr(sql`p."rootUri"`)}) AS publisher_target,
+          (${subscriberActorExpr(sql`p.author`)}) AS subscriber_actor
+        FROM post p
+        ${postJoin}
+        WHERE
+          p."rootUri" != ''
+          AND p."createdAt" >= ${filters.since}
+          AND p."createdAt" < ${filters.until}
+          AND (${postAuthorFilter})
+          AND (${postTargetFilter})
+      `)
+    }
+
+    if (baseParts.length === 0) {
+      return sql`
+          SELECT
+            'like' AS type,
+            '' AS event_uri,
+            '' AS target_uri,
+            '' AS author_did,
+            '' AS created_at,
+            '' AS indexed_at,
+            false AS publisher_target,
+            false AS subscriber_actor
+          WHERE false
+        `
+    }
+    if (baseParts.length === 1) {
+      return baseParts[0]
+    }
+    return sql.join(baseParts, sql` UNION ALL `)
+  }
+
+  const baseUnion =
+    filters.scope === 'publisher_posts'
+      ? buildActivityBaseUnion(false, 'publisher')
+      : filters.scope === 'feed_posts' || filters.subscriberDid
+        ? buildActivityBaseUnion(false, 'any')
+        : sql`
+            ${buildActivityBaseUnion(false, 'publisher')}
+            UNION ALL
+            ${buildActivityBaseUnion(true, 'non_publisher')}
+          `
+
+  const effectiveLimit = filters.limit + 1
+  const { rows } = await sql<ActivityEngagementRow>`
+    WITH served AS MATERIALIZED (
+      SELECT DISTINCT rp.post_uri
+      FROM request_log rl
+      JOIN request_posts rp ON rp.request_id = rl.id
+      WHERE
+        ${filters.subscriberDid === null ? sql<boolean>`false` : sql<boolean>`rl.requester_did = ${filters.subscriberDid}`}
+        AND rl.timestamp >= ${filters.since}
+        AND rl.timestamp < ${filters.until}
+        AND COALESCE(rl.result_count, 0) > 0
+    ),
+    base AS (
+      ${baseUnion}
+    ),
+    enriched AS (
+      SELECT
+        b.type,
+        b.event_uri,
+        b.target_uri,
+        b.author_did,
+        b.created_at,
+        NULLIF(b.indexed_at, '') AS indexed_at,
+        b.publisher_target,
+        (${servedToSubscriberExpr}) AS served_to_subscriber,
+        b.subscriber_actor
+      FROM base b
+    ),
+    scoped AS (
+      SELECT *
+      FROM enriched
+      WHERE (${scopeFilter}) AND (${cursorFilter})
+    )
+    SELECT
+      type,
+      event_uri,
+      target_uri,
+      author_did,
+      created_at,
+      indexed_at,
+      publisher_target,
+      served_to_subscriber
+    FROM scoped
+    ORDER BY created_at DESC, event_uri DESC
+    LIMIT ${effectiveLimit}
+  `.execute(db)
+
+  let events = rows
+  let nextCursor: string | undefined
+  if (rows.length > filters.limit) {
+    events = rows.slice(0, filters.limit)
+    const last = events[events.length - 1]
+    if (last) {
+      nextCursor = encodeEngagementCursor({
+        created_at: last.created_at,
+        event_uri: last.event_uri,
+        filter_sig: filterSig,
+      })
+    }
+  }
+
+  return {
+    rows: events.map((event) => ({
+      ...event,
+      bluesky_url: blueskyPostUrlFromAtUri(event.target_uri),
+    })),
+    nextCursor,
+  }
+}
+
 export default function registerMonitorEndpoints(server: Server, ctx: AppContext) {
   server.xrpc.router.get('/api/subscribers', async (req, res) => {
-    const apiKey = req.headers['api-key']
-
-    if (!apiKey || apiKey !== process.env.PRIORITIZE_API_KEY) {
-      console.log(`[${new Date().toISOString()}] - Attempted unauthorized access to subscribers with API key ${apiKey}`);
+    if (!isApiKeyAuthorized(req, monitorReadAuth)) {
+      logUnauthorized('/api/subscribers')
       return res.status(401).json({ error: 'Unauthorized: Invalid API key' })
     }
 
@@ -216,10 +708,8 @@ export default function registerMonitorEndpoints(server: Server, ctx: AppContext
   });
 
   server.xrpc.router.get('/api/follows', async (req, res) => {
-    const apiKey = req.headers['api-key']
-
-    if (!apiKey || apiKey !== process.env.PRIORITIZE_API_KEY) {
-      console.log(`[${new Date().toISOString()}] - Attempted unauthorized access to follows with API key ${apiKey}`);
+    if (!isApiKeyAuthorized(req, monitorReadAuth)) {
+      logUnauthorized('/api/follows')
       return res.status(401).json({ error: 'Unauthorized: Invalid API key' })
     }
 
@@ -246,8 +736,7 @@ export default function registerMonitorEndpoints(server: Server, ctx: AppContext
   });
 
   server.xrpc.router.get('/api/config', async (req, res) => {
-    const apiKey = parseHeaderValue(req.headers['api-key'])
-    if (!apiKey || apiKey !== process.env.PRIORITIZE_API_KEY) {
+    if (!isApiKeyAuthorized(req, monitorReadAuth)) {
       return res.status(401).json({ error: 'Unauthorized' })
     }
 
@@ -325,10 +814,8 @@ export default function registerMonitorEndpoints(server: Server, ctx: AppContext
   })
 
   server.xrpc.router.get('/api/compliance', async (req, res) => {
-    const apiKey = req.headers['api-key']
-
-    if (!apiKey || apiKey !== process.env.PRIORITIZE_API_KEY) {
-      console.log(`[${new Date().toISOString()}] - Attempted unauthorized access to compliance with API key ${apiKey}`);
+    if (!isApiKeyAuthorized(req, monitorReadAuth)) {
+      logUnauthorized('/api/compliance')
       return res.status(401).json({ error: 'Unauthorized: Invalid API key' })
     }
 
@@ -396,14 +883,80 @@ export default function registerMonitorEndpoints(server: Server, ctx: AppContext
     }
   });
 
+  server.xrpc.router.get('/api/compliance/activity', async (req, res) => {
+    if (!isApiKeyAuthorized(req, monitorReadAuth)) {
+      logUnauthorized('/api/compliance/activity')
+      return res.status(401).json({ error: 'Unauthorized' })
+    }
+
+    let filters: ActivityFilters
+    let cursor: EngagementCursor | null
+    let filterSig: string
+    try {
+      const parsed = parseActivityFilters(req)
+      filters = parsed.filters
+      cursor = parsed.cursor
+      filterSig = parsed.filterSig
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'BadRequest'
+      return res.status(400).json({ error: 'BadRequest', message })
+    }
+
+    try {
+      res.header('Cache-Control', 'no-store')
+      const startedAt = Date.now()
+      const publisherDids = getPublisherDidsFromEnv()
+
+      const retrievalStartedAt = Date.now()
+      const retrievals = filters.includeRetrievals
+        ? await fetchActivityRetrievalRows(ctx.db, filters)
+        : []
+      const retrievalDurationMs = Date.now() - retrievalStartedAt
+
+      const engagementStartedAt = Date.now()
+      const engagementResult = filters.includeEngagements
+        ? await fetchActivityEngagementRows(ctx.db, filters, cursor, filterSig, publisherDids)
+        : { rows: [] as ActivityEngagementResponseRow[], nextCursor: undefined }
+      const engagementDurationMs = Date.now() - engagementStartedAt
+
+      const durationMs = Date.now() - startedAt
+      console.log(
+        `[${new Date().toISOString()}] - Compliance activity endpoint scope=${filters.scope} subscriber=${filters.subscriberDid ?? 'none'} window=${filters.since}..${filters.until} retrievals=${retrievals.length} engagements=${engagementResult.rows.length} retrieval_duration_ms=${retrievalDurationMs} engagement_duration_ms=${engagementDurationMs} duration_ms=${durationMs}`,
+      )
+
+      return res.json({
+        since: filters.since,
+        until: filters.until,
+        scope: filters.scope,
+        subscriber_did: filters.subscriberDid,
+        limit: filters.limit,
+        types: filters.types,
+        include_retrievals: filters.includeRetrievals,
+        include_engagements: filters.includeEngagements,
+        counts: {
+          retrievals: retrievals.length,
+          engagements: engagementResult.rows.length,
+        },
+        retrievals,
+        engagements: engagementResult.rows,
+        next_cursor: engagementResult.nextCursor ?? null,
+      })
+    } catch (error) {
+      console.error('Error retrieving compliance activity:', error)
+      return res.status(500).json({
+        error: 'InternalServerError',
+        message: 'An unexpected error occurred',
+      })
+    }
+  })
+
   const handleEngagementExport = async (
     req: any,
     res: any,
     db: Database,
     responseSource?: string,
   ) => {
-    const apiKey = parseHeaderValue(req.headers['api-key'])
-    if (!apiKey || apiKey !== process.env.PRIORITIZE_API_KEY) {
+    if (!isApiKeyAuthorized(req, monitorReadAuth)) {
       return res.status(401).json({ error: 'Unauthorized' })
     }
 
@@ -566,19 +1119,6 @@ export default function registerMonitorEndpoints(server: Server, ctx: AppContext
       })
     const includeCommentEvents = types.includes('comment')
 
-    const subscriberDidFilter = subscriberDid
-      ? sql<boolean>`author_did = ${subscriberDid}`
-      : sql<boolean>`true`
-
-    const scopeFilter =
-      scope === 'publisher'
-        ? sql<boolean>`is_publisher_target`
-        : scope === 'subscriber'
-          ? sql<boolean>`is_subscriber_actor`
-          : scope === 'subscriber_on_publisher'
-            ? sql<boolean>`is_publisher_target AND is_subscriber_actor`
-            : sql<boolean>`is_publisher_target OR is_subscriber_actor`
-
     const cursorFilter =
       useCursor && cursor
         ? sql<boolean>`(d.created_at < ${cursor.created_at} OR (d.created_at = ${cursor.created_at} AND d.event_uri < ${cursor.event_uri}))`
@@ -590,10 +1130,8 @@ export default function registerMonitorEndpoints(server: Server, ctx: AppContext
         : sql<boolean>`true`
     const otherOffset = useOtherCursor ? 0 : offset
     const otherEffectiveLimit = limit + 1
-    const scopeRequiresSubscriberActors =
-      scope === 'subscriber' || scope === 'subscriber_on_publisher'
 
-    const buildBaseUnion = (requireSubscriberActors: boolean) => {
+    const buildBaseUnion = (requireSubscriberActors: boolean, targetMode: EngagementTargetMode) => {
       const engagementJoin = requireSubscriberActors
         ? sql`JOIN subscriber s_sub ON s_sub.did = e.author`
         : sql``
@@ -607,6 +1145,22 @@ export default function registerMonitorEndpoints(server: Server, ctx: AppContext
       const postAuthorFilter = subscriberDid
         ? sql<boolean>`p.author = ${subscriberDid}`
         : sql<boolean>`true`
+      const subscriberActorExpr = (authorColumn: ReturnType<typeof sql>) =>
+        requireSubscriberActors || Boolean(subscriberDid)
+          ? sql<boolean>`true`
+          : sql<boolean>`EXISTS (SELECT 1 FROM subscriber s WHERE s.did = ${authorColumn})`
+      const engagementTargetFilter =
+        targetMode === 'publisher'
+          ? buildAtUriDidMembershipFilter(sql`e."subjectUri"`, publisherDids, true)
+          : targetMode === 'non_publisher'
+            ? buildAtUriDidMembershipFilter(sql`e."subjectUri"`, publisherDids, false)
+            : sql<boolean>`true`
+      const postTargetFilter =
+        targetMode === 'publisher'
+          ? buildAtUriDidMembershipFilter(sql`p."rootUri"`, publisherDids, true)
+          : targetMode === 'non_publisher'
+            ? buildAtUriDidMembershipFilter(sql`p."rootUri"`, publisherDids, false)
+            : sql<boolean>`true`
 
       const baseParts: Array<ReturnType<typeof sql>> = []
 
@@ -622,7 +1176,8 @@ export default function registerMonitorEndpoints(server: Server, ctx: AppContext
             e.uri AS event_uri,
             e."subjectUri" AS subject_uri,
             e.author AS author_did,
-            e."createdAt" AS created_at
+            e."createdAt" AS created_at,
+            (${subscriberActorExpr(sql`e.author`)}) AS is_subscriber_actor
           FROM engagement e
           ${engagementJoin}
           WHERE
@@ -630,6 +1185,7 @@ export default function registerMonitorEndpoints(server: Server, ctx: AppContext
             AND e."createdAt" < ${until}
             AND e.type in (${sql.join(engagementTypeCodes)})
             AND (${engagementAuthorFilter})
+            AND (${engagementTargetFilter})
         `)
       }
 
@@ -640,7 +1196,8 @@ export default function registerMonitorEndpoints(server: Server, ctx: AppContext
             p.uri AS event_uri,
             p."rootUri" AS subject_uri,
             p.author AS author_did,
-            p."createdAt" AS created_at
+            p."createdAt" AS created_at,
+            (${subscriberActorExpr(sql`p.author`)}) AS is_subscriber_actor
           FROM post p
           ${postJoin}
           WHERE
@@ -648,6 +1205,7 @@ export default function registerMonitorEndpoints(server: Server, ctx: AppContext
             AND p."createdAt" >= ${since}
             AND p."createdAt" < ${until}
             AND (${postAuthorFilter})
+            AND (${postTargetFilter})
         `)
       }
 
@@ -658,7 +1216,8 @@ export default function registerMonitorEndpoints(server: Server, ctx: AppContext
             '' AS event_uri,
             '' AS subject_uri,
             '' AS author_did,
-            '' AS created_at
+            '' AS created_at,
+            false AS is_subscriber_actor
           WHERE false
         `
       }
@@ -668,13 +1227,21 @@ export default function registerMonitorEndpoints(server: Server, ctx: AppContext
       return sql.join(baseParts, sql` UNION ALL `)
     }
 
-    const mainBaseRequiresSubscriberActors = scopeRequiresSubscriberActors || Boolean(subscriberDid)
-    const mainBaseUnion = buildBaseUnion(mainBaseRequiresSubscriberActors)
-    const mainSubscriberActorExpr = mainBaseRequiresSubscriberActors
-      ? sql<boolean>`true`
-      : sql<boolean>`EXISTS (SELECT 1 FROM subscriber s WHERE s.did = b.author_did)`
-    const otherBaseUnion = buildBaseUnion(true)
-    const otherSubscriberActorExpr = sql<boolean>`true`
+    const mainBaseUnion =
+      scope === 'publisher'
+        ? buildBaseUnion(Boolean(subscriberDid), 'publisher')
+        : scope === 'subscriber'
+          ? buildBaseUnion(true, 'any')
+          : scope === 'subscriber_on_publisher'
+            ? buildBaseUnion(true, 'publisher')
+            : sql`
+                ${buildBaseUnion(Boolean(subscriberDid), 'publisher')}
+                UNION ALL
+                ${buildBaseUnion(true, 'any')}
+              `
+    const mainScopeFilter = sql<boolean>`true`
+    const otherBaseUnion = buildBaseUnion(true, 'non_publisher')
+    const otherScopeFilter = sql<boolean>`true`
 
     try {
       res.header('Cache-Control', 'no-store')
@@ -692,7 +1259,7 @@ export default function registerMonitorEndpoints(server: Server, ctx: AppContext
             b.author_did,
             b.created_at,
             (${publisherTargetExpr}) AS is_publisher_target,
-            (${mainSubscriberActorExpr}) AS is_subscriber_actor,
+            b.is_subscriber_actor,
             CASE b.type
               WHEN 'like' THEN 1
               WHEN 'repost' THEN 2
@@ -704,7 +1271,7 @@ export default function registerMonitorEndpoints(server: Server, ctx: AppContext
         ),
         scoped AS (
           SELECT * FROM enriched
-          WHERE (${subscriberDidFilter}) AND (${scopeFilter})
+          WHERE (${mainScopeFilter})
         ),
         aggregated AS (
           SELECT
@@ -783,7 +1350,6 @@ export default function registerMonitorEndpoints(server: Server, ctx: AppContext
         includeOtherSubscriberActivity &&
         (scope === 'publisher' || scope === 'subscriber_on_publisher')
       ) {
-        const otherScopeFilter = sql<boolean>`is_subscriber_actor AND NOT is_publisher_target`
         const otherQueryStartedAt = Date.now()
 
         const other = await sql<EngagementExportEvent>`
@@ -798,7 +1364,7 @@ export default function registerMonitorEndpoints(server: Server, ctx: AppContext
               b.author_did,
               b.created_at,
               (${publisherTargetExpr}) AS is_publisher_target,
-              (${otherSubscriberActorExpr}) AS is_subscriber_actor,
+              b.is_subscriber_actor,
               CASE b.type
                 WHEN 'like' THEN 1
                 WHEN 'repost' THEN 2
@@ -810,7 +1376,7 @@ export default function registerMonitorEndpoints(server: Server, ctx: AppContext
           ),
           scoped AS (
             SELECT * FROM enriched
-            WHERE (${subscriberDidFilter}) AND (${otherScopeFilter})
+            WHERE (${otherScopeFilter})
           ),
           aggregated AS (
             SELECT
@@ -901,10 +1467,8 @@ export default function registerMonitorEndpoints(server: Server, ctx: AppContext
   })
 
   server.xrpc.router.get('/api/engagement', async (req, res) => {
-    const apiKey = req.headers['api-key']
-
-    if (!apiKey || apiKey !== process.env.PRIORITIZE_API_KEY) {
-      console.log(`[${new Date().toISOString()}] - Attempted unauthorized access to engagement with API key ${apiKey}`);
+    if (!isApiKeyAuthorized(req, monitorReadAuth)) {
+      logUnauthorized('/api/engagement')
       return res.status(401).json({ error: 'Unauthorized: Invalid API key' })
     }
 
@@ -1055,10 +1619,8 @@ export default function registerMonitorEndpoints(server: Server, ctx: AppContext
   });
 
   server.xrpc.router.get('/api/priorities', async (req, res) => {
-    const apiKey = req.headers['api-key']
-
-    if (!apiKey || apiKey !== process.env.PRIORITIZE_API_KEY) {
-      console.log(`[${new Date().toISOString()}] - Attempted unauthorized access to priorities with API key ${apiKey}`);
+    if (!isApiKeyAuthorized(req, monitorReadAuth)) {
+      logUnauthorized('/api/priorities')
       return res.status(401).json({ error: 'Unauthorized: Invalid API key' })
     }
 

@@ -11,15 +11,23 @@ LOCK_TIMEOUT="${LOCK_TIMEOUT:-0}"
 
 echo "Creating engagement export indexes on container=${DB_CONTAINER} db=${DB_NAME} user=${DB_USER}"
 
-docker exec -i "${DB_CONTAINER}" psql -v ON_ERROR_STOP=1 -U "${DB_USER}" -d "${DB_NAME}" <<'SQL'
+docker exec -i "${DB_CONTAINER}" psql \
+  -v ON_ERROR_STOP=1 \
+  -v lock_timeout="${LOCK_TIMEOUT}" \
+  -U "${DB_USER}" \
+  -d "${DB_NAME}" <<'SQL'
 SET statement_timeout = 0;
-SET lock_timeout = '${LOCK_TIMEOUT}';
+SELECT set_config('lock_timeout', :'lock_timeout', false);
 
 CREATE INDEX CONCURRENTLY IF NOT EXISTS engagement_author_createdat_idx
   ON engagement (author, "createdAt");
 
 CREATE INDEX CONCURRENTLY IF NOT EXISTS post_comment_author_createdat_idx
   ON post (author, "createdAt")
+  WHERE "rootUri" <> '';
+
+CREATE INDEX CONCURRENTLY IF NOT EXISTS post_comment_rooturi_createdat_idx
+  ON post ("rootUri", "createdAt")
   WHERE "rootUri" <> '';
 SQL
 
