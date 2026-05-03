@@ -24,6 +24,7 @@ type ArchivePayload = {
   post?: Post
 }
 
+
 const maybeStr = (val?: string) => (val ? val : undefined)
 
 const maybeInt = (val: string | undefined, fallback: number) => {
@@ -64,7 +65,121 @@ const toErrorText = (error: unknown) => {
 
 const asPayload = (row: ArchiveOutbox): ArchivePayload => row.payload_json as ArchivePayload
 
-async function drainOnce(db: Database, batchSize: number, maxAttempts: number) {
+// Sprint 8 L1 (TASK-041.01) — research-db dual-write.
+//
+// When env `FEEDGEN_RESEARCH_DB_URL` is set, every successful write
+// to feedgen-db.research_archive is also replicated to the new
+// `research-db.research_archive` schema (separate database, same
+// Postgres container). The replication is **best-effort**: a failed
+// research-db write is logged but does not block the canonical
+// feedgen-db transaction or re-enqueue the outbox row. Parity is
+// validated by a periodic probe (see
+// `dev/storage/sprint8_l1_cutover_runbook_2026-05-03.md` step 4).
+//
+// When env is unset, behaviour is unchanged: single-write to
+// feedgen-db.research_archive only.
+async function replicateToResearchDb(
+  researchDb: Database,
+  row: ArchiveOutbox,
+) {
+  const payload = asPayload(row)
+  const request = payload.request ?? {}
+  const post = payload.post
+
+  const requestedAt = parseDate(row.requested_at) ?? new Date()
+
+  await researchDb.transaction().execute(async (trx) => {
+    await trx
+      .insertInto('research_archive.request_event')
+      .values({
+        request_id: row.request_id,
+        feed_id: row.feed_id ?? request.feed_id ?? null,
+        study_id: row.study_id ?? request.study_id ?? null,
+        requester_ref: row.requester_did ?? request.requester_did ?? null,
+        requested_at: requestedAt,
+        cursor_in: request.cursor_in ?? null,
+        cursor_out: request.cursor_out ?? null,
+        requested_limit: request.requested_limit ?? null,
+        result_count: request.result_count ?? null,
+        feedgen_build_sha: request.feedgen_build_sha ?? process.env.FEEDGEN_BUILD_SHA ?? null,
+        algo_policy_id: request.algo_policy_id ?? row.feed_id ?? null,
+        ranker_run_id: request.ranker_run_id ?? null,
+      })
+      .onConflict((oc) => oc.column('request_id').doNothing())
+      .execute()
+
+    if (!post) return
+
+    const createdAt = parseDate(post.createdAt)
+    const indexedAt = parseDate(post.indexedAt)
+
+    await trx
+      .insertInto('research_archive.post_snapshot')
+      .values({
+        post_uri: post.uri,
+        cid: post.cid,
+        author_did: post.author,
+        created_at: createdAt,
+        indexed_at: indexedAt,
+        created_at_raw: post.createdAt,
+        indexed_at_raw: post.indexedAt,
+        text: post.text,
+        root_uri: post.rootUri,
+        root_cid: post.rootCid,
+        link_url: post.linkUrl,
+        link_title: post.linkTitle,
+        link_description: post.linkDescription,
+        raw_record_json: payload,
+        first_seen_at: indexedAt,
+        first_captured_from: payload.captured_from ?? 'served',
+      })
+      .onConflict((oc) => oc.columns(['post_uri', 'cid']).doNothing())
+      .execute()
+
+    await trx
+      .insertInto('research_archive.post_snapshot_capture_source')
+      .values({
+        post_uri: post.uri,
+        cid: post.cid,
+        captured_from: payload.captured_from ?? 'served',
+      })
+      .onConflict((oc) =>
+        oc.columns(['post_uri', 'cid', 'captured_from']).doUpdateSet({
+          last_captured_at: sql`now()`,
+          observation_count: sql`research_archive.post_snapshot_capture_source.observation_count + 1`,
+        }),
+      )
+      .execute()
+
+    await trx
+      .insertInto('research_archive.served_post_event')
+      .values({
+        request_id: row.request_id,
+        position: row.position,
+        feed_id: row.feed_id ?? request.feed_id ?? null,
+        study_id: row.study_id ?? request.study_id ?? null,
+        post_uri: post.uri,
+        post_cid: post.cid,
+        likes_count: post.likes_count ?? null,
+        repost_count: post.repost_count ?? null,
+        comments_count: post.comments_count ?? null,
+        quote_count: post.quote_count ?? null,
+        priority: post.priority ?? null,
+        priority_source: 'public.post.priority',
+        ranker_run_id: request.ranker_run_id ?? null,
+        payload_status: 'present',
+      })
+      .onConflict((oc) => oc.columns(['request_id', 'position']).doNothing())
+      .execute()
+  })
+}
+
+async function drainOnce(
+  db: Database,
+  researchDb: Database | null,
+  batchSize: number,
+  maxAttempts: number,
+) {
   const rows = await db
     .selectFrom('feedgen_ops.archive_outbox')
     .selectAll()
@@ -75,6 +190,19 @@ async function drainOnce(db: Database, batchSize: number, maxAttempts: number) {
   for (const row of rows) {
     try {
       await archiveRow(db, row)
+      if (researchDb) {
+        try {
+          await replicateToResearchDb(researchDb, row)
+        } catch (error) {
+          // Best-effort shadow write. Parity probe (Sprint 8 L1
+          // cut-over runbook step 4) catches drift; we don't
+          // re-enqueue the outbox row because canonical write
+          // already succeeded.
+          console.warn(
+            `[${new Date().toISOString()}] research-db replicate failed outbox_id=${row.outbox_id} error=${toErrorText(error)}`,
+          )
+        }
+      }
     } catch (error) {
       await handleFailure(db, row, error, maxAttempts)
     }
@@ -258,23 +386,26 @@ async function main() {
   dotenv.config()
 
   const db = createDb(connectionString())
+  const researchDbDsn = maybeStr(process.env.FEEDGEN_RESEARCH_DB_URL)
+  const researchDb = researchDbDsn ? createDb(researchDbDsn) : null
   const batchSize = maybeInt(process.env.FEEDGEN_ARCHIVE_WORKER_BATCH_SIZE, 500)
   const idleMs = maybeInt(process.env.FEEDGEN_ARCHIVE_WORKER_IDLE_MS, 1000)
   const maxAttempts = maybeInt(process.env.FEEDGEN_ARCHIVE_WORKER_MAX_ATTEMPTS, 5)
 
   console.log(
-    `[${new Date().toISOString()}] archive worker started batch_size=${batchSize} idle_ms=${idleMs} max_attempts=${maxAttempts}`,
+    `[${new Date().toISOString()}] archive worker started batch_size=${batchSize} idle_ms=${idleMs} max_attempts=${maxAttempts} research_db_dual_write=${researchDb ? 'on' : 'off'}`,
   )
 
   try {
     while (true) {
-      const drained = await drainOnce(db, batchSize, maxAttempts)
+      const drained = await drainOnce(db, researchDb, batchSize, maxAttempts)
       if (drained === 0) {
         await sleep(idleMs)
       }
     }
   } finally {
     await db.destroy()
+    if (researchDb) await researchDb.destroy()
   }
 }
 
