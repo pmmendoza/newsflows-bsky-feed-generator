@@ -18,7 +18,12 @@ services:
     environment:
       NODE_ENV: production
       FEEDGEN_PORT: 3020
-      FEEDGEN_SUBSCRIBER_ONLY: ${FEEDGEN_SUBSCRIBER_ONLY:-'false'}
+      # FEEDGEN_SUBSCRIBER_ONLY removed 2026-05-04 (Sprint 10 Lane I).
+      # Access decisions now go through the per-feed access_policy_id
+      # dispatcher in src/util/access-policy.ts; auth is always
+      # required. The env was an open-mode escape hatch that
+      # re-introduced the same risk class as the 'open' policy that
+      # was removed from the access_policy_id enum.
       FEEDGEN_SUBSCRIPTION_ENDPOINT: ${FEEDGEN_SUBSCRIPTION_ENDPOINT:-wss://bsky.network}
       FEEDGEN_HOSTNAME: ${FEEDGEN_HOSTNAME:-example.com}
       FEEDGEN_BUILD_SHA: ${FEEDGEN_BUILD_SHA:-""}

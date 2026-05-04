@@ -20,7 +20,8 @@ services:
     environment:
       NODE_ENV: production
       FEEDGEN_PORT: 3020
-      FEEDGEN_SUBSCRIBER_ONLY: ${FEEDGEN_SUBSCRIBER_ONLY:-'false'}
+      # FEEDGEN_SUBSCRIBER_ONLY removed 2026-05-04 (Sprint 10 Lane I);
+      # see docker-compose.yml comment.
       FEEDGEN_PRIORITY_API_KEY: ${FEEDGEN_PRIORITY_API_KEY:-''}
       FEEDGEN_SUBSCRIPTION_ENDPOINT: ${FEEDGEN_SUBSCRIPTION_ENDPOINT:-wss://bsky.network}
       FEEDGEN_HOSTNAME: ${FEEDGEN_HOSTNAME:-example.com}
