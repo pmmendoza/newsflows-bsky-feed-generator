@@ -89,17 +89,39 @@ type AnySelect = any
  * stable: input is a query post-`selectFrom('post')` with filters,
  * output is the same with extra JOIN + ORDER BY.
  */
+/**
+ * Recency window for priority freshness. A post that was last given a
+ * priority by the ranker more than `RANKER_PROD_FRESHNESS_HOURS`
+ * hours ago is treated as having no priority (LEFT JOIN miss → -1
+ * sentinel → bottom of feed). This eliminates the need for explicit
+ * priority=0 demote rows in the ranker output: any post not refreshed
+ * in the active window naturally falls out.
+ *
+ * Default: 24 h (one ranker push window). Override per environment via
+ * `FEEDGEN_RANKER_PROD_FRESHNESS_HOURS` env var.
+ */
+function freshnessHours(): number {
+  const raw = process.env.FEEDGEN_RANKER_PROD_FRESHNESS_HOURS
+  const parsed = raw ? Number(raw) : 24
+  if (!Number.isFinite(parsed) || parsed <= 0) return 24
+  return parsed
+}
+
 export function applyRankerPriorityOrder(
   query: AnySelect,
   rkey: string,
 ): AnySelect {
+  const cutoffIso = new Date(
+    Date.now() - freshnessHours() * 60 * 60 * 1000,
+  ).toISOString()
   return (query as any)
     .leftJoin(
       'ranker_prod.feed_current_priority as fcp',
       (join: any) =>
         join
           .onRef('fcp.post_uri', '=', 'post.uri')
-          .on('fcp.feed_id', '=', rkey),
+          .on('fcp.feed_id', '=', rkey)
+          .on('fcp.updated_at', '>=', cutoffIso),
     )
     // Kysely's text orderBy doesn't expose `nulls last` directly across
     // versions; fall back to a CASE coalesce that puts nulls below 0.
