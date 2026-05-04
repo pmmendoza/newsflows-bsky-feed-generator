@@ -153,9 +153,11 @@ console.log('Canary path — applyRankerPriorityOrder')
     'feed_id parameter bound',
     JSON.stringify(c.parameters),
   )
+  // Score-precedence ordering (Stage 1 of plan_priority_to_score_migration):
+  // ORDER BY coalesce(fcp.score, fcp.priority::float, -1.0) DESC
   assert(
-    /coalesce\("fcp"\."priority",\s*\$\d+\)\s+desc/i.test(c.sql),
-    'orders by coalesce(fcp.priority, -1) DESC',
+    /coalesce\("fcp"\."score",\s*cast\("fcp"\."priority"/i.test(c.sql),
+    'orders by coalesce(fcp.score, fcp.priority::float, -1.0) DESC',
     c.sql,
   )
   // Demote-elimination via recency filter (added on

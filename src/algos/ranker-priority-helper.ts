@@ -38,7 +38,7 @@
  *     the container. No DDL involved.
  */
 
-import { Kysely, SqlBool } from 'kysely'
+import { Kysely, SqlBool, sql } from 'kysely'
 import { DatabaseSchema } from '../db/schema'
 
 /**
@@ -123,13 +123,24 @@ export function applyRankerPriorityOrder(
           .on('fcp.feed_id', '=', rkey)
           .on('fcp.updated_at', '>=', cutoffIso),
     )
+    // Score-precedence (Sprint 5 follow-on, plan_priority_to_score_migration.md
+    // Stage 1): order by `score` first when present, fall back to integer
+    // `priority` when `score IS NULL`. Today's integer-native ranker leaves
+    // `score` NULL → behaviour identical to legacy ordering. After Stage 2
+    // backfill or Stage 3 ranker change, `score` carries values and the
+    // float-native rankers (e.g. Belgian) get meaningful sub-integer
+    // tiebreakers.
+    //
     // Kysely's text orderBy doesn't expose `nulls last` directly across
-    // versions; fall back to a CASE coalesce that puts nulls below 0.
-    // (Equivalent semantically: missing rows are sorted as if priority
-    // were a sentinel value below all real priorities.)
+    // versions; CASE coalesce puts nulls below 0 (equivalent semantically:
+    // missing rows sort as if score were a sentinel below all real values).
     .orderBy(
       (eb: any) =>
-        eb.fn('coalesce', [eb.ref('fcp.priority'), eb.val(-1)]),
+        eb.fn('coalesce', [
+          eb.ref('fcp.score'),
+          eb.fn('cast', [eb.ref('fcp.priority'), sql`double precision`]),
+          eb.val(-1.0),
+        ]),
       'desc',
     )
     .orderBy('post.indexedAt', 'desc')
