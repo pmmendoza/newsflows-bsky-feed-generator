@@ -16,6 +16,7 @@ import { FirehoseSubscription } from './subscription'
 import { AppContext, Config } from './config'
 import wellKnown from './well-known'
 import { setupFollowsUpdateScheduler, setupEngagmentUpdateScheduler, setupDailyFullSyncScheduler, setupRetentionScheduler, stopAllSchedulers } from './util/scheduled-updater'
+import { startFeedCatalogListener, stopFeedCatalogListener } from './util/catalog-listener'
 
 export class FeedGenerator {
   public app: express.Application
@@ -147,12 +148,30 @@ export class FeedGenerator {
       setupRetentionScheduler(this.db, retentionIntervalMs)
     }
 
+    // Catalog cache invalidation via Postgres LISTEN/NOTIFY (Q4 #6).
+    // Gated on FEEDGEN_CATALOG_LISTEN_NOTIFY=true; safe no-op otherwise.
+    const connectionString =
+      this.cfg.postgresUrl ||
+      `postgres://${this.cfg.pgUser}:${this.cfg.pgPassword}@${this.cfg.pgHost}:${this.cfg.pgPort}/${this.cfg.pgDatabase}`
+    startFeedCatalogListener(connectionString).catch((err) => {
+      console.error(
+        `[${new Date().toISOString()}] - catalog-listener: bootstrap raised; TTL fallback remains in effect. error=${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      )
+    })
+
     return this.server
   }
 
   async stop(): Promise<void> {
     // Stop the scheduler
     stopAllSchedulers()
+
+    // Best-effort: stop the catalog LISTEN/NOTIFY connection.
+    await stopFeedCatalogListener().catch(() => {
+      /* best effort */
+    })
 
     if (this.db) {
       await this.db.destroy()
