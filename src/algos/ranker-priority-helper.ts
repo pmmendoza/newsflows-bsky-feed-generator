@@ -38,7 +38,7 @@
  *     the container. No DDL involved.
  */
 
-import { Kysely, SqlBool } from 'kysely'
+import { Kysely, SqlBool, sql } from 'kysely'
 import { DatabaseSchema } from '../db/schema'
 
 /**
@@ -89,25 +89,58 @@ type AnySelect = any
  * stable: input is a query post-`selectFrom('post')` with filters,
  * output is the same with extra JOIN + ORDER BY.
  */
+/**
+ * Recency window for priority freshness. A post that was last given a
+ * priority by the ranker more than `RANKER_PROD_FRESHNESS_HOURS`
+ * hours ago is treated as having no priority (LEFT JOIN miss → -1
+ * sentinel → bottom of feed). This eliminates the need for explicit
+ * priority=0 demote rows in the ranker output: any post not refreshed
+ * in the active window naturally falls out.
+ *
+ * Default: 24 h (one ranker push window). Override per environment via
+ * `FEEDGEN_RANKER_PROD_FRESHNESS_HOURS` env var.
+ */
+function freshnessHours(): number {
+  const raw = process.env.FEEDGEN_RANKER_PROD_FRESHNESS_HOURS
+  const parsed = raw ? Number(raw) : 24
+  if (!Number.isFinite(parsed) || parsed <= 0) return 24
+  return parsed
+}
+
 export function applyRankerPriorityOrder(
   query: AnySelect,
   rkey: string,
 ): AnySelect {
+  const cutoffIso = new Date(
+    Date.now() - freshnessHours() * 60 * 60 * 1000,
+  ).toISOString()
   return (query as any)
     .leftJoin(
       'ranker_prod.feed_current_priority as fcp',
       (join: any) =>
         join
           .onRef('fcp.post_uri', '=', 'post.uri')
-          .on('fcp.feed_id', '=', rkey),
+          .on('fcp.feed_id', '=', rkey)
+          .on('fcp.updated_at', '>=', cutoffIso),
     )
+    // Score-precedence (Sprint 5 follow-on, plan_priority_to_score_migration.md
+    // Stage 1): order by `score` first when present, fall back to integer
+    // `priority` when `score IS NULL`. Today's integer-native ranker leaves
+    // `score` NULL → behaviour identical to legacy ordering. After Stage 2
+    // backfill or Stage 3 ranker change, `score` carries values and the
+    // float-native rankers (e.g. Belgian) get meaningful sub-integer
+    // tiebreakers.
+    //
     // Kysely's text orderBy doesn't expose `nulls last` directly across
-    // versions; fall back to a CASE coalesce that puts nulls below 0.
-    // (Equivalent semantically: missing rows are sorted as if priority
-    // were a sentinel value below all real priorities.)
+    // versions; CASE coalesce puts nulls below 0 (equivalent semantically:
+    // missing rows sort as if score were a sentinel below all real values).
     .orderBy(
       (eb: any) =>
-        eb.fn('coalesce', [eb.ref('fcp.priority'), eb.val(-1)]),
+        eb.fn('coalesce', [
+          eb.ref('fcp.score'),
+          eb.fn('cast', [eb.ref('fcp.priority'), sql`double precision`]),
+          eb.val(-1.0),
+        ]),
       'desc',
     )
     .orderBy('post.indexedAt', 'desc')

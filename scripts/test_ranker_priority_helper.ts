@@ -153,11 +153,56 @@ console.log('Canary path — applyRankerPriorityOrder')
     'feed_id parameter bound',
     JSON.stringify(c.parameters),
   )
+  // Score-precedence ordering (Stage 1 of plan_priority_to_score_migration):
+  // ORDER BY coalesce(fcp.score, fcp.priority::float, -1.0) DESC
   assert(
-    /coalesce\("fcp"\."priority",\s*\$\d+\)\s+desc/i.test(c.sql),
-    'orders by coalesce(fcp.priority, -1) DESC',
+    /coalesce\("fcp"\."score",\s*cast\("fcp"\."priority"/i.test(c.sql),
+    'orders by coalesce(fcp.score, fcp.priority::float, -1.0) DESC',
     c.sql,
   )
+  // Demote-elimination via recency filter (added on
+  // feature/eliminate-demote-recency-filter):
+  assert(
+    /"fcp"\."updated_at"\s*>=/i.test(c.sql),
+    'JOIN includes recency filter on fcp.updated_at',
+    c.sql,
+  )
+  // The cutoff should be a recent ISO timestamp (within last day).
+  const isoParam = c.parameters.find(
+    (p) =>
+      typeof p === 'string' &&
+      /^\d{4}-\d{2}-\d{2}T/.test(p as string),
+  )
+  assert(
+    Boolean(isoParam),
+    'recency cutoff parameter is bound as an ISO timestamp',
+    JSON.stringify(c.parameters),
+  )
+}
+
+console.log('Recency filter respects FEEDGEN_RANKER_PROD_FRESHNESS_HOURS env')
+{
+  withEnv({ FEEDGEN_RANKER_PROD_FRESHNESS_HOURS: '6' }, () => {
+    const c = applyRankerPriorityOrder(basePostQuery(), 'newsflow-nl-2').compile()
+    const isoParam = c.parameters.find(
+      (p) =>
+        typeof p === 'string' &&
+        /^\d{4}-\d{2}-\d{2}T/.test(p as string),
+    ) as string | undefined
+    if (!isoParam) {
+      assert(false, 'expected ISO cutoff parameter', JSON.stringify(c.parameters))
+    } else {
+      const cutoffMs = new Date(isoParam).getTime()
+      const sixHoursAgo = Date.now() - 6 * 60 * 60 * 1000
+      // Allow ±2 minutes of slack for clock + execution time.
+      const slackMs = 2 * 60 * 1000
+      assert(
+        Math.abs(cutoffMs - sixHoursAgo) < slackMs,
+        '6h env honoured',
+        `cutoff=${isoParam} expected~${new Date(sixHoursAgo).toISOString()}`,
+      )
+    }
+  })
 }
 
 console.log('Wrapper — applyPriorityOrderForFeed routes via env')
