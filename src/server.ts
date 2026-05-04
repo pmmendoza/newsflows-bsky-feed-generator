@@ -10,6 +10,7 @@ import registerPrioritizeEndpoint from './methods/prioritize-posts'
 import registerMonitorEndpoints from './methods/monitor'
 import registerUpdaterEndpoints from './methods/updater'
 import registerStudyEndpoints from './methods/study'
+import registerFeedCatalogAdminEndpoint from './methods/feed-catalog-admin'
 import { importSubscribersFromCSV } from './util/import-subscribers'
 import { createDb, Database, migrateToLatest } from './db'
 import { FirehoseSubscription } from './subscription'
@@ -104,6 +105,7 @@ export class FeedGenerator {
     registerMonitorEndpoints(server, ctx)
     registerUpdaterEndpoints(server, ctx)
     registerStudyEndpoints(server, ctx)
+    registerFeedCatalogAdminEndpoint(server, ctx)
 
     return new FeedGenerator(app, db, legacyDb, firehose, cfg)
   }
