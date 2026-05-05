@@ -154,10 +154,22 @@ console.log('Canary path — applyRankerPriorityOrder')
     JSON.stringify(c.parameters),
   )
   // Score-precedence ordering (Stage 1 of plan_priority_to_score_migration):
-  // ORDER BY coalesce(fcp.score, fcp.priority::float, -1.0) DESC
+  // ORDER BY coalesce(fcp.score, fcp.priority::double precision, -1.0) DESC.
+  //
+  // Sprint 12 incident regression-guard: the previous form used
+  // `eb.fn('cast', [...])` which emits `cast(arg1, arg2)` — not valid
+  // Postgres syntax. The new form uses `::double precision` via a sql
+  // tagged template. Assert THAT shape, not the broken `cast(...)` form.
   assert(
-    /coalesce\("fcp"\."score",\s*cast\("fcp"\."priority"/i.test(c.sql),
-    'orders by coalesce(fcp.score, fcp.priority::float, -1.0) DESC',
+    /coalesce\("fcp"\."score",\s*"fcp"\."priority"::double precision/i.test(c.sql),
+    'orders by coalesce(fcp.score, fcp.priority::double precision, -1.0) DESC',
+    c.sql,
+  )
+  // Postgres-validity guard: assert the SQL does NOT contain the broken
+  // `cast(...)` two-argument form.
+  assert(
+    !/cast\("fcp"\."priority",/i.test(c.sql),
+    'must NOT use cast(arg1, arg2) — invalid Postgres SQL',
     c.sql,
   )
   // Demote-elimination via recency filter (added on

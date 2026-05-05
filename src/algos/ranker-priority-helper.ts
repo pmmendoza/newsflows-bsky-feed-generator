@@ -134,11 +134,20 @@ export function applyRankerPriorityOrder(
     // Kysely's text orderBy doesn't expose `nulls last` directly across
     // versions; CASE coalesce puts nulls below 0 (equivalent semantically:
     // missing rows sort as if score were a sentinel below all real values).
+    //
+    // BUG (Sprint 12 incident 2026-05-04): the original implementation used
+    // `eb.fn('cast', [ref, sql\`double precision\`])`. Kysely's `fn()`
+    // generates function-call syntax `cast(arg1, arg2)`, which is **invalid
+    // Postgres SQL** — CAST is a special operator requiring `CAST(expr AS
+    // type)` or the `::` shorthand. The DummyDriver-based unit tests only
+    // *compile* SQL; they don't execute it, so the test passed even though
+    // every runtime request 500'd. Fix: emit `::double precision` directly
+    // via a `sql` tagged template, and add an executing integration test.
     .orderBy(
       (eb: any) =>
         eb.fn('coalesce', [
           eb.ref('fcp.score'),
-          eb.fn('cast', [eb.ref('fcp.priority'), sql`double precision`]),
+          sql<number>`${eb.ref('fcp.priority')}::double precision`,
           eb.val(-1.0),
         ]),
       'desc',
