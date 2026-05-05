@@ -45,10 +45,13 @@ type CatalogInsertBody = {
   op: 'insert'
   feed_id: string
   rkey: string
+  display_name: string
   algo_policy_id: string
   access_policy_id: string
+  country?: string | null
   study_id?: string | null
   publisher_did?: string | null
+  ranker_policy_id?: string | null
   enabled?: boolean
 }
 
@@ -71,6 +74,7 @@ function validateInsert(body: any): { ok: true; row: CatalogInsertBody } | { ok:
   if (!isString(body?.feed_id)) return { ok: false, error: 'feed_id required' }
   if (!isString(body?.rkey)) return { ok: false, error: 'rkey required' }
   if (body.rkey.length > 15) return { ok: false, error: 'rkey must be ≤15 chars (ATProto record-key constraint)' }
+  if (!isString(body?.display_name)) return { ok: false, error: 'display_name required (NOT NULL in feed_catalog)' }
   if (!isString(body?.algo_policy_id)) return { ok: false, error: 'algo_policy_id required' }
   if (!isString(body?.access_policy_id)) return { ok: false, error: 'access_policy_id required' }
   if (!ALLOWED_ACCESS_POLICIES.has(body.access_policy_id)) {
@@ -85,10 +89,13 @@ function validateInsert(body: any): { ok: true; row: CatalogInsertBody } | { ok:
       op: 'insert',
       feed_id: body.feed_id,
       rkey: body.rkey,
+      display_name: body.display_name,
       algo_policy_id: body.algo_policy_id,
       access_policy_id: body.access_policy_id,
+      country: body.country ?? null,
       study_id: body.study_id ?? null,
       publisher_did: body.publisher_did ?? null,
+      ranker_policy_id: body.ranker_policy_id ?? null,
       enabled: typeof body.enabled === 'boolean' ? body.enabled : true,
     },
   }
@@ -138,10 +145,13 @@ export default function registerFeedCatalogAdminEndpoint(
           .values({
             feed_id: v.row.feed_id,
             rkey: v.row.rkey,
+            display_name: v.row.display_name,
             algo_policy_id: v.row.algo_policy_id,
             access_policy_id: v.row.access_policy_id,
+            country: v.row.country,
             study_id: v.row.study_id,
             publisher_did: v.row.publisher_did,
+            ranker_policy_id: v.row.ranker_policy_id,
             enabled: v.row.enabled,
           } as any)
           .execute()

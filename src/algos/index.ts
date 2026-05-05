@@ -15,6 +15,7 @@ import * as feedIR1 from './feed-ir-1'
 import * as feedIR2 from './feed-ir-2'
 import * as feedIR3 from './feed-ir-3'
 import * as feedIR4 from './feed-ir-4'
+import * as feedIR5 from './feed-ir-5'
 
 import * as feedFR1 from './feed-fr-1'
 import * as feedFR2 from './feed-fr-2'
@@ -38,6 +39,7 @@ const algos: Record<string, AlgoHandler> = {
     [feedIR2.shortname]: feedIR2.handler,
     [feedIR3.shortname]: feedIR3.handler,
     [feedIR4.shortname]: feedIR4.handler,
+    [feedIR5.shortname]: feedIR5.handler,
 
     // FR
     [feedFR1.shortname]: feedFR1.handler,
