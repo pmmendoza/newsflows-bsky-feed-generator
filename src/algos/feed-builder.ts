@@ -36,7 +36,14 @@ export async function buildFeed({
   buildFollowsQuery
 }: FeedGeneratorOptions) {
   console.log(`[${new Date().toISOString()}] - Feed ${shortname} requested by ${requesterDid}`);
-  const limit = Math.floor(params.limit / 3); // 1/3 from news + 2/3 other
+  // Sprint 13 / T1: AppView probes with limit=1 and Math.floor(1/3)=0
+  // makes the publisher query ask for 0 rows. Result: 200 + empty feed,
+  // which AppView's online-probe heuristic can interpret as "feed broken".
+  // Clamp to >=1 publisher and >=2 follows so probes always return content.
+  // For limit>=3 this is a no-op (the floor split is unchanged).
+  const publisherLimit = Math.max(1, Math.floor(params.limit / 3));
+  const followsLimit = Math.max(2, Math.floor(params.limit * 2 / 3));
+  const limit = publisherLimit; // 1/3 from news + 2/3 other (legacy alias for cursor math)
   const requesterFollows = await getFollows(requesterDid, ctx.db)
   
   // don't consider posts older than time limit hours
@@ -64,7 +71,7 @@ export async function buildFeed({
     timeLimit,
     requesterFollows,
     cursorOffset,
-    limit * 2
+    followsLimit
   );
 
   // Execute both queries in parallel
@@ -103,8 +110,11 @@ export async function buildFeed({
   let cursor: string | undefined;
   const totalPostsReturned = publisherPosts.length + otherPosts.length;
   if (totalPostsReturned > 0) {
-    // Set the next offset to current offset + number of posts returned
-    cursor = (cursorOffset + limit * 2).toString();
+    // Set the next offset to current offset + size of follows window
+    // (matches how the original code paged with `limit * 2`; we now use
+    // `followsLimit` directly so the cursor stays consistent with the
+    // post-T1 floor-division clamp).
+    cursor = (cursorOffset + followsLimit).toString();
   }
 
   const archiveOutboxEnabled = process.env.FEEDGEN_ARCHIVE_OUTBOX_ENABLED === 'true';
