@@ -24,13 +24,12 @@ import { AtUri } from '@atproto/syntax'
 import { evaluateAccessPolicy } from '../util/access-policy'
 import { resolveDynamicHandler } from '../algos/catalog-dispatch'
 
-// Sprint 14 / T2 Phase 1 — when false, the static `algos[rkey]` map
-// is the primary lookup. The dynamic catalog-dispatch path runs as a
-// silent shadow to warm its cache and exercise the SQL/policy
-// mapping; nothing in the response surface depends on it yet. Phase 2
-// (Sprint 15) flips this to true and Phase 3 deletes the per-feed
-// shim files. Plan: dev/storage/plan_storage_refactor/T2_dynamic_dispatch_plan.md
-const DYNAMIC_DISPATCH_WINS = false
+// Sprint 15 / T2 Phase 2 — flipped 2026-05-06 after Phase 1 shadow
+// soak with zero `catalog-dispatch` warning lines. Dynamic resolver
+// now serves; static shims remain as fallback only. Phase 3 deletes
+// them country-by-country once Phase 2 has soaked clean.
+// Plan: dev/storage/plan_storage_refactor/T2_dynamic_dispatch_plan.md
+const DYNAMIC_DISPATCH_WINS = true
 
 export default function (server: Server, ctx: AppContext) {
   server.app.bsky.feed.getFeedSkeleton(async ({ params, req }) => {

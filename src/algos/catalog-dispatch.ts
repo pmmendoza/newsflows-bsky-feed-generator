@@ -35,22 +35,15 @@ import { Policy, pickPolicy } from './make-handler'
 
 const CACHE_TTL_MS = 5 * 60 * 1000
 
-// Sprint 14 / T2 Phase 1 — bridge the catalog enum to the TS Policy
-// label. The catalog's CHECK constraint
-// (`feed_catalog_algo_policy_id_chk`) enforces three values:
-// 'chronological', 'engagement-sorted', 'ranker-driven'.
-// The TS code uses 'ranker-priority' as the corresponding Policy
-// label (a divergence introduced when policy modules were extracted
-// in Sprint 11 / Task 5; the static shims hard-code the TS label
-// in their own files so they never read the catalog column).
-//
-// Sprint 15 follow-up (carry-over): pick one canonical name and
-// rename the other side. Until then this map keeps Phase 1 honest.
-const CATALOG_TO_POLICY: Readonly<Record<string, Policy>> = {
-  'chronological': 'chronological',
-  'engagement-sorted': 'engagement-sorted',
-  'ranker-driven': 'ranker-priority',
-}
+// Sprint 15 — catalog enum + TS Policy type now share the same set of
+// values. Migration 021 renamed `feed_catalog.algo_policy_id` from
+// 'ranker-driven' to 'ranker-priority' so the two sides match end-to-
+// end and the previous CATALOG_TO_POLICY bridge map is gone.
+const KNOWN_POLICIES: ReadonlySet<Policy> = new Set<Policy>([
+  'chronological',
+  'ranker-priority',
+  'engagement-sorted',
+])
 
 type DispatchCacheEntry = {
   /** The compiled handler, or null when the catalog row is unknown / disabled / unsupported. */
@@ -109,12 +102,12 @@ export async function resolveDynamicHandler(
       // Retired / disabled — `evaluateAccessPolicy` already short-
       // circuits these requests with a denial, but we cache null
       // here so dispatch stays consistent with access-policy.
-    } else if (!(String(row.algo_policy_id) in CATALOG_TO_POLICY)) {
+    } else if (!KNOWN_POLICIES.has(String(row.algo_policy_id) as Policy)) {
       console.warn(
         `[${new Date().toISOString()}] - catalog-dispatch: unknown algo_policy_id='${row.algo_policy_id}' for rkey=${rkey}; returning null (would 400)`,
       )
     } else {
-      const policy = CATALOG_TO_POLICY[String(row.algo_policy_id)]
+      const policy = String(row.algo_policy_id) as Policy
       const publisherDid = String(row.publisher_did ?? '')
       if (!publisherDid) {
         // Empty `publisher_did` would silently produce zero-publisher
