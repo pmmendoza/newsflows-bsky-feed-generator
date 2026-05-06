@@ -5,6 +5,17 @@ in `algos/index.ts` and are **not compiled** (excluded in
 `tsconfig.json`). They are preserved here verbatim so future
 work can revive or reference them without a git-history dive.
 
+## Retention policy
+
+**Operator decision 2026-05-06: keep indefinitely.** Sprint 15 / T2
+Phase 3 moved the 14 active per-country shims (NL/FR/CZ/IR × 1–3 + IR-4
++ IR-5) here. All became candidates for hard deletion, but the
+operator explicitly chose to retain them as a rollback safety net
+and a concrete historical reference. Any future cleanup is
+operator-initiated; **no automatic deletion schedule**. The same
+applies to the variant-4 + UK files that have lived here since
+Sprint 5.
+
 ## Why kept
 
 Operator decision 2026-05-04: variant-4 (hybrid) and the UK family
