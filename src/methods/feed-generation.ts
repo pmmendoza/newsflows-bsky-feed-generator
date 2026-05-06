@@ -18,18 +18,19 @@
 import { InvalidRequestError } from '@atproto/xrpc-server'
 import { Server } from '../lexicon'
 import { AppContext } from '../config'
-import algos from '../algos'
 import { extractDidFromAuth } from '../auth'
 import { AtUri } from '@atproto/syntax'
 import { evaluateAccessPolicy } from '../util/access-policy'
 import { resolveDynamicHandler } from '../algos/catalog-dispatch'
 
-// Sprint 15 / T2 Phase 2 — flipped 2026-05-06 after Phase 1 shadow
-// soak with zero `catalog-dispatch` warning lines. Dynamic resolver
-// now serves; static shims remain as fallback only. Phase 3 deletes
-// them country-by-country once Phase 2 has soaked clean.
+// Sprint 16 — dual-path lookup retired 2026-05-06. The static
+// `algos[]` import + `DYNAMIC_DISPATCH_WINS` flag + dual-path
+// `staticAlgo ?? dynamicAlgo` block are gone. Dispatch is now
+// purely `feedgen_ops.feed_catalog`-driven. Phase 3 soak (S15+S16
+// 4 synthetic tests + 1-hour live soak with zero 5xx) cleared the
+// gate. Static shims remain in `src/algos/_drafts/` indefinitely as
+// rollback safety net (see `_drafts/README.md`).
 // Plan: dev/storage/plan_storage_refactor/T2_dynamic_dispatch_plan.md
-const DYNAMIC_DISPATCH_WINS = true
 
 export default function (server: Server, ctx: AppContext) {
   server.app.bsky.feed.getFeedSkeleton(async ({ params, req }) => {
@@ -45,16 +46,7 @@ export default function (server: Server, ctx: AppContext) {
       )
     }
 
-    // Resolve handler via static map AND the dynamic catalog path. In
-    // Phase 1, static wins; we still call the dynamic resolver so its
-    // cache stays warm, errors surface in logs, and `tsc --noEmit`
-    // verifies the new code is in the build path.
-    const staticAlgo = algos[feedUri.rkey]
-    const dynamicAlgo = await resolveDynamicHandler(ctx.db, feedUri.rkey)
-    const algo = DYNAMIC_DISPATCH_WINS
-      ? dynamicAlgo ?? staticAlgo
-      : staticAlgo ?? dynamicAlgo
-
+    const algo = await resolveDynamicHandler(ctx.db, feedUri.rkey)
     if (!algo) {
       throw new InvalidRequestError(
         'Unsupported algorithm',
