@@ -12,7 +12,8 @@
     "unpublishFeed": "ts-node scripts/unpublishFeedGen.ts",
     "start": "ts-node src/index.ts",
     "archiveWorker": "ts-node src/archive-worker.ts",
-    "build": "tsc"
+    "build": "tsc",
+    "test:execute": "ts-node scripts/test_ranker_priority_helper_execute.ts && ts-node scripts/test_policies_execute.ts && ts-node scripts/test_catalog_dispatch_execute.ts && ts-node scripts/test_make_handler_dispatcher_execute.ts"
   },
   "dependencies": {
     "@atproto/api": "^0.13.28",
