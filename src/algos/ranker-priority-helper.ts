@@ -50,16 +50,19 @@ export function rkeyToEnvSuffix(rkey: string): string {
 }
 
 /**
- * Decide whether the given feed should source priority from the new
- * `ranker_prod.feed_current_priority` table instead of legacy
- * `post.priority`.
+ * Sprint 16 / R1 close-out (2026-05-06): unconditional. The
+ * `ranker_prod.feed_current_priority` table is the only priority
+ * source for variant-2 feeds. Legacy `post.priority` reading via
+ * `applyLegacyPriorityOrder` is dead code, kept for one sprint as a
+ * rollback safety net. The per-feed + master env flags
+ * (`FEEDGEN_PRIORITY_FROM_RANKER_PROD[_*]`) no longer have an effect
+ * — every variant-2 query goes through `applyRankerPriorityOrder`.
+ *
+ * Returns `true` always. Kept as a function (not inlined) so the
+ * existing call sites in the policy modules remain valid imports.
  */
-export function useRankerPriority(rkey: string): boolean {
-  const perFeed = process.env[`FEEDGEN_PRIORITY_FROM_RANKER_PROD_${rkeyToEnvSuffix(rkey)}`]
-  if (typeof perFeed === 'string' && perFeed.length > 0) {
-    return perFeed.toLowerCase() === 'true'
-  }
-  return String(process.env.FEEDGEN_PRIORITY_FROM_RANKER_PROD ?? '').toLowerCase() === 'true'
+export function useRankerPriority(_rkey: string): boolean {
+  return true
 }
 
 /**
@@ -123,31 +126,23 @@ export function applyRankerPriorityOrder(
           .on('fcp.feed_id', '=', rkey)
           .on('fcp.updated_at', '>=', cutoffIso),
     )
-    // Score-precedence (Sprint 5 follow-on, plan_priority_to_score_migration.md
-    // Stage 1): order by `score` first when present, fall back to integer
-    // `priority` when `score IS NULL`. Today's integer-native ranker leaves
-    // `score` NULL → behaviour identical to legacy ordering. After Stage 2
-    // backfill or Stage 3 ranker change, `score` carries values and the
-    // float-native rankers (e.g. Belgian) get meaningful sub-integer
-    // tiebreakers.
+    // Sprint 16 / R1 close-out (2026-05-06): `score` is the sole
+    // canonical numeric column. The ranker stopped writing
+    // `priority` integer values 2026-05-06 (priority_db.py
+    // `_iter_priority_rows` now sets `priority=None`); all new
+    // ranker_prod rows have `score IS NOT NULL` and `priority IS
+    // NULL`. Historical pre-2026-05-06 rows kept their integer
+    // `priority` values (and matching `score` populated by the
+    // backfill); they continue to sort correctly via the same
+    // `score` column. The `priority::float8` fallback that lived
+    // here was a transition-period safety net and is now dead code.
     //
-    // Kysely's text orderBy doesn't expose `nulls last` directly across
-    // versions; CASE coalesce puts nulls below 0 (equivalent semantically:
-    // missing rows sort as if score were a sentinel below all real values).
-    //
-    // BUG (Sprint 12 incident 2026-05-04): the original implementation used
-    // `eb.fn('cast', [ref, sql\`double precision\`])`. Kysely's `fn()`
-    // generates function-call syntax `cast(arg1, arg2)`, which is **invalid
-    // Postgres SQL** — CAST is a special operator requiring `CAST(expr AS
-    // type)` or the `::` shorthand. The DummyDriver-based unit tests only
-    // *compile* SQL; they don't execute it, so the test passed even though
-    // every runtime request 500'd. Fix: emit `::double precision` directly
-    // via a `sql` tagged template, and add an executing integration test.
+    // Sprint 17 will drop the `priority` column entirely (migration
+    // 022) once we've proven nothing else reads it.
     .orderBy(
       (eb: any) =>
         eb.fn('coalesce', [
           eb.ref('fcp.score'),
-          sql<number>`${eb.ref('fcp.priority')}::double precision`,
           eb.val(-1.0),
         ]),
       'desc',
