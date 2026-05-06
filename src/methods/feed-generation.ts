@@ -22,17 +22,41 @@ import algos from '../algos'
 import { extractDidFromAuth } from '../auth'
 import { AtUri } from '@atproto/syntax'
 import { evaluateAccessPolicy } from '../util/access-policy'
+import { resolveDynamicHandler } from '../algos/catalog-dispatch'
+
+// Sprint 14 / T2 Phase 1 — when false, the static `algos[rkey]` map
+// is the primary lookup. The dynamic catalog-dispatch path runs as a
+// silent shadow to warm its cache and exercise the SQL/policy
+// mapping; nothing in the response surface depends on it yet. Phase 2
+// (Sprint 15) flips this to true and Phase 3 deletes the per-feed
+// shim files. Plan: dev/storage/plan_storage_refactor/T2_dynamic_dispatch_plan.md
+const DYNAMIC_DISPATCH_WINS = false
 
 export default function (server: Server, ctx: AppContext) {
   server.app.bsky.feed.getFeedSkeleton(async ({ params, req }) => {
     const feedUri = new AtUri(params.feed)
-    const algo = algos[feedUri.rkey]
     if (
       // turned off publisherDid validation
       // feedUri.hostname !== ctx.cfg.publisherDid ||
-      feedUri.collection !== 'app.bsky.feed.generator' ||
-      !algo
+      feedUri.collection !== 'app.bsky.feed.generator'
     ) {
+      throw new InvalidRequestError(
+        'Unsupported algorithm',
+        'UnsupportedAlgorithm',
+      )
+    }
+
+    // Resolve handler via static map AND the dynamic catalog path. In
+    // Phase 1, static wins; we still call the dynamic resolver so its
+    // cache stays warm, errors surface in logs, and `tsc --noEmit`
+    // verifies the new code is in the build path.
+    const staticAlgo = algos[feedUri.rkey]
+    const dynamicAlgo = await resolveDynamicHandler(ctx.db, feedUri.rkey)
+    const algo = DYNAMIC_DISPATCH_WINS
+      ? dynamicAlgo ?? staticAlgo
+      : staticAlgo ?? dynamicAlgo
+
+    if (!algo) {
       throw new InvalidRequestError(
         'Unsupported algorithm',
         'UnsupportedAlgorithm',

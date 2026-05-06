@@ -19,6 +19,7 @@
 
 import { Client } from 'pg'
 import { invalidatePolicyCache } from './access-policy'
+import { invalidateDispatchCache } from '../algos/catalog-dispatch'
 
 const RECONNECT_DELAY_MS = 5000
 const CHANNEL = 'feed_catalog_changed'
@@ -66,17 +67,22 @@ async function connectAndListen(connectionString: string): Promise<void> {
         const payload = msg.payload ? JSON.parse(msg.payload) : null
         if (payload?.rkey) {
           invalidatePolicyCache(String(payload.rkey))
+          // Sprint 14 / T2 Phase 1 — dispatch cache invalidates on
+          // the same NOTIFY trigger as policy cache.
+          invalidateDispatchCache(String(payload.rkey))
           console.log(
             `[${new Date().toISOString()}] - catalog-listener: invalidated rkey=${payload.rkey} op=${payload.op}`,
           )
         } else {
           invalidatePolicyCache()
+          invalidateDispatchCache()
           console.log(
             `[${new Date().toISOString()}] - catalog-listener: payload missing rkey; cleared full cache`,
           )
         }
       } catch (err) {
         invalidatePolicyCache()
+        invalidateDispatchCache()
         console.warn(
           `[${new Date().toISOString()}] - catalog-listener: payload parse failed; cleared full cache. error=${
             err instanceof Error ? err.message : String(err)
@@ -90,6 +96,7 @@ async function connectAndListen(connectionString: string): Promise<void> {
         `[${new Date().toISOString()}] - catalog-listener: client error; will reconnect. error=${err.message}`,
       )
       invalidatePolicyCache()
+      invalidateDispatchCache()
       cleanup()
       if (!stopRequested) {
         setTimeout(() => {

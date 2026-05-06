@@ -57,7 +57,11 @@ export function makeHandler(opts: MakeHandlerOptions): FeedGenerator {
   }
 }
 
-function pickPolicy(
+// Sprint 14 / T2 Phase 1: exported so `algos/catalog-dispatch.ts`
+// (the new dynamic-dispatch path) can reuse the same policy mapping.
+// Static `makeHandler()` above also calls this; the two callers must
+// stay aligned so static and dynamic paths produce identical handlers.
+export function pickPolicy(
   policy: Policy,
   publisherDid: string,
   shortname: string,
