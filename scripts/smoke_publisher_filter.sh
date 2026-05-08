@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Layer B integration smoke for the publisher-DID engagement filter.
 #
-# Hits the running feedgen-v2 container at /api/compliance/engagement
+# Hits the running feedgen container at /api/compliance/engagement
 # with two scopes that exercise the publisher-DID filter:
 #   - subscriber_on_publisher (the ranker's daily call)
 #   - publisher
@@ -24,7 +24,7 @@ if [ "$(id -u)" -ne 0 ]; then
   exit 2
 fi
 
-APP_CONTAINER="${APP_CONTAINER:-feedgen-v2}"
+APP_CONTAINER="${APP_CONTAINER:-feedgen}"
 DAYS="${DAYS:-3}"
 LIMIT="${LIMIT:-10}"
 

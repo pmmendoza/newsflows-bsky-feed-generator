@@ -4,8 +4,8 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: feedgen-v2
-    hostname: feedgen-v2
+    container_name: feedgen
+    hostname: feedgen
     restart: unless-stopped
     ports:
       - "3020:3020"
@@ -52,15 +52,22 @@ services:
       STUDY_COMPLIANCE_RATE_LIMIT_MAX: ${STUDY_COMPLIANCE_RATE_LIMIT_MAX:-60}
       FEEDGEN_ARCHIVE_OUTBOX_ENABLED: ${FEEDGEN_ARCHIVE_OUTBOX_ENABLED:-'false'}
     networks:
-      - default
-      - caddy_network
+      default:
+        # `feedgen-v2` alias: backwards-compat for unmanaged dependents
+        # (cluster-history-api, archive-worker) until R7 Phase D D6 lands.
+        # Remove only after every consumer is on the canonical name.
+        aliases:
+          - feedgen-v2
+      caddy_network:
+        aliases:
+          - feedgen-v2
     depends_on:
       - feedgen-db
 
   feedgen-db:
     image: postgres:17
-    container_name: feedgen-db-v2
-    hostname: feedgen-db-v2
+    container_name: feedgen-db
+    hostname: feedgen-db
     restart: unless-stopped
     ports:
       - "5434:5432"
@@ -89,6 +96,12 @@ services:
       - max_parallel_workers_per_gather=4
       - -c
       - max_parallel_workers=8
+    networks:
+      default:
+        # `feedgen-db-v2` alias: same backwards-compat rationale as
+        # the feedgen service. Removed in R7 Phase D D6.
+        aliases:
+          - feedgen-db-v2
 
 volumes:
   data:

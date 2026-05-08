@@ -4,7 +4,7 @@ set -euo pipefail
 # Creates indexes needed by /api/compliance/engagement on large production DBs.
 # Uses CREATE INDEX CONCURRENTLY to avoid blocking writes.
 
-DB_CONTAINER="${DB_CONTAINER:-feedgen-db-v2}"
+DB_CONTAINER="${DB_CONTAINER:-feedgen-db}"
 DB_USER="${DB_USER:-feedgen}"
 DB_NAME="${DB_NAME:-feedgen-db}"
 LOCK_TIMEOUT="${LOCK_TIMEOUT:-0}"

@@ -11,8 +11,8 @@ BASE="${BASE:-http://127.0.0.1:3020}"
 DAYS="${DAYS:-2}"
 LIMIT="${LIMIT:-5}"
 ENV_FILE="${ENV_FILE:-/etc/newsflows/secrets/feedgen.env}"
-DB_CONTAINER="${DB_CONTAINER:-feedgen-db-v2}"
-APP_CONTAINER="${APP_CONTAINER:-feedgen-v2}"
+DB_CONTAINER="${DB_CONTAINER:-feedgen-db}"
+APP_CONTAINER="${APP_CONTAINER:-feedgen}"
 
 if [ ! -r "$ENV_FILE" ]; then
   echo "error=env_file_not_readable"
