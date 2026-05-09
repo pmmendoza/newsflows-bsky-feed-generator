@@ -58,15 +58,8 @@ services:
       STUDY_COMPLIANCE_RATE_LIMIT_MAX: ${STUDY_COMPLIANCE_RATE_LIMIT_MAX:-60}
       FEEDGEN_ARCHIVE_OUTBOX_ENABLED: ${FEEDGEN_ARCHIVE_OUTBOX_ENABLED:-'false'}
     networks:
-      default:
-        # `feedgen-v2` alias: backwards-compat for unmanaged dependents
-        # (cluster-history-api, archive-worker) until R7 Phase D D6 lands.
-        # Remove only after every consumer is on the canonical name.
-        aliases:
-          - feedgen-v2
-      caddy_network:
-        aliases:
-          - feedgen-v2
+      - default
+      - caddy_network
     depends_on:
       - feedgen-db
 
@@ -103,11 +96,7 @@ services:
       - -c
       - max_parallel_workers=8
     networks:
-      default:
-        # `feedgen-db-v2` alias: same backwards-compat rationale as
-        # the feedgen service. Removed in R7 Phase D D6.
-        aliases:
-          - feedgen-db-v2
+      - default
 
 volumes:
   data:
