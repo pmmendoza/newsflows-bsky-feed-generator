@@ -45,6 +45,12 @@ services:
       FEEDGEN_MONITOR_API_KEY: ${FEEDGEN_MONITOR_API_KEY:-''}
       FEEDGEN_READ_API_KEY: ${FEEDGEN_READ_API_KEY:-''}
       FEEDGEN_ADMIN_API_KEY: ${FEEDGEN_ADMIN_API_KEY:-''}
+      # Drift fix 2026-05-09 (R7 Phase D D2): the prior live feedgen had
+      # FEEDGEN_RANKER_API_KEY set somehow (probably via an older compose
+      # generation or shell export) but the canonical-source compose
+      # never propagated it. After the D2 recreate, secret-health
+      # surfaced 7 fails because of this. Now explicitly listed.
+      FEEDGEN_RANKER_API_KEY: ${FEEDGEN_RANKER_API_KEY:-''}
       STUDY_TOKEN_API_KEY: ${STUDY_TOKEN_API_KEY:-''}
       STUDY_JWT_SECRET: ${STUDY_JWT_SECRET:-""}
       STUDY_JWT_TTL_SECONDS: ${STUDY_JWT_TTL_SECONDS:-345600}
