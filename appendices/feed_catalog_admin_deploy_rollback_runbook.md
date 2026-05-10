@@ -103,11 +103,11 @@ offers browser/device-code login, avoid it for this deployment and use
 Before changing the container, record the current state:
 
 ```sh
-cd /opt/newsflows/code/newsflows-bsky-feed-generator
+cd /home/philipp/newsflows-bsky-feed-generator-v2
 git rev-parse HEAD
-docker compose ps
+sudo docker-compose --env-file /etc/newsflows/secrets/feedgen.env ps
 docker image inspect pmmendoza/bsky-feedgen --format '{{.Id}} {{json .RepoTags}}'
-docker compose logs --tail=80 feedgen >/tmp/feedgen-predeploy.log
+sudo docker logs --tail=80 feedgen >/tmp/feedgen-predeploy.log
 ```
 
 Backup the database before deploying even though this API hardening has no
@@ -138,14 +138,20 @@ Or deploy from a pushed Docker Hub tag:
 ```sh
 docker pull pmmendoza/bsky-feedgen:<approved-tag>
 # Edit/override compose image tag to the approved tag.
-FEEDGEN_BUILD_SHA="<approved-git-sha>" docker compose up -d feedgen
+sudo docker-compose --env-file /etc/newsflows/secrets/feedgen.env \
+  up -d --no-deps --no-build feedgen
 ```
+
+On `newsflowsserver1`, use `docker-compose` with a dash plus
+`--env-file /etc/newsflows/secrets/feedgen.env`. The `docker compose`
+plugin is not installed there, and running compose without the env file
+falls back to blank/default DB credentials.
 
 ## Post-Deploy Smoke
 
 ```sh
-docker compose ps feedgen
-docker compose logs --tail=120 feedgen
+sudo docker-compose --env-file /etc/newsflows/secrets/feedgen.env ps feedgen
+sudo docker logs --tail=120 feedgen
 curl -fsS -H "api-key: $FEEDGEN_ADMIN_API_KEY" \
   http://127.0.0.1:3020/api/admin/feed_catalog >/tmp/feed_catalog_after.json
 curl -fsS -H "api-key: $FEEDGEN_ADMIN_API_KEY" \
@@ -173,7 +179,8 @@ If using Docker Hub tags:
 ```sh
 docker pull pmmendoza/bsky-feedgen:<previous-known-good-tag>
 # Restore compose image tag to previous-known-good-tag.
-FEEDGEN_BUILD_SHA="<previous-known-good-sha>" docker compose up -d feedgen
+sudo docker-compose --env-file /etc/newsflows/secrets/feedgen.env \
+  up -d --no-deps --no-build feedgen
 ```
 
 Then re-run post-deploy smoke.
