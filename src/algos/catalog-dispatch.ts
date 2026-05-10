@@ -39,7 +39,7 @@ const CACHE_TTL_MS = 5 * 60 * 1000
 // values. Migration 021 renamed `feed_catalog.algo_policy_id` from
 // 'ranker-driven' to 'ranker-priority' so the two sides match end-to-
 // end and the previous CATALOG_TO_POLICY bridge map is gone.
-const KNOWN_POLICIES: ReadonlySet<Policy> = new Set<Policy>([
+export const KNOWN_POLICIES: ReadonlySet<Policy> = new Set<Policy>([
   'chronological',
   'ranker-priority',
   'engagement-sorted',
