@@ -1,7 +1,11 @@
 /**
- * Sprint 11 / Task 4 — minimal `feed_catalog` admin write endpoint.
+ * Sprint 11 / Task 4 — `feed_catalog` admin endpoints.
  *
- * Replaces ad-hoc psql edits for the common operator actions:
+ * Replaces ad-hoc psql edits for common operator actions and provides
+ * read/dry-run surfaces for the future `bskyops` operator CLI:
+ *   - GET all catalog rows
+ *   - GET one catalog row
+ *   - DRY-RUN an UPDATE without writing
  *   - INSERT a new row (e.g. when a Belgian feed is provisioned)
  *   - UPDATE a single row's enabled/access_policy_id/study_id/retired_at
  *
@@ -17,14 +21,16 @@
  *     migration.
  *   - Bulk imports — operator can call this endpoint in a loop or use
  *     `bsr feed new` (future tooling).
- *   - Read endpoints — describe-generator already serves the catalog
- *     listing.
+ *   - Live apply transaction orchestration — `bskyops` owns the
+ *     higher-level workflow; this endpoint owns feedgen validation and
+ *     catalog mutation.
  *
  * Plan: dev/storage/plan_storage_refactor/plan_feed_catalog_listen_notify.md
  */
 
 import { Server } from '../lexicon'
 import { AppContext } from '../config'
+import { FeedCatalog } from '../db/schema'
 import {
   ApiKeyAuthConfig,
   isApiKeyAuthorized,
@@ -35,11 +41,20 @@ const adminWriteAuth: ApiKeyAuthConfig = {
   primaryEnv: ['FEEDGEN_ADMIN_API_KEY'],
 }
 
-const ALLOWED_ACCESS_POLICIES = new Set([
+export const ALLOWED_ACCESS_POLICIES = new Set([
   'subscriber-default',
   'study-only',
   'disabled',
 ])
+
+const UPDATE_FIELDS = [
+  'enabled',
+  'access_policy_id',
+  'study_id',
+  'retired_at',
+] as const
+
+type UpdateField = typeof UPDATE_FIELDS[number]
 
 type CatalogInsertBody = {
   op: 'insert'
@@ -62,15 +77,146 @@ type CatalogUpdateBody = {
   access_policy_id?: string
   study_id?: string | null
   retired_at?: string | null
+  if_current?: Partial<Record<UpdateField, boolean | string | null>>
 }
 
 type CatalogBody = CatalogInsertBody | CatalogUpdateBody
+
+type CatalogDryRunBody = Omit<CatalogUpdateBody, 'op'> & {
+  op?: 'update'
+}
+
+type CatalogUpdatePatch = Partial<Pick<
+  FeedCatalog,
+  'enabled' | 'access_policy_id' | 'study_id' | 'retired_at'
+>>
+
+type ValidatedCatalogUpdate = {
+  op: 'update'
+  rkey: string
+  patch: CatalogUpdatePatch
+  ifCurrent?: Partial<Record<UpdateField, boolean | string | null>>
+}
+
+type FeedCatalogDryRunMessage = {
+  code: string
+  message: string
+  [key: string]: unknown
+}
 
 function isString(v: unknown): v is string {
   return typeof v === 'string' && v.length > 0
 }
 
-function validateInsert(body: any): { ok: true; row: CatalogInsertBody } | { ok: false; error: string } {
+function nullableString(v: unknown): v is string | null {
+  return v === null || typeof v === 'string'
+}
+
+function isUpdateField(field: string): field is UpdateField {
+  return (UPDATE_FIELDS as readonly string[]).includes(field)
+}
+
+function fieldValue(row: Pick<FeedCatalog, UpdateField>, field: UpdateField) {
+  const value = row[field]
+  if (value instanceof Date) return value.toISOString()
+  return value ?? null
+}
+
+function currentFieldValues(row: Pick<FeedCatalog, UpdateField>) {
+  return Object.fromEntries(
+    UPDATE_FIELDS.map((field) => [field, fieldValue(row, field)]),
+  ) as Record<UpdateField, boolean | string | null>
+}
+
+function proposedFieldValues(row: Pick<FeedCatalog, UpdateField>, patch: CatalogUpdatePatch) {
+  const proposed = { ...row, ...patch }
+  return currentFieldValues(proposed)
+}
+
+function validateCurrentValues(
+  value: unknown,
+): { ok: true; current?: Partial<Record<UpdateField, boolean | string | null>> } | { ok: false; error: string } {
+  if (value === undefined) return { ok: true }
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return { ok: false, error: 'if_current must be an object when provided' }
+  }
+  const current: Partial<Record<UpdateField, boolean | string | null>> = {}
+  for (const [field, fieldValue] of Object.entries(value)) {
+    if (!isUpdateField(field)) {
+      return { ok: false, error: `if_current contains unsupported field: ${field}` }
+    }
+    if (field === 'enabled' && typeof fieldValue !== 'boolean') {
+      return { ok: false, error: 'if_current.enabled must be boolean' }
+    }
+    if (
+      field === 'access_policy_id' &&
+      (typeof fieldValue !== 'string' || !ALLOWED_ACCESS_POLICIES.has(fieldValue))
+    ) {
+      return { ok: false, error: `if_current.access_policy_id must be one of ${[...ALLOWED_ACCESS_POLICIES].join(', ')}` }
+    }
+    if ((field === 'study_id' || field === 'retired_at') && !nullableString(fieldValue)) {
+      return { ok: false, error: `if_current.${field} must be string or null` }
+    }
+    current[field] = fieldValue as boolean | string | null
+  }
+  return { ok: true, current }
+}
+
+export function operatorStatus(row: Pick<FeedCatalog, 'enabled' | 'access_policy_id' | 'retired_at'>): string {
+  if (row.retired_at) return 'retired'
+  if (row.enabled === false) return 'disabled'
+  if (row.access_policy_id === 'disabled') return 'paused'
+  return 'active'
+}
+
+export function feedCatalogItemPayload(row: FeedCatalog) {
+  return {
+    feed_id: row.feed_id,
+    rkey: row.rkey,
+    display_name: row.display_name,
+    country: row.country ?? null,
+    publisher_did: row.publisher_did ?? null,
+    study_id: row.study_id ?? null,
+    algo_policy_id: row.algo_policy_id,
+    ranker_policy_id: row.ranker_policy_id ?? null,
+    access_policy_id: row.access_policy_id,
+    enabled: row.enabled,
+    created_at: row.created_at ?? null,
+    retired_at: row.retired_at ?? null,
+    operator_status: operatorStatus(row),
+    published: {
+      status: 'unknown',
+      uri: null,
+    },
+    health: {
+      status: 'unknown',
+      checked_at: null,
+    },
+    raw_values_in_output: false,
+  }
+}
+
+export function feedCatalogListPayload(rows: FeedCatalog[]) {
+  return {
+    schema_version: 1,
+    feed_count: rows.length,
+    feeds: rows.map(feedCatalogItemPayload),
+    raw_values_in_output: false,
+  }
+}
+
+export function feedCatalogShowPayload(row: FeedCatalog) {
+  return {
+    schema_version: 1,
+    ...feedCatalogItemPayload(row),
+  }
+}
+
+export function feedCatalogNotFoundPayload(rkey: string) {
+  return { error: `rkey=${rkey} not found` }
+}
+
+export function validateInsert(body: any): { ok: true; row: CatalogInsertBody } | { ok: false; error: string } {
   if (!isString(body?.feed_id)) return { ok: false, error: 'feed_id required' }
   if (!isString(body?.rkey)) return { ok: false, error: 'rkey required' }
   if (body.rkey.length > 15) return { ok: false, error: 'rkey must be ≤15 chars (ATProto record-key constraint)' }
@@ -101,13 +247,25 @@ function validateInsert(body: any): { ok: true; row: CatalogInsertBody } | { ok:
   }
 }
 
-function validateUpdate(body: any): { ok: true; row: CatalogUpdateBody } | { ok: false; error: string } {
+export function validateUpdate(body: any): { ok: true; row: ValidatedCatalogUpdate } | { ok: false; error: string } {
+  if (body?.op !== undefined && body.op !== 'update') {
+    return { ok: false, error: "op must be 'update' when provided" }
+  }
   if (!isString(body?.rkey)) return { ok: false, error: 'rkey required' }
+  if (body.enabled !== undefined && typeof body.enabled !== 'boolean') {
+    return { ok: false, error: 'enabled must be boolean' }
+  }
   if (
     body.access_policy_id !== undefined &&
     !ALLOWED_ACCESS_POLICIES.has(body.access_policy_id)
   ) {
     return { ok: false, error: `access_policy_id must be one of ${[...ALLOWED_ACCESS_POLICIES].join(', ')}` }
+  }
+  if (body.study_id !== undefined && !nullableString(body.study_id)) {
+    return { ok: false, error: 'study_id must be string or null' }
+  }
+  if (body.retired_at !== undefined && !nullableString(body.retired_at)) {
+    return { ok: false, error: 'retired_at must be string or null' }
   }
   const updates = {
     enabled: body.enabled,
@@ -118,13 +276,300 @@ function validateUpdate(body: any): { ok: true; row: CatalogUpdateBody } | { ok:
   if (Object.values(updates).every((v) => v === undefined)) {
     return { ok: false, error: 'at least one of enabled/access_policy_id/study_id/retired_at required' }
   }
-  return { ok: true, row: { op: 'update', rkey: body.rkey, ...updates } }
+  const current = validateCurrentValues(body.if_current)
+  if (!current.ok) return current
+  const patch: CatalogUpdatePatch = {}
+  for (const field of UPDATE_FIELDS) {
+    if (updates[field] !== undefined) {
+      ;(patch as any)[field] = updates[field]
+    }
+  }
+  return { ok: true, row: { op: 'update', rkey: body.rkey, patch, ifCurrent: current.current } }
+}
+
+export function buildFeedCatalogDryRun(
+  current: FeedCatalog,
+  update: ValidatedCatalogUpdate,
+  opts: { studyExists?: boolean } = {},
+) {
+  const currentValues = currentFieldValues(current)
+  const proposedValues = proposedFieldValues(current, update.patch)
+  const proposed = {
+    ...current,
+    ...update.patch,
+  }
+  const changes = UPDATE_FIELDS
+    .filter((field) => Object.prototype.hasOwnProperty.call(update.patch, field))
+    .filter((field) => currentValues[field] !== proposedValues[field])
+    .map((field) => ({
+      field,
+      current: currentValues[field],
+      proposed: proposedValues[field],
+    }))
+  const blockers: FeedCatalogDryRunMessage[] = []
+  const warnings: FeedCatalogDryRunMessage[] = []
+  if (proposed.access_policy_id === 'study-only' && !proposed.study_id) {
+    blockers.push({
+      code: 'study-id-required',
+      message: 'study_id is required when access_policy_id=study-only',
+    })
+  }
+  if (proposed.study_id && opts.studyExists === false) {
+    blockers.push({
+      code: 'study-id-not-found',
+      message: `study_id does not exist in study_catalog: ${proposed.study_id}`,
+    })
+  }
+  if (proposed.access_policy_id === 'disabled' && proposed.enabled === true) {
+    warnings.push({
+      code: 'access-disabled-feed-enabled',
+      message: 'feed remains enabled but access policy disables serving',
+    })
+  }
+  if (Object.prototype.hasOwnProperty.call(update.patch, 'retired_at')) {
+    warnings.push({
+      code: 'retirement-semantics-review',
+      message: 'retire/unretire semantics must be reviewed before live apply',
+    })
+  }
+  return {
+    schema_version: 1,
+    mode: 'dry-run',
+    operation: 'feed.update',
+    target: `feed:${current.rkey}`,
+    source: 'feedgen',
+    status: blockers.length > 0 ? 'blocked' : changes.length === 0 ? 'no-op' : 'dry-run',
+    dry_run: true,
+    would_write: false,
+    current: currentValues,
+    proposed: proposedValues,
+    current_status: operatorStatus(current),
+    proposed_status: operatorStatus(proposed),
+    changes,
+    change_count: changes.length,
+    blockers,
+    warnings,
+    rollback: {
+      strategy: 'restore-current-values',
+      fields: Object.fromEntries(changes.map((change) => [change.field, change.current])),
+    },
+    raw_values_in_output: false,
+  }
+}
+
+export function currentValueMismatches(
+  current: FeedCatalog,
+  expected: Partial<Record<UpdateField, boolean | string | null>> | undefined,
+) {
+  if (!expected) return []
+  const actual = currentFieldValues(current)
+  return UPDATE_FIELDS
+    .filter((field) => Object.prototype.hasOwnProperty.call(expected, field))
+    .filter((field) => actual[field] !== expected[field])
+    .map((field) => ({
+      field,
+      expected: expected[field] ?? null,
+      actual: actual[field],
+    }))
+}
+
+export function buildFeedCatalogApplyBlocked(
+  dryRun: ReturnType<typeof buildFeedCatalogDryRun>,
+  blocker: FeedCatalogDryRunMessage,
+  status = 'blocked',
+) {
+  return {
+    ...dryRun,
+    mode: 'apply',
+    status,
+    dry_run: false,
+    would_write: false,
+    applied: false,
+    blockers: [...dryRun.blockers, blocker],
+    raw_values_in_output: false,
+  }
+}
+
+export function buildFeedCatalogApplyConflict(
+  dryRun: ReturnType<typeof buildFeedCatalogDryRun>,
+  mismatches: ReturnType<typeof currentValueMismatches>,
+) {
+  return buildFeedCatalogApplyBlocked(
+    dryRun,
+    {
+      code: 'stale-current-values',
+      message: 'feed_catalog row changed since dry-run/current-state capture',
+      mismatches,
+    } as FeedCatalogDryRunMessage & { mismatches: ReturnType<typeof currentValueMismatches> },
+    'conflict',
+  )
+}
+
+export function buildFeedCatalogApplyResult(
+  before: FeedCatalog,
+  after: FeedCatalog,
+  dryRun: ReturnType<typeof buildFeedCatalogDryRun>,
+  applied: boolean,
+) {
+  const afterValues = currentFieldValues(after)
+  return {
+    schema_version: 1,
+    mode: 'apply',
+    operation: 'feed.update',
+    target: `feed:${before.rkey}`,
+    source: 'feedgen',
+    status: applied ? 'applied' : 'no-op',
+    dry_run: false,
+    would_write: false,
+    applied,
+    wrote: applied,
+    before: dryRun.current,
+    after: afterValues,
+    current: dryRun.current,
+    proposed: dryRun.proposed,
+    changes: dryRun.changes,
+    change_count: dryRun.change_count,
+    blockers: [],
+    warnings: dryRun.warnings,
+    before_status: dryRun.current_status,
+    after_status: operatorStatus(after),
+    rollback: dryRun.rollback,
+    readback: feedCatalogShowPayload(after),
+    raw_values_in_output: false,
+  }
+}
+
+async function readCatalogRows(ctx: AppContext): Promise<FeedCatalog[]> {
+  return (await ctx.db
+    .selectFrom('feedgen_ops.feed_catalog')
+    .select([
+      'feed_id',
+      'rkey',
+      'display_name',
+      'country',
+      'publisher_did',
+      'study_id',
+      'algo_policy_id',
+      'ranker_policy_id',
+      'access_policy_id',
+      'enabled',
+      'created_at',
+      'retired_at',
+    ])
+    .orderBy('rkey', 'asc')
+    .execute()) as FeedCatalog[]
+}
+
+async function readCatalogRowFromDb(db: any, rkey: string): Promise<FeedCatalog | undefined> {
+  return (await db
+    .selectFrom('feedgen_ops.feed_catalog')
+    .select([
+      'feed_id',
+      'rkey',
+      'display_name',
+      'country',
+      'publisher_did',
+      'study_id',
+      'algo_policy_id',
+      'ranker_policy_id',
+      'access_policy_id',
+      'enabled',
+      'created_at',
+      'retired_at',
+    ])
+    .where('rkey', '=', rkey)
+    .executeTakeFirst()) as FeedCatalog | undefined
+}
+
+async function readCatalogRow(ctx: AppContext, rkey: string): Promise<FeedCatalog | undefined> {
+  return readCatalogRowFromDb(ctx.db, rkey)
+}
+
+async function studyExistsFromDb(db: any, studyId: string | null | undefined): Promise<boolean | undefined> {
+  if (!studyId) return undefined
+  const row = await db
+    .selectFrom('feedgen_ops.study_catalog')
+    .select('study_id')
+    .where('study_id', '=', studyId)
+    .executeTakeFirst()
+  return Boolean(row)
+}
+
+async function studyExists(ctx: AppContext, studyId: string | null | undefined): Promise<boolean | undefined> {
+  return studyExistsFromDb(ctx.db, studyId)
 }
 
 export default function registerFeedCatalogAdminEndpoint(
   server: Server,
   ctx: AppContext,
 ) {
+  server.xrpc.router.get('/api/admin/feed_catalog', async (req, res) => {
+    if (!isApiKeyAuthorized(req, adminWriteAuth)) {
+      logUnauthorized('/api/admin/feed_catalog')
+      return res.status(401).json({ error: 'Unauthorized: Invalid API key' })
+    }
+
+    try {
+      const rows = await readCatalogRows(ctx)
+      return res.json(feedCatalogListPayload(rows))
+    } catch (err) {
+      console.error(
+        `[${new Date().toISOString()}] - feed_catalog-admin: read error. ${err instanceof Error ? err.message : String(err)}`,
+      )
+      return res.status(500).json({ error: 'InternalServerError' })
+    }
+  })
+
+  server.xrpc.router.get('/api/admin/feed_catalog/:rkey', async (req, res) => {
+    if (!isApiKeyAuthorized(req, adminWriteAuth)) {
+      logUnauthorized('/api/admin/feed_catalog/:rkey')
+      return res.status(401).json({ error: 'Unauthorized: Invalid API key' })
+    }
+
+    try {
+      const row = await readCatalogRow(ctx, String(req.params.rkey || ''))
+      if (!row) return res.status(404).json(feedCatalogNotFoundPayload(String(req.params.rkey || '')))
+      return res.json(feedCatalogShowPayload(row))
+    } catch (err) {
+      console.error(
+        `[${new Date().toISOString()}] - feed_catalog-admin: read error. ${err instanceof Error ? err.message : String(err)}`,
+      )
+      return res.status(500).json({ error: 'InternalServerError' })
+    }
+  })
+
+  server.xrpc.router.post('/api/admin/feed_catalog/dry-run', async (req, res) => {
+    if (!isApiKeyAuthorized(req, adminWriteAuth)) {
+      logUnauthorized('/api/admin/feed_catalog/dry-run')
+      return res.status(401).json({ error: 'Unauthorized: Invalid API key' })
+    }
+
+    const body = req.body as CatalogDryRunBody | undefined
+    if (!body || typeof body !== 'object') {
+      return res.status(400).json({ error: 'JSON body required' })
+    }
+    const v = validateUpdate(body)
+    if (!v.ok) return res.status(400).json({ error: v.error })
+
+    try {
+      const current = await readCatalogRow(ctx, v.row.rkey)
+      if (!current) return res.status(404).json(feedCatalogNotFoundPayload(v.row.rkey))
+      const proposedStudyId =
+        v.row.patch.study_id !== undefined
+          ? v.row.patch.study_id
+          : current.study_id
+      const result = buildFeedCatalogDryRun(current, v.row, {
+        studyExists: await studyExists(ctx, proposedStudyId),
+      })
+      return res.json(result)
+    } catch (err) {
+      console.error(
+        `[${new Date().toISOString()}] - feed_catalog-admin: dry-run error. ${err instanceof Error ? err.message : String(err)}`,
+      )
+      return res.status(500).json({ error: 'InternalServerError' })
+    }
+  })
+
   server.xrpc.router.post('/api/admin/feed_catalog', async (req, res) => {
     if (!isApiKeyAuthorized(req, adminWriteAuth)) {
       logUnauthorized('/api/admin/feed_catalog')
@@ -163,25 +608,83 @@ export default function registerFeedCatalogAdminEndpoint(
       if (body.op === 'update') {
         const v = validateUpdate(body)
         if (!v.ok) return res.status(400).json({ error: v.error })
-        const patch: any = {}
-        if (v.row.enabled !== undefined) patch.enabled = v.row.enabled
-        if (v.row.access_policy_id !== undefined)
-          patch.access_policy_id = v.row.access_policy_id
-        if (v.row.study_id !== undefined) patch.study_id = v.row.study_id
-        if (v.row.retired_at !== undefined) patch.retired_at = v.row.retired_at
-        const result = await ctx.db
-          .updateTable('feedgen_ops.feed_catalog')
-          .set(patch)
-          .where('rkey', '=', v.row.rkey)
-          .executeTakeFirst()
-        const numUpdated = Number(result.numUpdatedRows ?? 0)
-        if (numUpdated === 0) {
-          return res.status(404).json({ error: `rkey=${v.row.rkey} not found` })
+        const apply = await ctx.db.transaction().execute(async (trx) => {
+          const current = await readCatalogRowFromDb(trx, v.row.rkey)
+          if (!current) {
+            return {
+              httpStatus: 404,
+              payload: feedCatalogNotFoundPayload(v.row.rkey),
+              applied: false,
+            }
+          }
+          const proposedStudyId =
+            v.row.patch.study_id !== undefined
+              ? v.row.patch.study_id
+              : current.study_id
+          const dryRun = buildFeedCatalogDryRun(current, v.row, {
+            studyExists: await studyExistsFromDb(trx, proposedStudyId),
+          })
+          if (dryRun.blockers.length > 0) {
+            return {
+              httpStatus: 409,
+              payload: buildFeedCatalogApplyBlocked(
+                dryRun,
+                {
+                  code: 'dry-run-blocked',
+                  message: 'apply refused because feedgen dry-run has blockers',
+                },
+              ),
+              applied: false,
+            }
+          }
+          const mismatches = currentValueMismatches(current, v.row.ifCurrent)
+          if (mismatches.length > 0) {
+            return {
+              httpStatus: 409,
+              payload: buildFeedCatalogApplyConflict(dryRun, mismatches),
+              applied: false,
+            }
+          }
+          if (dryRun.change_count === 0) {
+            return {
+              httpStatus: 200,
+              payload: buildFeedCatalogApplyResult(current, current, dryRun, false),
+              applied: false,
+            }
+          }
+          const result = await trx
+            .updateTable('feedgen_ops.feed_catalog')
+            .set(v.row.patch as any)
+            .where('rkey', '=', v.row.rkey)
+            .executeTakeFirst()
+          const numUpdated = Number(result.numUpdatedRows ?? 0)
+          if (numUpdated === 0) {
+            return {
+              httpStatus: 404,
+              payload: feedCatalogNotFoundPayload(v.row.rkey),
+              applied: false,
+            }
+          }
+          const after = await readCatalogRowFromDb(trx, v.row.rkey)
+          if (!after) {
+            return {
+              httpStatus: 500,
+              payload: { error: 'updated row could not be read back' },
+              applied: false,
+            }
+          }
+          return {
+            httpStatus: 200,
+            payload: buildFeedCatalogApplyResult(current, after, dryRun, true),
+            applied: true,
+          }
+        })
+        if (apply.applied) {
+          console.log(
+            `[${new Date().toISOString()}] - feed_catalog-admin: UPDATE rkey=${v.row.rkey} ${JSON.stringify(v.row.patch)}`,
+          )
         }
-        console.log(
-          `[${new Date().toISOString()}] - feed_catalog-admin: UPDATE rkey=${v.row.rkey} ${JSON.stringify(patch)}`,
-        )
-        return res.json({ ok: true, op: 'update', rkey: v.row.rkey, fields: Object.keys(patch) })
+        return res.status(apply.httpStatus).json(apply.payload)
       }
       return res.status(400).json({ error: "op must be 'insert' or 'update'" })
     } catch (err) {

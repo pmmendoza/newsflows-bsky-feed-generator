@@ -13,6 +13,7 @@
     "start": "ts-node src/index.ts",
     "archiveWorker": "ts-node src/archive-worker.ts",
     "build": "tsc",
+    "test:feed-catalog-admin": "ts-node scripts/test_feed_catalog_admin.ts",
     "test:execute": "ts-node scripts/test_ranker_priority_helper_execute.ts && ts-node scripts/test_policies_execute.ts && ts-node scripts/test_catalog_dispatch_execute.ts && ts-node scripts/test_make_handler_dispatcher_execute.ts && ts-node scripts/test_buildfeed_smoke.ts"
   },
   "dependencies": {
