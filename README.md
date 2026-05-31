@@ -26,7 +26,9 @@ yarn publishFeed
 
 Subscription endpoint: <http://localhost:3000/api/subscribe?handle=news-flows-nl.bsky.social>
 
-Prioritize endpoint: <http://localhost:3000/api/prioritize/>
+Retired priority endpoints: `/api/prioritize` and `/api/priorities` return
+`410 retired_endpoint`. Ranker output is written through
+`ranker_prod.feed_current_priority.score`.
 
 
 ## Build Image

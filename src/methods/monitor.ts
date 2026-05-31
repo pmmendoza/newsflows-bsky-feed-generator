@@ -1624,108 +1624,11 @@ export default function registerMonitorEndpoints(server: Server, ctx: AppContext
       return res.status(401).json({ error: 'Unauthorized: Invalid API key' })
     }
 
-    try {
-      const { requester_did, publisher_did, page, min_priority } = req.query;
-
-      // Validate that exactly one of requester_did or publisher_did is provided
-      if ((!requester_did && !publisher_did) || (requester_did && publisher_did)) {
-        return res.status(400).json({
-          error: 'BadRequest',
-          message: 'Exactly one of requester_did or publisher_did must be provided'
-        });
-      }
-
-      // Parse page parameter (default to 0)
-      const pageNum = page ? parseInt(page as string, 10) : 0;
-      if (isNaN(pageNum) || pageNum < 0) {
-        return res.status(400).json({
-          error: 'BadRequest',
-          message: 'page must be a non-negative integer'
-        });
-      }
-
-      // Parse min_priority parameter (default to 1)
-      const minPriority = min_priority ? parseInt(min_priority as string, 10) : 1;
-      if (isNaN(minPriority)) {
-        return res.status(400).json({
-          error: 'BadRequest',
-          message: 'min_priority must be an integer'
-        });
-      }
-
-      const limit = 100;
-      const offset = pageNum * limit;
-
-      let posts: any[];
-      let queryType: string;
-
-      if (publisher_did) {
-        // Query for posts by the specified publisher
-        queryType = 'publisher';
-        posts = await ctx.db
-          .selectFrom('post')
-          .select([
-            'uri',
-            'indexedAt',
-            'priority',
-            'likes_count',
-            'repost_count',
-            'comments_count',
-            sql<number>`COALESCE(priority, 0)`.as('priority_value')
-          ])
-          .where('author', '=', publisher_did as string)
-          .where((eb) => eb('priority', '>=', minPriority))
-          .orderBy(sql`COALESCE(priority, 0)`, 'desc')
-          .orderBy('indexedAt', 'desc')
-          .orderBy('cid', 'desc')
-          .offset(offset)
-          .limit(limit)
-          .execute();
-      } else {
-        // Query for posts by people the requester follows
-        queryType = 'follows';
-        const { getFollows } = await import('../util/queries');
-        const requesterFollows = await getFollows(requester_did as string, ctx.db);
-
-        posts = await ctx.db
-          .selectFrom('post')
-          .select([
-            'uri',
-            'indexedAt',
-            'priority',
-            'likes_count',
-            'repost_count',
-            'comments_count',
-            sql<number>`COALESCE(priority, 0)`.as('priority_value')
-          ])
-          .where((eb) => eb('author', 'in', requesterFollows))
-          .where((eb) => eb('priority', '>=', minPriority))
-          .orderBy(sql`COALESCE(priority, 0)`, 'desc')
-          .orderBy('indexedAt', 'desc')
-          .orderBy('cid', 'desc')
-          .offset(offset)
-          .limit(limit)
-          .execute();
-      }
-
-      console.log(`[${new Date().toISOString()}] - Retrieved ${posts.length} ${queryType} posts with priorities >= ${minPriority}, page ${pageNum}`);
-
-      return res.json({
-        count: posts.length,
-        page: pageNum,
-        limit: limit,
-        query_type: queryType,
-        requester_did: requester_did || null,
-        publisher_did: publisher_did || null,
-        min_priority: minPriority,
-        posts: posts
-      });
-    } catch (error) {
-      console.error('Error retrieving priorities data:', error);
-      return res.status(500).json({
-        error: 'InternalServerError',
-        message: 'An unexpected error occurred'
-      });
-    }
+    return res.status(410).json({
+      error: 'retired_endpoint',
+      message:
+        '/api/priorities has been retired with the integer-priority surface. Use canonical feed/engagement/study endpoints or a future score-specific endpoint if one is approved.',
+      canonical_output: 'ranker_prod.feed_current_priority.score',
+    })
   });
 }

@@ -30,7 +30,6 @@ export type Post = {
   linkUrl: string
   linkTitle: string
   linkDescription: string
-  priority?: number
   likes_count?: number
   repost_count?: number
   comments_count?: number
@@ -206,15 +205,12 @@ export type StudyRegistry = {
   status: string
 }
 
-// Sprint 5 Lane A — ranker_prod.feed_current_priority. Current
-// per-(feed, post) priority surface, maintained by the ranker via
-// upserts from each ranker_run. The serving query (Sprint 5 Lane C)
-// joins this table for variant-2 feed handlers when the per-feed
-// canary flag is enabled.
+// ranker_prod.feed_current_priority. Current per-(feed, post) score surface,
+// maintained by the ranker via upserts from each ranker_run. Variant-2 feed
+// handlers join this table and order by score.
 export type FeedCurrentPriority = {
   feed_id: string
   post_uri: string
-  priority?: number | null
   score?: number | null
   run_id: string
   updated_at?: string | Date
@@ -231,8 +227,6 @@ export type ServedPostEvent = {
   repost_count?: number | null
   comments_count?: number | null
   quote_count?: number | null
-  priority?: number | null
-  priority_source?: string | null
   selection_reason_json?: any
   ranker_run_id?: string | null
   payload_status?: string

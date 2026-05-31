@@ -23,7 +23,6 @@ import {
   PostgresQueryCompiler,
 } from 'kysely'
 import {
-  applyLegacyPriorityOrder,
   applyRankerPriorityOrder,
   applyPriorityOrderForFeed,
   rkeyToEnvSuffix,
@@ -84,7 +83,7 @@ console.log('rkeyToEnvSuffix')
   assert(rkeyToEnvSuffix('a.b_c-d') === 'A_B_C_D', 'punctuation collapses to single underscores')
 }
 
-console.log('useRankerPriority — env flag resolution')
+console.log('useRankerPriority — score path is unconditional')
 {
   withEnv(
     {
@@ -92,12 +91,12 @@ console.log('useRankerPriority — env flag resolution')
       FEEDGEN_PRIORITY_FROM_RANKER_PROD_NEWSFLOW_NL_2: undefined,
     },
     () => {
-      assert(useRankerPriority('newsflow-nl-2') === false, 'unset → false (default)')
+      assert(useRankerPriority('newsflow-nl-2') === true, 'unset → true')
     },
   )
   withEnv({ FEEDGEN_PRIORITY_FROM_RANKER_PROD_NEWSFLOW_NL_2: 'true' }, () => {
     assert(useRankerPriority('newsflow-nl-2') === true, 'per-feed flag true → true')
-    assert(useRankerPriority('newsflow-fr-2') === false, 'other feed unaffected')
+    assert(useRankerPriority('newsflow-fr-2') === true, 'other feed still true')
   })
   withEnv(
     { FEEDGEN_PRIORITY_FROM_RANKER_PROD: 'true' },
@@ -113,30 +112,18 @@ console.log('useRankerPriority — env flag resolution')
     },
     () => {
       assert(
-        useRankerPriority('newsflow-nl-2') === false,
-        'per-feed false overrides master true',
+        useRankerPriority('newsflow-nl-2') === true,
+        'per-feed false no longer disables ranker-prod score path',
       )
       assert(
         useRankerPriority('newsflow-fr-2') === true,
-        'master true still applies to feeds without override',
+        'other feed true',
       )
     },
   )
 }
 
-console.log('Legacy path — applyLegacyPriorityOrder')
-{
-  const c = applyLegacyPriorityOrder(basePostQuery()).compile()
-  assert(
-    /coalesce\("priority",\s*\$\d+\)\s+desc/i.test(c.sql),
-    'orders by coalesce(priority,0) DESC',
-    c.sql,
-  )
-  assert(/order by/i.test(c.sql), 'has ORDER BY')
-  assert(!c.sql.includes('feed_current_priority'), 'no JOIN to ranker_prod', c.sql)
-}
-
-console.log('Canary path — applyRankerPriorityOrder')
+console.log('Score path — applyRankerPriorityOrder')
 {
   const c = applyRankerPriorityOrder(basePostQuery(), 'newsflow-nl-2').compile()
   assert(
@@ -153,23 +140,15 @@ console.log('Canary path — applyRankerPriorityOrder')
     'feed_id parameter bound',
     JSON.stringify(c.parameters),
   )
-  // Score-precedence ordering (Stage 1 of plan_priority_to_score_migration):
-  // ORDER BY coalesce(fcp.score, fcp.priority::double precision, -1.0) DESC.
-  //
-  // Sprint 12 incident regression-guard: the previous form used
-  // `eb.fn('cast', [...])` which emits `cast(arg1, arg2)` — not valid
-  // Postgres syntax. The new form uses `::double precision` via a sql
-  // tagged template. Assert THAT shape, not the broken `cast(...)` form.
+  // Migration 024: score-only ordering. Do not keep any fcp.priority fallback.
   assert(
-    /coalesce\("fcp"\."score",\s*"fcp"\."priority"::double precision/i.test(c.sql),
-    'orders by coalesce(fcp.score, fcp.priority::double precision, -1.0) DESC',
+    /coalesce\("fcp"\."score",\s*\$\d+\)\s+desc/i.test(c.sql),
+    'orders by coalesce(fcp.score, -1.0) DESC',
     c.sql,
   )
-  // Postgres-validity guard: assert the SQL does NOT contain the broken
-  // `cast(...)` two-argument form.
   assert(
-    !/cast\("fcp"\."priority",/i.test(c.sql),
-    'must NOT use cast(arg1, arg2) — invalid Postgres SQL',
+    !/"fcp"\."priority"/i.test(c.sql),
+    'must NOT read fcp.priority',
     c.sql,
   )
   // Demote-elimination via recency filter (added on
@@ -227,8 +206,8 @@ console.log('Wrapper — applyPriorityOrderForFeed routes via env')
     () => {
       const c = applyPriorityOrderForFeed(basePostQuery(), 'newsflow-nl-2').compile()
       assert(
-        !c.sql.includes('feed_current_priority'),
-        'env unset → legacy ordering, no JOIN',
+        /feed_current_priority/i.test(c.sql),
+        'env unset → score-backed ranker_prod JOIN',
         c.sql,
       )
     },

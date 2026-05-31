@@ -1,52 +1,9 @@
-library(httr2)
-readRenviron(".env")
-feedgen_read_key <- function() {
-  key <- Sys.getenv("FEEDGEN_READ_API_KEY", "")
-  if (key == "") key <- Sys.getenv("FEEDGEN_MONITOR_API_KEY", "")
-  if (key == "") key <- Sys.getenv("FEEDGEN_RANKER_API_KEY", "")
-  key
-}
-# for https servers use
-# base_req <- request(paste0(
-#   "https://",
-#   Sys.getenv("FEEDGEN_HOSTNAME"),
-#   ":443"
-# ))
-base_req <- request(paste0(
-  "http://",
-  Sys.getenv("FEEDGEN_HOSTNAME"),
-  ":3020"
-))
-priorities <- base_req |>
-  req_url_path("/api/priorities") |>
-  req_url_query(
-    publisher_did = "did:plc:toz4no26o2x4vsbum7cp4bxp"
-  ) |>
-  req_headers(
-    "api-key" = feedgen_read_key(),
-    .redact = "api-key"
-  ) |>
-  req_perform() |>
-  resp_body_json()
-
-priorities_df <- priorities |>
-  purrr::pluck("posts") |>
-  dplyr::bind_rows()
-
-# or get engagement for the accounts a requester DID follows
-priorities <- base_req |>
-  req_url_path("/api/priorities") |>
-  req_url_query(
-    # note this is a different parameter
-    requester_did = atrrr::get_user_info("jbgruber.bsky.social")$did
-  ) |>
-  req_headers(
-    "api-key" = feedgen_read_key(),
-    .redact = "api-key"
-  ) |>
-  req_perform() |>
-  resp_body_json()
-
-priorities_df <- priorities |>
-  purrr::pluck("posts") |>
-  dplyr::bind_rows()
+stop(
+  paste(
+    "scripts/priorities.r is retired.",
+    "The /api/priorities endpoint no longer exposes integer-priority views.",
+    "Use canonical feed, engagement, or study endpoints; add a score-specific",
+    "read endpoint only after it is approved and documented."
+  ),
+  call. = FALSE
+)

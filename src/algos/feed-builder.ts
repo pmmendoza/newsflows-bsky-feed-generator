@@ -299,7 +299,6 @@ function buildArchivePayload({
       linkUrl: post.linkUrl,
       linkTitle: post.linkTitle,
       linkDescription: post.linkDescription,
-      priority: post.priority ?? null,
       likes_count: post.likes_count ?? null,
       repost_count: post.repost_count ?? null,
       comments_count: post.comments_count ?? null,

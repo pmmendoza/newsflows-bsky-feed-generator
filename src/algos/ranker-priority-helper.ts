@@ -1,41 +1,18 @@
 /**
  * Sprint 5 Lane C — feedgen serving rewrite for ranker-driven feeds.
  *
- * When the ranker's Lane B dual-write is active and
- * `ranker_prod.feed_current_priority` is being maintained, variant-2
- * feed handlers (the priority-driven feeds) can switch from reading
- * `post.priority` (the legacy mutable cell shared across rankers) to
- * joining `ranker_prod.feed_current_priority(feed_id, post_uri)`,
- * which is keyed by feed and survives multiple coexisting rankers.
- *
- * The cut-over is **per-feed canary** so a regression on one country
- * does not break the others. Each feed handler reads its own env
- * flag; when unset, the handler keeps the legacy ordering.
- *
- * Env flag conventions
- * --------------------
- * Per-feed flag (preferred):
- *   `FEEDGEN_PRIORITY_FROM_RANKER_PROD_<NORMALISED_RKEY>=true`
- * where `<NORMALISED_RKEY>` is the feed's rkey with all
- * non-alphanumerics replaced by `_` and uppercased. Examples:
- *   rkey `newsflow-nl-2` → env `FEEDGEN_PRIORITY_FROM_RANKER_PROD_NEWSFLOW_NL_2`
- *   rkey `newsflow-fr-2` → env `FEEDGEN_PRIORITY_FROM_RANKER_PROD_NEWSFLOW_FR_2`
- *
- * Master flag (fallback, applies to every variant-2 feed):
- *   `FEEDGEN_PRIORITY_FROM_RANKER_PROD=true`
- *
- * The per-feed flag wins when both are set.
+ * Variant-2 feed handlers now read only
+ * `ranker_prod.feed_current_priority(feed_id, post_uri).score`. The legacy
+ * `public.post.priority` ordering path has been retired from active code so the
+ * integer column can be dropped after production soak and zero-reader proof.
  *
  * Design notes
  * ------------
- *   - Default: every flag is unset, behaviour matches today exactly.
- *   - When activated for a feed, the publisher and follows queries
- *     LEFT JOIN `ranker_prod.feed_current_priority` filtered to that
- *     feed_id, then ORDER BY `fcp.priority DESC NULLS LAST` (matches
- *     today's `coalesce(priority, 0) DESC` because LEFT JOIN +
- *     NULLS LAST sends "no row found" to the bottom).
- *   - Rollback: set the per-feed flag to false (or unset) and recreate
- *     the container. No DDL involved.
+ *   - The publisher and follows queries LEFT JOIN
+ *     `ranker_prod.feed_current_priority` filtered to that feed_id and a
+ *     freshness window, then ORDER BY `fcp.score DESC`.
+ *   - Rollback before DDL is a code/image rollback. The env-flag rollback path
+ *     has intentionally been removed from active serving code.
  */
 
 import { Kysely, SqlBool, sql } from 'kysely'
@@ -50,13 +27,11 @@ export function rkeyToEnvSuffix(rkey: string): string {
 }
 
 /**
- * Sprint 16 / R1 close-out (2026-05-06): unconditional. The
- * `ranker_prod.feed_current_priority` table is the only priority
- * source for variant-2 feeds. Legacy `post.priority` reading via
- * `applyLegacyPriorityOrder` is dead code, kept for one sprint as a
- * rollback safety net. The per-feed + master env flags
- * (`FEEDGEN_PRIORITY_FROM_RANKER_PROD[_*]`) no longer have an effect
- * — every variant-2 query goes through `applyRankerPriorityOrder`.
+ * Migration 024: unconditional. The `ranker_prod.feed_current_priority`
+ * table's `score` column is the only ranking source for variant-2 feeds.
+ * The per-feed + master env flags (`FEEDGEN_PRIORITY_FROM_RANKER_PROD[_*]`)
+ * no longer have an effect; every variant-2 query goes through
+ * `applyRankerPriorityOrder`.
  *
  * Returns `true` always. Kept as a function (not inlined) so the
  * existing call sites in the policy modules remain valid imports.
@@ -76,11 +51,11 @@ export function useRankerPriority(_rkey: string): boolean {
 type AnySelect = any
 
 /**
- * Apply the ranker-prod priority ORDER BY to a base query that
+ * Apply the ranker-prod score ORDER BY to a base query that
  * already has `selectFrom('post')` and the time-window predicates
  * applied. Returns the augmented query with a LEFT JOIN to
  * `ranker_prod.feed_current_priority` (filtered to the feed_id) and
- * priority-first ordering.
+ * score-first ordering.
  *
  * The caller adds `.offset()` and `.limit()` after this returns.
  *
@@ -93,12 +68,9 @@ type AnySelect = any
  * output is the same with extra JOIN + ORDER BY.
  */
 /**
- * Recency window for priority freshness. A post that was last given a
- * priority by the ranker more than `RANKER_PROD_FRESHNESS_HOURS`
- * hours ago is treated as having no priority (LEFT JOIN miss → -1
- * sentinel → bottom of feed). This eliminates the need for explicit
- * priority=0 demote rows in the ranker output: any post not refreshed
- * in the active window naturally falls out.
+ * Recency window for score freshness. A post whose ranker score was last
+ * updated more than `RANKER_PROD_FRESHNESS_HOURS` hours ago is treated as
+ * having no score (LEFT JOIN miss -> -1 sentinel -> bottom of feed).
  *
  * Default: 24 h (one ranker push window). Override per environment via
  * `FEEDGEN_RANKER_PROD_FRESHNESS_HOURS` env var.
@@ -126,19 +98,9 @@ export function applyRankerPriorityOrder(
           .on('fcp.feed_id', '=', rkey)
           .on('fcp.updated_at', '>=', cutoffIso),
     )
-    // Sprint 16 / R1 close-out (2026-05-06): `score` is the sole
-    // canonical numeric column. The ranker stopped writing
-    // `priority` integer values 2026-05-06 (priority_db.py
-    // `_iter_priority_rows` now sets `priority=None`); all new
-    // ranker_prod rows have `score IS NOT NULL` and `priority IS
-    // NULL`. Historical pre-2026-05-06 rows kept their integer
-    // `priority` values (and matching `score` populated by the
-    // backfill); they continue to sort correctly via the same
-    // `score` column. The `priority::float8` fallback that lived
-    // here was a transition-period safety net and is now dead code.
-    //
-    // Sprint 17 will drop the `priority` column entirely (migration
-    // 022) once we've proven nothing else reads it.
+    // Migration 024: `score` is the sole canonical numeric ranking column.
+    // Do not fall back to `fcp.priority`; keeping such a fallback would keep
+    // the integer priority column alive.
     .orderBy(
       (eb: any) =>
         eb.fn('coalesce', [
@@ -152,33 +114,16 @@ export function applyRankerPriorityOrder(
 }
 
 /**
- * Apply the legacy `post.priority` ORDER BY (today's behaviour).
- * Returns the augmented query.
- */
-export function applyLegacyPriorityOrder(query: AnySelect): AnySelect {
-  return (query as any)
-    .orderBy(
-      (eb: any) =>
-        eb.fn('coalesce', [eb.ref('priority'), eb.val(0)]),
-      'desc',
-    )
-    .orderBy('indexedAt', 'desc')
-    .orderBy('cid', 'desc')
-}
-
-/**
  * Convenience wrapper used by every variant-2 feed handler:
  *   - takes the partially-built post query (selectAll + filters)
- *   - applies the right ordering based on the per-feed flag
+ *   - applies score-backed ranker-prod ordering
  *   - returns the query ready for offset/limit
  */
 export function applyPriorityOrderForFeed(
   query: AnySelect,
   rkey: string,
 ): AnySelect {
-  return useRankerPriority(rkey)
-    ? applyRankerPriorityOrder(query, rkey)
-    : applyLegacyPriorityOrder(query)
+  return applyRankerPriorityOrder(query, rkey)
 }
 
 // Re-export for the type system

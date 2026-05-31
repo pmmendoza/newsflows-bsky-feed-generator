@@ -164,8 +164,6 @@ async function replicateToResearchDb(
         repost_count: post.repost_count ?? null,
         comments_count: post.comments_count ?? null,
         quote_count: post.quote_count ?? null,
-        priority: post.priority ?? null,
-        priority_source: 'public.post.priority',
         ranker_run_id: request.ranker_run_id ?? null,
         payload_status: 'present',
       })
@@ -314,8 +312,6 @@ async function archiveRow(db: Database, row: ArchiveOutbox) {
         repost_count: post.repost_count ?? null,
         comments_count: post.comments_count ?? null,
         quote_count: post.quote_count ?? null,
-        priority: post.priority ?? null,
-        priority_source: 'public.post.priority',
         ranker_run_id: request.ranker_run_id ?? null,
         payload_status: 'present',
       })
