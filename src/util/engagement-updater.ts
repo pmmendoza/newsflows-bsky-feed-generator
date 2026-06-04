@@ -1,23 +1,10 @@
 import { Database } from '../db';
 import { sql } from 'kysely';
+import { resolvePublisherDids } from './publisher-dids';
 
 const ENGAGEMENT_TYPE_REPOST = 1
 const ENGAGEMENT_TYPE_LIKE = 2
 const ENGAGEMENT_TYPE_QUOTE = 3
-
-// Get all NEWSBOT_*_DID environment variables
-function getNewsbotDids(): string[] {
-  const newsbotDids: string[] = [];
-  Object.keys(process.env).forEach(key => {
-    if (key.startsWith('NEWSBOT_') && key.endsWith('_DID')) {
-      const did = process.env[key];
-      if (did) {
-        newsbotDids.push(did);
-      }
-    }
-  });
-  return newsbotDids;
-}
 
 /**
  * Updates engagement counts (likes, reposts, comments) for recent posts
@@ -45,7 +32,7 @@ export async function updateEngagement(db: Database): Promise<void> {
     console.log(`[${new Date().toISOString()}] - Starting update of subscriber engagement (last ${engagementTimeHours} hours)...`);
 
     // Get newsbot DIDs to identify publisher posts
-    const newsbotDids = getNewsbotDids();
+    const newsbotDids = await resolvePublisherDids(db);
 
     // Get all subscribers from the database
     const subscribers = await db

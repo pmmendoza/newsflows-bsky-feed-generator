@@ -1,4 +1,5 @@
 import { Database } from '../db'
+import { resolvePublisherDids } from './publisher-dids'
 
 export type IngestionScope = {
   allowlistedAuthorDids: Set<string>
@@ -43,17 +44,6 @@ export const allowlistRefreshMs = (): number => {
   return getIntEnv('FEEDGEN_ALLOWLIST_REFRESH_MS', 60_000)
 }
 
-export const getPublisherDidsFromEnv = (): string[] => {
-  const dids: string[] = []
-  for (const key of Object.keys(process.env)) {
-    if (key.startsWith('NEWSBOT_') && key.endsWith('_DID')) {
-      const did = process.env[key]
-      if (did) dids.push(did)
-    }
-  }
-  return dids
-}
-
 export const didFromAtUri = (uri: string | undefined | null): string | null => {
   if (!uri) return null
   const match = /^at:\/\/([^/]+)\//.exec(uri)
@@ -73,7 +63,7 @@ export async function getIngestionScope(db: Database): Promise<IngestionScope> {
   }
 
   refreshInFlight = (async () => {
-    const publisherDids = new Set(getPublisherDidsFromEnv())
+    const publisherDids = new Set(await resolvePublisherDids(db))
 
     const followsRows = await db.selectFrom('follows').select('follows').execute()
     const allowlistedAuthorDids = new Set<string>(followsRows.map((r) => r.follows))
@@ -101,4 +91,3 @@ export async function getIngestionScope(db: Database): Promise<IngestionScope> {
     refreshInFlight = null
   }
 }
-

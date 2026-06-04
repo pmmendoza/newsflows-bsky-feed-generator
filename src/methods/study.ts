@@ -5,7 +5,7 @@ import { sql } from 'kysely'
 import { Server } from '../lexicon'
 import { AppContext } from '../config'
 import { ApiKeyAuthConfig, hasConfiguredApiKey, isApiKeyAuthorized } from '../util/api-auth'
-import { getPublisherDidsFromEnv } from '../util/ingestion-scope'
+import { resolvePublisherDids } from '../util/publisher-dids'
 
 type StudyScope = 'compliance:read'
 
@@ -460,7 +460,7 @@ export default function registerStudyEndpoints(server: Server, ctx: AppContext) 
         return res.status(400).json({ error: 'BadRequest', message })
       }
 
-      const publisherDids = getPublisherDidsFromEnv()
+      const publisherDids = await resolvePublisherDids(ctx.db)
       const publisherTargetExpr =
         publisherDids.length > 0
           ? sql<boolean>`split_part(ev.target_uri, '/', 3) in (${sql.join(publisherDids)})`

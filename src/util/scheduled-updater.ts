@@ -2,20 +2,7 @@ import { Database } from '../db';
 import { getFollowsApi } from './queries';
 import { updateEngagement } from './engagement-updater';
 import { runRetentionOnce } from './retention';
-
-// Get all NEWSBOT_*_DID environment variables
-function getNewsbotDids(): string[] {
-  const newsbotDids: string[] = [];
-  Object.keys(process.env).forEach(key => {
-    if (key.startsWith('NEWSBOT_') && key.endsWith('_DID')) {
-      const did = process.env[key];
-      if (did) {
-        newsbotDids.push(did);
-      }
-    }
-  });
-  return newsbotDids;
-}
+import { resolvePublisherDids } from './publisher-dids';
 
 // Track active timers
 let activeTimers: NodeJS.Timeout[] = [];
@@ -27,7 +14,7 @@ let activeTimers: NodeJS.Timeout[] = [];
 export async function updateAllSubscriberFollows(db: Database, updateAll: boolean = false): Promise<void> {
   try {
     // Get newsbot DIDs that should be excluded
-    const newsbotDids = getNewsbotDids();
+    const newsbotDids = await resolvePublisherDids(db);
     console.log(`[${new Date().toISOString()}] - Found ${newsbotDids.length} newsbot DIDs to exclude: ${newsbotDids.join(', ')}`);
 
     // Remove any existing newsbot accounts from follows table
@@ -94,7 +81,7 @@ export function triggerFollowsUpdateForSubscriber(db: Database, did: string): vo
   setTimeout(async () => {
     try {
       console.log(`[${new Date().toISOString()}] - Background update: fetching follows for new subscriber ${did}`);
-      const newsbotDids = getNewsbotDids();
+      const newsbotDids = await resolvePublisherDids(db);
       await getFollowsApi(did, db, false, newsbotDids);
     } catch (error) {
       console.error(`Error updating follows for ${did}:`, error);

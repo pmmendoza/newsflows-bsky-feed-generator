@@ -7,11 +7,11 @@ import path from 'path'
 import { Database } from '../db'
 import {
   allowlistRefreshMs,
-  getPublisherDidsFromEnv,
   restrictPublisherEngagementToSubscribersEnabled,
   scopedIngestionEnabled,
   trackSubscriberActivityEnabled,
 } from '../util/ingestion-scope'
+import { resolvePublisherDidInfo, resolvePublisherDids } from '../util/publisher-dids'
 import { getRetentionConfig } from '../util/retention'
 import { ApiKeyAuthConfig, isApiKeyAuthorized, logUnauthorized } from '../util/api-auth'
 
@@ -743,7 +743,8 @@ export default function registerMonitorEndpoints(server: Server, ctx: AppContext
     try {
       res.header('Cache-Control', 'no-store')
 
-      const publisherDids = getPublisherDidsFromEnv().sort()
+      const publisherDidInfo = await resolvePublisherDidInfo(ctx.db)
+      const publisherDids = [...publisherDidInfo.dids].sort()
       const retention = getRetentionConfig()
       const version = getPackageVersion()
       const buildSha = process.env.FEEDGEN_BUILD_SHA || undefined
@@ -785,6 +786,7 @@ export default function registerMonitorEndpoints(server: Server, ctx: AppContext
           track_subscriber_activity: trackSubscriberActivityEnabled(),
           publisher_engagement_subscriber_only: restrictPublisherEngagementToSubscribersEnabled(),
           allowlist_refresh_ms: allowlistRefreshMs(),
+          publisher_did_source: publisherDidInfo.source,
         },
         retention: {
           enabled: retention.enabled,
@@ -905,7 +907,7 @@ export default function registerMonitorEndpoints(server: Server, ctx: AppContext
     try {
       res.header('Cache-Control', 'no-store')
       const startedAt = Date.now()
-      const publisherDids = getPublisherDidsFromEnv()
+      const publisherDids = await resolvePublisherDids(ctx.db)
 
       const retrievalStartedAt = Date.now()
       const retrievals = filters.includeRetrievals
@@ -960,7 +962,7 @@ export default function registerMonitorEndpoints(server: Server, ctx: AppContext
       return res.status(401).json({ error: 'Unauthorized' })
     }
 
-    const publisherDids = getPublisherDidsFromEnv()
+    const publisherDids = await resolvePublisherDids(db)
 
     const { since: defaultSince, until: defaultUntil } = getDefaultSinceUntil()
 
