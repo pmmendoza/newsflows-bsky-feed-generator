@@ -9,12 +9,10 @@
  *   - LISTEN/NOTIFY invalidation via `invalidateDispatchCache(rkey)`
  *   - read failures are NOT cached (so the next request retries)
  *
- * Phase 1 contract: `feed-generation.ts` keeps the static `algos[]`
- * lookup as the primary path. The dynamic resolver runs alongside
- * it, gated by `DYNAMIC_DISPATCH_WINS` (false in Phase 1). Behaviour
- * is identical to today; the dynamic path warms its cache and
- * exercises the SQL/policy mapping silently. Phase 2 (Sprint 15)
- * flips the flag.
+ * Current contract: `feed-generation.ts` uses this resolver as the
+ * feed dispatch path. Unknown, disabled, or unsupported catalog rows
+ * fail closed by returning null; read failures are not cached so the
+ * next request can recover.
  *
  * Why two caches (this + `policyCache` in access-policy.ts) rather
  * than merging: the `FeedCatalogPolicyRow` type used by the access
