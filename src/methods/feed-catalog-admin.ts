@@ -47,7 +47,17 @@ export const ALLOWED_ACCESS_POLICIES = new Set([
   'disabled',
 ])
 
+export const ALLOWED_ALGO_POLICIES = new Set([
+  'chronological',
+  'ranker-priority',
+  'engagement-sorted',
+])
+
 const UPDATE_FIELDS = [
+  'display_name',
+  'publisher_did',
+  'algo_policy_id',
+  'ranker_policy_id',
   'enabled',
   'access_policy_id',
   'study_id',
@@ -73,6 +83,10 @@ type CatalogInsertBody = {
 type CatalogUpdateBody = {
   op: 'update'
   rkey: string
+  display_name?: string
+  publisher_did?: string | null
+  algo_policy_id?: string
+  ranker_policy_id?: string | null
   enabled?: boolean
   access_policy_id?: string
   study_id?: string | null
@@ -88,7 +102,14 @@ type CatalogDryRunBody = Omit<CatalogUpdateBody, 'op'> & {
 
 type CatalogUpdatePatch = Partial<Pick<
   FeedCatalog,
-  'enabled' | 'access_policy_id' | 'study_id' | 'retired_at'
+  | 'display_name'
+  | 'publisher_did'
+  | 'algo_policy_id'
+  | 'ranker_policy_id'
+  | 'enabled'
+  | 'access_policy_id'
+  | 'study_id'
+  | 'retired_at'
 >>
 
 type ValidatedCatalogUpdate = {
@@ -148,6 +169,21 @@ function validateCurrentValues(
     if (field === 'enabled' && typeof fieldValue !== 'boolean') {
       return { ok: false, error: 'if_current.enabled must be boolean' }
     }
+    if (field === 'display_name' && !isString(fieldValue)) {
+      return { ok: false, error: 'if_current.display_name must be a non-empty string' }
+    }
+    if (field === 'publisher_did' && !nullableString(fieldValue)) {
+      return { ok: false, error: 'if_current.publisher_did must be string or null' }
+    }
+    if (
+      field === 'algo_policy_id' &&
+      (typeof fieldValue !== 'string' || !ALLOWED_ALGO_POLICIES.has(fieldValue))
+    ) {
+      return { ok: false, error: `if_current.algo_policy_id must be one of ${[...ALLOWED_ALGO_POLICIES].join(', ')}` }
+    }
+    if (field === 'ranker_policy_id' && !nullableString(fieldValue)) {
+      return { ok: false, error: 'if_current.ranker_policy_id must be string or null' }
+    }
     if (
       field === 'access_policy_id' &&
       (typeof fieldValue !== 'string' || !ALLOWED_ACCESS_POLICIES.has(fieldValue))
@@ -160,6 +196,32 @@ function validateCurrentValues(
     current[field] = fieldValue as boolean | string | null
   }
   return { ok: true, current }
+}
+
+function validatePolicyPair(
+  algoPolicyId: string | undefined,
+  rankerPolicyId: string | null | undefined,
+): { ok: true } | { ok: false; error: string } {
+  if (algoPolicyId === undefined) return { ok: true }
+  if (!ALLOWED_ALGO_POLICIES.has(algoPolicyId)) {
+    return { ok: false, error: `algo_policy_id must be one of ${[...ALLOWED_ALGO_POLICIES].join(', ')}` }
+  }
+  if (algoPolicyId === 'ranker-priority') {
+    if (!isString(rankerPolicyId)) {
+      return {
+        ok: false,
+        error: 'ranker_policy_id required when algo_policy_id=ranker-priority',
+      }
+    }
+    return { ok: true }
+  }
+  if (rankerPolicyId !== undefined && rankerPolicyId !== null) {
+    return {
+      ok: false,
+      error: 'ranker_policy_id must be null when algo_policy_id is chronological or engagement-sorted',
+    }
+  }
+  return { ok: true }
 }
 
 export function operatorStatus(row: Pick<FeedCatalog, 'enabled' | 'access_policy_id' | 'retired_at'>): string {
@@ -222,6 +284,8 @@ export function validateInsert(body: any): { ok: true; row: CatalogInsertBody } 
   if (body.rkey.length > 15) return { ok: false, error: 'rkey must be ≤15 chars (ATProto record-key constraint)' }
   if (!isString(body?.display_name)) return { ok: false, error: 'display_name required (NOT NULL in feed_catalog)' }
   if (!isString(body?.algo_policy_id)) return { ok: false, error: 'algo_policy_id required' }
+  const policy = validatePolicyPair(body.algo_policy_id, body.ranker_policy_id ?? null)
+  if (!policy.ok) return policy
   if (!isString(body?.access_policy_id)) return { ok: false, error: 'access_policy_id required' }
   if (!ALLOWED_ACCESS_POLICIES.has(body.access_policy_id)) {
     return { ok: false, error: `access_policy_id must be one of ${[...ALLOWED_ACCESS_POLICIES].join(', ')}` }
@@ -252,6 +316,20 @@ export function validateUpdate(body: any): { ok: true; row: ValidatedCatalogUpda
     return { ok: false, error: "op must be 'update' when provided" }
   }
   if (!isString(body?.rkey)) return { ok: false, error: 'rkey required' }
+  if (body.display_name !== undefined && !isString(body.display_name)) {
+    return { ok: false, error: 'display_name must be a non-empty string' }
+  }
+  if (body.publisher_did !== undefined && !nullableString(body.publisher_did)) {
+    return { ok: false, error: 'publisher_did must be string or null' }
+  }
+  if (body.algo_policy_id !== undefined && !isString(body.algo_policy_id)) {
+    return { ok: false, error: 'algo_policy_id must be a non-empty string' }
+  }
+  if (body.ranker_policy_id !== undefined && !nullableString(body.ranker_policy_id)) {
+    return { ok: false, error: 'ranker_policy_id must be string or null' }
+  }
+  const policy = validatePolicyPair(body.algo_policy_id, body.ranker_policy_id)
+  if (!policy.ok) return policy
   if (body.enabled !== undefined && typeof body.enabled !== 'boolean') {
     return { ok: false, error: 'enabled must be boolean' }
   }
@@ -268,6 +346,10 @@ export function validateUpdate(body: any): { ok: true; row: ValidatedCatalogUpda
     return { ok: false, error: 'retired_at must be string or null' }
   }
   const updates = {
+    display_name: body.display_name,
+    publisher_did: body.publisher_did,
+    algo_policy_id: body.algo_policy_id,
+    ranker_policy_id: body.ranker_policy_id,
     enabled: body.enabled,
     access_policy_id: body.access_policy_id,
     study_id: body.study_id,
@@ -312,6 +394,16 @@ export function buildFeedCatalogDryRun(
     blockers.push({
       code: 'study-id-required',
       message: 'study_id is required when access_policy_id=study-only',
+    })
+  }
+  const policy = validatePolicyPair(
+    proposed.algo_policy_id,
+    proposed.ranker_policy_id ?? null,
+  )
+  if (!policy.ok) {
+    blockers.push({
+      code: 'invalid-policy-pair',
+      message: policy.error,
     })
   }
   if (proposed.study_id && opts.studyExists === false) {

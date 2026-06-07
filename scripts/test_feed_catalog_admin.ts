@@ -121,6 +121,56 @@ function testValidIfCurrent() {
   assertEqual(update.ifCurrent?.study_id, 'newsflows-main', 'if_current study_id')
 }
 
+function testValidPolicyFieldUpdate() {
+  const update = validUpdate({
+    rkey: 'newsflow-nl-1',
+    display_name: 'NEWSFLOWS NL - Test',
+    publisher_did: 'did:plc:newpublisher',
+    algo_policy_id: 'engagement-sorted',
+    ranker_policy_id: null,
+    if_current: {
+      display_name: 'Newsflow NL 1',
+      publisher_did: 'did:plc:nlbot',
+      algo_policy_id: 'chronological',
+      ranker_policy_id: null,
+    },
+  })
+  assertEqual(update.patch.display_name, 'NEWSFLOWS NL - Test', 'patch display_name')
+  assertEqual(update.patch.publisher_did, 'did:plc:newpublisher', 'patch publisher_did')
+  assertEqual(update.patch.algo_policy_id, 'engagement-sorted', 'patch algo_policy_id')
+  assertEqual(update.patch.ranker_policy_id, null, 'patch ranker_policy_id')
+  assertEqual(update.ifCurrent?.display_name, 'Newsflow NL 1', 'if_current display_name')
+  assertEqual(update.ifCurrent?.algo_policy_id, 'chronological', 'if_current algo_policy_id')
+}
+
+function testRankerPriorityRequiresRankerPolicy() {
+  const result = validateUpdate({
+    rkey: 'newsflow-nl-1',
+    algo_policy_id: 'ranker-priority',
+    ranker_policy_id: null,
+  })
+  assert(!result.ok, 'ranker-priority without ranker_policy_id should fail')
+  assertEqual(
+    result.error,
+    'ranker_policy_id required when algo_policy_id=ranker-priority',
+    'ranker-priority ranker policy error',
+  )
+}
+
+function testNonRankerPolicyRequiresNullRankerPolicy() {
+  const result = validateUpdate({
+    rkey: 'newsflow-nl-1',
+    algo_policy_id: 'chronological',
+    ranker_policy_id: 'news-cluster-engagement',
+  })
+  assert(!result.ok, 'chronological with ranker_policy_id should fail')
+  assertEqual(
+    result.error,
+    'ranker_policy_id must be null when algo_policy_id is chronological or engagement-sorted',
+    'non-ranker ranker policy error',
+  )
+}
+
 function testInvalidIfCurrentField() {
   const result = validateUpdate({
     rkey: 'newsflow-nl-1',
@@ -171,6 +221,27 @@ function testRealDiffDryRun() {
     dryRun.warnings.some((warning: any) => warning.code === 'retirement-semantics-review'),
     'real diff should warn about retirement semantics',
   )
+}
+
+function testPolicyDiffDryRun() {
+  const dryRun = buildFeedCatalogDryRun(
+    baseFeed,
+    validUpdate({
+      rkey: 'newsflow-nl-1',
+      display_name: 'NEWSFLOWS NL - Test',
+      publisher_did: 'did:plc:newpublisher',
+      algo_policy_id: 'engagement-sorted',
+      ranker_policy_id: null,
+    }),
+    { studyExists: true },
+  )
+  assertEqual(dryRun.status, 'dry-run', 'policy diff status')
+  assertEqual(dryRun.change_count, 3, 'policy diff change_count')
+  assertEqual(dryRun.current.display_name, 'Newsflow NL 1', 'policy diff current display_name')
+  assertEqual(dryRun.proposed.display_name, 'NEWSFLOWS NL - Test', 'policy diff proposed display_name')
+  assertEqual(dryRun.current.algo_policy_id, 'chronological', 'policy diff current algo')
+  assertEqual(dryRun.proposed.algo_policy_id, 'engagement-sorted', 'policy diff proposed algo')
+  assertEqual(dryRun.rollback.fields.algo_policy_id, 'chronological', 'policy diff rollback algo')
 }
 
 function testBlockedDryRun() {
@@ -256,9 +327,13 @@ const tests = [
   testInvalidAccessPolicy,
   testInvalidUpdateOp,
   testValidIfCurrent,
+  testValidPolicyFieldUpdate,
+  testRankerPriorityRequiresRankerPolicy,
+  testNonRankerPolicyRequiresNullRankerPolicy,
   testInvalidIfCurrentField,
   testNoOpDryRun,
   testRealDiffDryRun,
+  testPolicyDiffDryRun,
   testBlockedDryRun,
   testApplyResultPayload,
   testApplyConflictPayload,
