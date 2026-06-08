@@ -30,6 +30,31 @@ Retired priority endpoints: `/api/prioritize` and `/api/priorities` return
 `410 retired_endpoint`. Ranker output is written through
 `ranker_prod.feed_current_priority.score`.
 
+## Central Feed Catalog Ops
+
+The non-secret desired state for publisher accounts, active and
+expected-disabled feed rows, bot runtime rows, BSR expectations, health
+expectations, and secret refs lives in the BSKY root catalog:
+
+```text
+config/newsflows/catalogs/publishers.yml
+```
+
+Feedgen owns the runtime materialization in `feedgen_ops.feed_catalog`. Treat
+that table as serving/readback state, not a separate planning SSOT. Operator
+changes should flow through `bskyops` parity and feedgen admin dry-run/apply:
+
+```bash
+bskyops ecosystem desired-state feedgen-parity --active-only --json
+bskyops ecosystem desired-state feedgen-sync-packet --active-only --json
+bskyops feed set <rkey> --dry-run --json
+bskyops feed apply --dry-run-json <packet.json> --environment <target> --confirm-target <target>
+```
+
+Do not hand-edit feed rows in Postgres. Existing-row changes must use
+`if_current` stale-state protection and readback; new active feed rows remain
+feedgen-owner insert tasks with publication and health assumption checks.
+
 
 ## Build Image
 
@@ -64,6 +89,11 @@ docker image push jbgruber/bsky-feedgen:latest
 
 ## Fork changelog (pmmendoza)
 
+- **2026-06-08** — Document central desired-state feed catalog operations.
+  Feedgen `feedgen_ops.feed_catalog` is the feedgen-owned runtime
+  materialization/readback surface for `config/newsflows/catalogs/publishers.yml`;
+  operator changes go through `bskyops` parity plus feedgen admin dry-run/apply
+  evidence.
 - **2026-05-02** — Repair old compliance engagement export performance for recent server-operations windows. `GET /api/compliance/engagement?scope=publisher&include_other_subscriber_activity=true` now pushes publisher/non-publisher target filtering into the base SQL, `scripts/create_engagement_export_indexes.sh` includes `post_comment_rooturi_createdat_idx` for comment-root lookups, and `/api/compliance/activity?scope=publisher_posts` uses the same target pushdown. Server smoke on `feedgen-v2`: old endpoint returned `200` for 1-day/7-day/30-day windows in sub-second time. Retention was not changed.
 - **2026-05-02** — Add participant-safe compliance activity summary and bounded admin compliance activity endpoint. Canonical endpoint reference: `/Users/pm/Work/VUPD/projects/BSKY/docs/docs/api_endpoints.md`. Feedgen-local pointer: [`appendices/compliance_activity_endpoints.md`](appendices/compliance_activity_endpoints.md). Server smoke helper: [`scripts/smoke_compliance_activity.sh`](scripts/smoke_compliance_activity.sh).
 - **2026-04-30** — Add scoped API-key support for feedgen endpoints. Endpoint families now use `FEEDGEN_PRIORITY_API_KEY`, `FEEDGEN_RANKER_API_KEY`, `FEEDGEN_MONITOR_API_KEY`/`FEEDGEN_READ_API_KEY`, `FEEDGEN_ADMIN_API_KEY`, and `STUDY_TOKEN_API_KEY`; the legacy `PRIORITIZE_API_KEY` fallback was removed from active feedgen auth.

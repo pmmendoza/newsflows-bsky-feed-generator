@@ -1,13 +1,21 @@
 # Feed Catalog Admin Endpoints
 
-Status: M4d backend contract for `bskyops` operator tooling.
-Date: 2026-05-10
+Status: feedgen-owned runtime materialization contract for central catalog
+operations through `bskyops`.
+Date: 2026-06-08
 
 These endpoints expose feedgen-owned read, dry-run validation, and
 apply-grade update evidence for operator feed-catalog changes. Feedgen
 owns validation, stale-state protection, atomic catalog mutation, and
 before/after readback. `bskyops` still owns operator run folders, approval
 flags, health gates, smoke checks, audit JSONL, and rollback orchestration.
+
+The upstream desired state for study feed identity and policy is the BSKY root
+catalog `config/newsflows/catalogs/publishers.yml`. The feedgen table
+`feedgen_ops.feed_catalog` is the feedgen-owned runtime materialization and
+readback surface for that desired state. Use `bskyops ecosystem desired-state
+feedgen-parity --active-only --json` and `feedgen-sync-packet` before any
+approved mutation.
 
 ## Auth
 
@@ -170,10 +178,12 @@ The update path runs inside a database transaction. It reuses the same
 validation and diff builder as dry-run, refuses dry-run blockers, performs
 the update, then reads the row back before returning.
 
-This endpoint is still not a complete operator workflow. The future
-`bskyops` apply milestone should call feedgen dry-run first, record run
-evidence and audit JSONL, collect health context, then call this apply
-primitive only after explicit operator approval.
+This endpoint is an apply primitive, not the complete operator workflow.
+`bskyops` should call feedgen dry-run first, record run evidence and audit
+JSONL, collect health context, then call this apply primitive only after
+explicit operator approval. After apply, the workflow must read back the row
+and run config-derived feed assumption checks before reporting the change
+green.
 
 ## Local Verification
 
