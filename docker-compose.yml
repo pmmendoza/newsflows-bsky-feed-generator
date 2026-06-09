@@ -1,6 +1,6 @@
 services:
   feedgen:
-    image: jbgruber/bsky-feedgen
+    image: ${FEEDGEN_IMAGE:-pmmendoza/bsky-feedgen:catalog-publisher-dids-9e6a72b-20260605}
     build:
       context: .
       dockerfile: Dockerfile
