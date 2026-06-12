@@ -13,7 +13,6 @@ services:
       options:
         max-size: 10m
     volumes:
-      - data:/app/data
       - ./subscribers.csv:/app/subscribers.csv
     environment:
       NODE_ENV: production
@@ -34,7 +33,6 @@ services:
       NEWSBOT_IR_DID: ${NEWSBOT_IR_DID}
       NEWSBOT_NL_DID: ${NEWSBOT_NL_DID}
       NEWSBOT_BE_DID: ${NEWSBOT_BE_DID}
-      FEEDGEN_SQLITE_LOCATION: ${FEEDGEN_SQLITE_LOCATION:-/app/data/db.sqlite}
       FOLLOWS_UPDATE_INTERVAL_MS: ${FOLLOWS_UPDATE_INTERVAL_MS:-3600000}
       # Database connection details
       FEEDGEN_DB_HOST: ${FEEDGEN_DB_HOST:-feedgen-db}
@@ -100,7 +98,6 @@ services:
       - default
 
 volumes:
-  data:
   extensions:
   db:
     external: true
