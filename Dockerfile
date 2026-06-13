@@ -28,6 +28,9 @@ COPY --from=prod-deps /app/node_modules ./node_modules
 COPY --from=build /app/dist ./dist
 COPY package.json yarn.lock ./
 
+# Keep published runtime images free of dependency test fixture env files.
+RUN find ./node_modules -type f \( -name ".env" -o -name "*.env" \) -delete
+
 EXPOSE 3000
 
 CMD ["node", "dist/index.js"]
