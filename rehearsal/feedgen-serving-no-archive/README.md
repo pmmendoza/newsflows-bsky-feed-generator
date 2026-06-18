@@ -3,6 +3,8 @@
 This profile is the first minimal runtime rehearsal target for feedgen. It is
 only for disposable loopback roots and disposable Postgres databases. It must
 not be applied to production or to a restored production database.
+Do not use the tracked compose files as-is for this proof; they are development
+or deploy shapes and can inherit live endpoints or local subscriber files.
 
 ## Purpose
 
@@ -77,6 +79,35 @@ Expected result for `limit=3`:
 - three `request_posts` rows;
 - zero dependency on `ranker_prod.*`, `feedgen_ops.archive_outbox`, or
   `research_archive.*`.
+
+## Startup / Migration And Source-Build Variants
+
+The first proof can run with `FEEDGEN_READ_ONLY_MODE=true` when the disposable DB
+is already bootstrapped. A second incremental proof may start feedgen with
+`FEEDGEN_READ_ONLY_MODE=false` against an empty disposable DB to prove Kysely
+migrations and normal app startup before applying this profile's feed catalog
+schema and seed data.
+
+A stronger rebuild proof should build a temporary feedgen image from a fresh
+clone of the feedgen repo, run that image against disposable Postgres, and then
+delete the image. Do not rely on the already-running production image when the
+claim is source rebuildability.
+
+For that variant:
+
+- point `FEEDGEN_SUBSCRIPTION_ENDPOINT` at a non-live loopback endpoint such as
+  `ws://127.0.0.1:9`;
+- use a long `FEEDGEN_SUBSCRIPTION_RECONNECT_DELAY`;
+- keep the DB subscriber-free until after startup, so the immediate follows
+  scheduler cannot call the public follows API;
+- apply `schema_bootstrap.sql` and `seed_loopback.sql` only after the app is
+  reachable;
+- verify `kysely_migration` rows, synthetic feed serving, and absence of
+  archive/ranker/research schemas.
+
+This variant proves startup and migration boundaries. The source-build variant
+also proves that the committed feedgen source can produce a runnable image for
+this minimal profile. Neither variant proves real firehose ingestion.
 
 ## Exclusion Gates
 
