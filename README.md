@@ -1,3 +1,29 @@
+# NEWSFLOWS Feed Generator
+
+Feedgen owns feed serving, scoped firehose ingestion, subscription/follow
+storage, request logging, and the runtime `feedgen_ops.feed_catalog`
+materialization. It does not own ecosystem planning truth.
+
+Before changing publisher, feed, bot, ranker, health, secret-ref, Docker, or
+runtime-root expectations, start from the BSKY root SSOTs:
+
+- `config/newsflows/catalogs/publishers.yml` for publisher/feed/bot/ranker/
+  health/secret-ref desired state.
+- `config/newsflows/catalogs/host_topology.yml` for install/runtime/deploy
+  topology.
+- `docs/ecosystem_principles.md` for requirement classes, owner gates,
+  rebuildability, and raw-free evidence rules.
+
+Treat `feedgen_ops.feed_catalog` as feedgen-owned serving/readback state. Use
+`bskyops` desired-state parity plus feedgen admin dry-run/apply for feed
+changes; do not hand-edit Postgres rows as planning truth.
+
+Retired priority endpoints: `/api/prioritize` and `/api/priorities` return
+`410 retired_endpoint`. Ranker-priority feeds read
+`ranker_prod.feed_current_priority.score`.
+
+## Local Development Notes
+
 To import subscribers, create csv file subscribers.csv in the project directory. Should have columns handle and did, supply either, the other will be looked up.
 
 Start Feed generator (Terminal 1):
@@ -25,10 +51,6 @@ yarn publishFeed
 ```
 
 Subscription endpoint: <http://localhost:3000/api/subscribe?handle=news-flows-nl.bsky.social>
-
-Retired priority endpoints: `/api/prioritize` and `/api/priorities` return
-`410 retired_endpoint`. Ranker output is written through
-`ranker_prod.feed_current_priority.score`.
 
 ## Central Feed Catalog Ops
 
@@ -81,11 +103,16 @@ When adding new env vars (e.g. `STUDY_*` for the study endpoints), update **both
 - `docker-compose.yml` (tracked, for dev/portable deploys)
 - `docker-compose-deploy.yml` (server-only)
 
-# Upload to dockerhub (for Contributors)
+## Historical DockerHub Upload Note
 
 ``` bash
 docker image push jbgruber/bsky-feedgen:latest
 ```
+
+Do not use `latest` or maintainer-personal tags for NEWSFLOWS production
+deploys. Production image refs, compose roots, and rebuild recipes are declared
+in the BSKY root `host_topology.yml`; feedgen production deploys follow
+`docs/runbooks/feedgen_production_deploy_runbook.md` from the BSKY root repo.
 
 ## Fork changelog (pmmendoza)
 
