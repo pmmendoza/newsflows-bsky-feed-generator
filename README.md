@@ -52,6 +52,15 @@ yarn publishFeed
 
 Subscription endpoint: <http://localhost:3000/api/subscribe?handle=news-flows-nl.bsky.social>
 
+## Rehearsal Profiles
+
+Feedgen-owned rebuild rehearsal artifacts live under `rehearsal/`. The first
+minimal runtime target is
+`rehearsal/feedgen-serving-no-archive/`: a disposable loopback profile that
+starts feedgen in `FEEDGEN_READ_ONLY_MODE=true`, disables archive outbox, seeds
+one synthetic chronological feed, and keeps ranker, archive worker, bots, Caddy,
+production data, and raw secrets out of scope.
+
 ## Central Feed Catalog Ops
 
 The non-secret desired state for publisher accounts, active and
@@ -116,6 +125,12 @@ in the BSKY root `host_topology.yml`; feedgen production deploys follow
 
 ## Fork changelog (pmmendoza)
 
+- **2026-06-19** — Add feedgen-owned `feedgen-serving-no-archive` rehearsal
+  profile artifacts for the first incremental rebuild runtime proof. The profile
+  uses a disposable Postgres schema/seed, catalog-driven chronological serving,
+  `FEEDGEN_READ_ONLY_MODE=true`, and `FEEDGEN_ARCHIVE_OUTBOX_ENABLED=false`;
+  it deliberately excludes ranker, archive worker, research archive, bots, Caddy,
+  production data, and raw secrets.
 - **2026-06-08** — Document central desired-state feed catalog operations.
   Feedgen `feedgen_ops.feed_catalog` is the feedgen-owned runtime
   materialization/readback surface for `config/newsflows/catalogs/publishers.yml`;
