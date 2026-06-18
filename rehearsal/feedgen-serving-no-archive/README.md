@@ -80,7 +80,7 @@ Expected result for `limit=3`:
 - zero dependency on `ranker_prod.*`, `feedgen_ops.archive_outbox`, or
   `research_archive.*`.
 
-## Startup / Migration And Source-Build Variants
+## Startup / Migration, Source-Build, And Synthetic Ingest Variants
 
 The first proof can run with `FEEDGEN_READ_ONLY_MODE=true` when the disposable DB
 is already bootstrapped. A second incremental proof may start feedgen with
@@ -107,7 +107,29 @@ For that variant:
 
 This variant proves startup and migration boundaries. The source-build variant
 also proves that the committed feedgen source can produce a runnable image for
-this minimal profile. Neither variant proves real firehose ingestion.
+this minimal profile.
+
+A further synthetic-ingest proof can run from the same fresh source-built image
+without connecting to the live firehose:
+
+```sh
+FEEDGEN_TEST_DSN='postgresql://feedgen:feedgen@localhost:5436/feedgen-db-staging' \
+FEEDGEN_SYNTHETIC_FIREHOSE_REHEARSAL=1 \
+  npx ts-node scripts/test_firehose_ingest_synthetic.ts
+```
+
+In server Docker rehearsal, call
+`dist/rehearsal/synthetic-firehose-ingest.js` through Node inside the temporary
+image and pass a disposable Postgres DSN. The proof builds a lexicon-valid
+CAR-backed `com.atproto.sync.subscribeRepos#commit`, invokes
+`FirehoseSubscription.handleEvent()`, and expects one `post` row plus one
+type-2 `engagement` row.
+
+This proves the CAR decode and database write path for synthetic post/like
+events. It still does not prove live WebSocket firehose transport, reconnect
+behavior, cursor persistence, signed commit/MST validity, scoped-ingestion
+allowlist filtering, archive worker behavior, bots/FreshRSS supply, ranker
+integration, public edge/TLS, protected credentials, or production data restore.
 
 ## Exclusion Gates
 
