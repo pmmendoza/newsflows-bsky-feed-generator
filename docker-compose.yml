@@ -1,3 +1,9 @@
+# LOCAL / DEV ONLY — NOT a production/rebuild artifact.
+# Production deployment uses the topology-declared compose at
+# deploy/docker/feedgen/docker-compose.yml (digest-pinned image + postgres,
+# per host_topology.yml). The image default below is intentionally a local
+# convenience default and may be stale; override with FEEDGEN_IMAGE=<tag>.
+# See dev/audits/centralization_drift_register_2026-06-18.md (DR-003).
 services:
   feedgen:
     image: ${FEEDGEN_IMAGE:-pmmendoza/bsky-feedgen:catalog-publisher-dids-9e6a72b-20260605}
