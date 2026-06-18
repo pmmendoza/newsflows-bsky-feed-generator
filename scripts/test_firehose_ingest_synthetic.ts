@@ -10,6 +10,9 @@
  *   FEEDGEN_SYNTHETIC_FIREHOSE_REHEARSAL=1 \
  *     npx ts-node scripts/test_firehose_ingest_synthetic.ts
  *
+ * Add `FEEDGEN_SYNTHETIC_FIREHOSE_SCOPED=1` to prove the same path with
+ * scoped ingestion enabled and explicit allowlist fixtures.
+ *
  * The test skips unless both env vars are set, so normal execute smoke runs do
  * not accidentally write synthetic rows to an arbitrary database.
  */
@@ -21,6 +24,7 @@ import {
 async function main() {
   const dsn = process.env.FEEDGEN_TEST_DSN
   const enabled = process.env.FEEDGEN_SYNTHETIC_FIREHOSE_REHEARSAL === '1'
+  const scoped = process.env.FEEDGEN_SYNTHETIC_FIREHOSE_SCOPED === '1'
 
   if (!dsn || !enabled) {
     console.log(
@@ -31,6 +35,7 @@ async function main() {
 
   const result = await runSyntheticFirehoseIngestRehearsal({
     connectionString: dsn,
+    scopedIngestion: scoped,
   })
 
   console.log(JSON.stringify(result, null, 2))
