@@ -14,6 +14,7 @@ type Options = {
   serviceUrl: string
   maxFrames: number
   timeoutMs: number
+  cursorProbe?: boolean
 }
 
 export type FirehoseRelayConnectivityResult = {
@@ -32,6 +33,12 @@ export type FirehoseRelayConnectivityResult = {
   highest_seq: number
   timeout_ms: number
   max_frames: number
+  cursor_probe_status: 'ok' | 'skipped'
+  cursor_probe_requested_cursor: number | null
+  cursor_probe_frame_count: number
+  cursor_probe_lowest_seq: number | null
+  cursor_probe_highest_seq: number | null
+  cursor_probe_relation: 'inclusive' | 'after' | 'skipped'
   raw_values_in_output: false
 }
 
@@ -41,6 +48,76 @@ export async function runFirehoseRelayConnectivityProof(
   assert.ok(options.maxFrames > 0, 'maxFrames must be positive')
   assert.ok(options.timeoutMs > 0, 'timeoutMs must be positive')
 
+  const serviceHost = new URL(options.serviceUrl).host
+  const baseline = await collectRelayFrames({
+    serviceUrl: options.serviceUrl,
+    maxFrames: options.maxFrames,
+    timeoutMs: options.timeoutMs,
+  })
+  let cursorProbe: RelayFrameCollection | null = null
+  if (options.cursorProbe) {
+    cursorProbe = await collectRelayFrames({
+      serviceUrl: options.serviceUrl,
+      maxFrames: 1,
+      timeoutMs: options.timeoutMs,
+      cursor: baseline.highestSeq,
+    })
+    assert.ok(
+      cursorProbe.lowestSeq >= baseline.highestSeq,
+      'relay cursor probe returned a sequence before the requested cursor',
+    )
+  }
+
+  return {
+    status: 'ok',
+    transport: 'xrpc_websocket',
+    store_mode: 'no_store',
+    service_host: serviceHost,
+    frame_count: baseline.totalFrames,
+    commit_count: baseline.counts.commit,
+    handle_count: baseline.counts.handle,
+    migrate_count: baseline.counts.migrate,
+    tombstone_count: baseline.counts.tombstone,
+    info_count: baseline.counts.info,
+    other_count: baseline.counts.other,
+    lowest_seq: baseline.lowestSeq,
+    highest_seq: baseline.highestSeq,
+    timeout_ms: options.timeoutMs,
+    max_frames: options.maxFrames,
+    cursor_probe_status: cursorProbe ? 'ok' : 'skipped',
+    cursor_probe_requested_cursor: cursorProbe ? baseline.highestSeq : null,
+    cursor_probe_frame_count: cursorProbe?.totalFrames ?? 0,
+    cursor_probe_lowest_seq: cursorProbe?.lowestSeq ?? null,
+    cursor_probe_highest_seq: cursorProbe?.highestSeq ?? null,
+    cursor_probe_relation: cursorProbe
+      ? cursorProbe.lowestSeq === baseline.highestSeq
+        ? 'inclusive'
+        : 'after'
+      : 'skipped',
+    raw_values_in_output: false,
+  }
+}
+
+type RelayFrameCollection = {
+  counts: {
+    commit: number
+    handle: number
+    migrate: number
+    tombstone: number
+    info: number
+    other: number
+  }
+  totalFrames: number
+  lowestSeq: number
+  highestSeq: number
+}
+
+async function collectRelayFrames(options: {
+  serviceUrl: string
+  maxFrames: number
+  timeoutMs: number
+  cursor?: number
+}): Promise<RelayFrameCollection> {
   const abort = new AbortController()
   const counts = {
     commit: 0,
@@ -51,7 +128,6 @@ export async function runFirehoseRelayConnectivityProof(
     other: 0,
   }
   const seqs: number[] = []
-  const serviceHost = new URL(options.serviceUrl).host
 
   const timeout = setTimeout(() => {
     abort.abort(new Error('relay connectivity timeout'))
@@ -61,6 +137,10 @@ export async function runFirehoseRelayConnectivityProof(
     service: options.serviceUrl,
     method: ids.ComAtprotoSyncSubscribeRepos,
     signal: abort.signal,
+    getParams: () =>
+      typeof options.cursor === 'number'
+        ? { cursor: options.cursor }
+        : undefined,
     validate: (value: unknown) => {
       try {
         return lexicons.assertValidXrpcMessage<RepoEvent>(
@@ -105,22 +185,10 @@ export async function runFirehoseRelayConnectivityProof(
     assert.ok(seqs.length > 0, 'relay produced no sequence-bearing frames')
 
     return {
-      status: 'ok',
-      transport: 'xrpc_websocket',
-      store_mode: 'no_store',
-      service_host: serviceHost,
-      frame_count: totalFrames,
-      commit_count: counts.commit,
-      handle_count: counts.handle,
-      migrate_count: counts.migrate,
-      tombstone_count: counts.tombstone,
-      info_count: counts.info,
-      other_count: counts.other,
-      lowest_seq: Math.min(...seqs),
-      highest_seq: Math.max(...seqs),
-      timeout_ms: options.timeoutMs,
-      max_frames: options.maxFrames,
-      raw_values_in_output: false,
+      counts,
+      totalFrames,
+      lowestSeq: Math.min(...seqs),
+      highestSeq: Math.max(...seqs),
     }
   } finally {
     clearTimeout(timeout)

@@ -202,10 +202,29 @@ The output deliberately omits raw repo DIDs, handles, URIs, CAR blocks, and DB
 rows.
 
 This proves bounded production-relay connectivity and local frame validation
-only. It still does not prove relay-side cursor semantics, signed commit/MST
-validity, long-running live ingestion, feedgen DB writes from live events,
-archive worker behavior, bots/FreshRSS supply, ranker integration, public
-edge/TLS, protected credentials, or production data restore.
+only. Add `FEEDGEN_FIREHOSE_RELAY_CURSOR_PROBE=1` to perform a second no-store
+connection with the first pass's highest observed sequence as the cursor:
+
+```sh
+FEEDGEN_FIREHOSE_RELAY_CONNECTIVITY=1 \
+FEEDGEN_FIREHOSE_RELAY_CURSOR_PROBE=1 \
+FEEDGEN_FIREHOSE_RELAY_MAX_FRAMES=2 \
+FEEDGEN_FIREHOSE_RELAY_TIMEOUT_MS=15000 \
+  npx ts-node scripts/test_firehose_relay_connectivity.ts
+```
+
+The cursor probe validates that the relay returns sequence-bearing frames at or
+after the requested cursor and reports `cursor_probe_relation` as `inclusive`
+or `after`. Live `bsky.network` checks on 2026-06-19 observed inclusive
+semantics, so callers must not assume the first returned frame is strictly
+greater than the requested cursor.
+
+Together, the no-store relay proofs cover bounded relay reachability, local
+frame validation, and relay-side cursor parameter behavior without storing
+events. They still do not prove signed commit/MST validity, long-running live
+ingestion, feedgen DB writes from live events, archive worker behavior,
+bots/FreshRSS supply, ranker integration, public edge/TLS, protected
+credentials, or production data restore.
 
 ## Synthetic DB Dump/Restore Rehearsal
 
