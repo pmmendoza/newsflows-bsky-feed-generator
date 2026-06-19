@@ -118,6 +118,15 @@ FEEDGEN_SYNTHETIC_FIREHOSE_REHEARSAL=1 \
   npx ts-node scripts/test_firehose_ingest_synthetic.ts
 ```
 
+Add scoped-ingestion fixtures with:
+
+```sh
+FEEDGEN_TEST_DSN='postgresql://feedgen:feedgen@localhost:5436/feedgen-db-staging' \
+FEEDGEN_SYNTHETIC_FIREHOSE_REHEARSAL=1 \
+FEEDGEN_SYNTHETIC_FIREHOSE_SCOPED=1 \
+  npx ts-node scripts/test_firehose_ingest_synthetic.ts
+```
+
 In server Docker rehearsal, call
 `dist/rehearsal/synthetic-firehose-ingest.js` through Node inside the temporary
 image and pass a disposable Postgres DSN. The proof builds a lexicon-valid
@@ -126,10 +135,15 @@ CAR-backed `com.atproto.sync.subscribeRepos#commit`, invokes
 type-2 `engagement` row.
 
 This proves the CAR decode and database write path for synthetic post/like
-events. It still does not prove live WebSocket firehose transport, reconnect
-behavior, cursor persistence, signed commit/MST validity, scoped-ingestion
-allowlist filtering, archive worker behavior, bots/FreshRSS supply, ranker
-integration, public edge/TLS, protected credentials, or production data restore.
+events. With `FEEDGEN_SYNTHETIC_FIREHOSE_SCOPED=1`, it also enables scoped
+ingestion, creates minimal disposable `feedgen_ops.feed_catalog`,
+`subscriber`, and `follows` fixtures, stores the allowlisted synthetic repo, and
+asserts that a non-allowlisted synthetic repo is filtered out.
+
+These variants still do not prove live WebSocket firehose transport, reconnect
+behavior, cursor persistence, signed commit/MST validity, archive worker
+behavior, bots/FreshRSS supply, ranker integration, public edge/TLS, protected
+credentials, or production data restore.
 
 ## Exclusion Gates
 
