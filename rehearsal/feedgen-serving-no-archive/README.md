@@ -140,9 +140,32 @@ ingestion, creates minimal disposable `feedgen_ops.feed_catalog`,
 `subscriber`, and `follows` fixtures, stores the allowlisted synthetic repo, and
 asserts that a non-allowlisted synthetic repo is filtered out.
 
-These variants still do not prove live WebSocket firehose transport, reconnect
-behavior, cursor persistence, signed commit/MST validity, archive worker
-behavior, bots/FreshRSS supply, ranker integration, public edge/TLS, protected
+These variants still do not prove WebSocket transport through the subscription
+client. Use the synthetic WebSocket transport rehearsal below for that narrower
+proof.
+
+## Synthetic XRPC WebSocket Transport Rehearsal
+
+Use `scripts/test_firehose_websocket_synthetic.ts` to prove that feedgen's
+normal `FirehoseSubscription.run()` path can consume an XRPC WebSocket stream
+and persist a cursor. The script is guarded and skips unless explicitly enabled:
+
+```sh
+FEEDGEN_TEST_DSN='postgresql://feedgen:feedgen@localhost:5436/feedgen-db-staging' \
+FEEDGEN_SYNTHETIC_FIREHOSE_WS_REHEARSAL=1 \
+  npx ts-node scripts/test_firehose_websocket_synthetic.ts
+```
+
+The test starts a local XRPC stream server, sends a CAR-backed
+`com.atproto.sync.subscribeRepos#commit` frame over WebSocket, and lets the
+subscription iterator feed that event to `FirehoseSubscription.handleEvent()`.
+The expected readback is one `post` row, one type-2 `engagement` row, and
+`sub_state.cursor = 20` for the synthetic loopback service URL.
+
+This proves bounded synthetic WebSocket transport and cursor persistence. It
+still does not prove reconnect behavior, production relay connectivity, signed
+commit/MST validity, long-running live ingestion, archive worker behavior,
+bots/FreshRSS supply, ranker integration, public edge/TLS, protected
 credentials, or production data restore.
 
 ## Synthetic DB Dump/Restore Rehearsal
