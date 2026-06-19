@@ -15,6 +15,7 @@ type Options = {
   maxFrames: number
   timeoutMs: number
   cursorProbe?: boolean
+  minDurationMs?: number
 }
 
 export type FirehoseRelayConnectivityResult = {
@@ -33,6 +34,10 @@ export type FirehoseRelayConnectivityResult = {
   highest_seq: number
   timeout_ms: number
   max_frames: number
+  soak_status: 'ok' | 'skipped'
+  soak_min_duration_ms: number
+  soak_observed_duration_ms: number
+  soak_frame_count: number
   cursor_probe_status: 'ok' | 'skipped'
   cursor_probe_requested_cursor: number | null
   cursor_probe_frame_count: number
@@ -47,12 +52,19 @@ export async function runFirehoseRelayConnectivityProof(
 ): Promise<FirehoseRelayConnectivityResult> {
   assert.ok(options.maxFrames > 0, 'maxFrames must be positive')
   assert.ok(options.timeoutMs > 0, 'timeoutMs must be positive')
+  const minDurationMs = options.minDurationMs ?? 0
+  assert.ok(minDurationMs >= 0, 'minDurationMs must not be negative')
+  assert.ok(
+    minDurationMs < options.timeoutMs,
+    'minDurationMs must be lower than timeoutMs',
+  )
 
   const serviceHost = new URL(options.serviceUrl).host
   const baseline = await collectRelayFrames({
     serviceUrl: options.serviceUrl,
     maxFrames: options.maxFrames,
     timeoutMs: options.timeoutMs,
+    minDurationMs,
   })
   let cursorProbe: RelayFrameCollection | null = null
   if (options.cursorProbe) {
@@ -84,6 +96,10 @@ export async function runFirehoseRelayConnectivityProof(
     highest_seq: baseline.highestSeq,
     timeout_ms: options.timeoutMs,
     max_frames: options.maxFrames,
+    soak_status: minDurationMs > 0 ? 'ok' : 'skipped',
+    soak_min_duration_ms: minDurationMs,
+    soak_observed_duration_ms: baseline.durationMs,
+    soak_frame_count: baseline.totalFrames,
     cursor_probe_status: cursorProbe ? 'ok' : 'skipped',
     cursor_probe_requested_cursor: cursorProbe ? baseline.highestSeq : null,
     cursor_probe_frame_count: cursorProbe?.totalFrames ?? 0,
@@ -110,14 +126,17 @@ type RelayFrameCollection = {
   totalFrames: number
   lowestSeq: number
   highestSeq: number
+  durationMs: number
 }
 
 async function collectRelayFrames(options: {
   serviceUrl: string
   maxFrames: number
   timeoutMs: number
+  minDurationMs?: number
   cursor?: number
 }): Promise<RelayFrameCollection> {
+  const startedAt = Date.now()
   const abort = new AbortController()
   const counts = {
     commit: 0,
@@ -166,7 +185,10 @@ async function collectRelayFrames(options: {
         else if (isInfo(event)) counts.info += 1
         else counts.other += 1
 
-        if (frameCount(counts) >= options.maxFrames) {
+        if (
+          frameCount(counts) >= options.maxFrames &&
+          Date.now() - startedAt >= (options.minDurationMs ?? 0)
+        ) {
           abort.abort(new Error('relay connectivity frame limit reached'))
         }
       }
@@ -189,6 +211,7 @@ async function collectRelayFrames(options: {
       totalFrames,
       lowestSeq: Math.min(...seqs),
       highestSeq: Math.max(...seqs),
+      durationMs: Date.now() - startedAt,
     }
   } finally {
     clearTimeout(timeout)

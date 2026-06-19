@@ -202,7 +202,24 @@ The output deliberately omits raw repo DIDs, handles, URIs, CAR blocks, and DB
 rows.
 
 This proves bounded production-relay connectivity and local frame validation
-only. Add `FEEDGEN_FIREHOSE_RELAY_CURSOR_PROBE=1` to perform a second no-store
+only. Set `FEEDGEN_FIREHOSE_RELAY_MIN_DURATION_MS` to keep the no-store
+connection open until both the frame floor and minimum duration are reached:
+
+```sh
+FEEDGEN_FIREHOSE_RELAY_CONNECTIVITY=1 \
+FEEDGEN_FIREHOSE_RELAY_MIN_DURATION_MS=10000 \
+FEEDGEN_FIREHOSE_RELAY_MAX_FRAMES=2 \
+FEEDGEN_FIREHOSE_RELAY_TIMEOUT_MS=25000 \
+  npx ts-node scripts/test_firehose_relay_connectivity.ts
+```
+
+When a minimum duration is set, `FEEDGEN_FIREHOSE_RELAY_MAX_FRAMES` acts as a
+minimum frame floor rather than an upper bound. The result reports
+`soak_status`, `soak_min_duration_ms`, `soak_observed_duration_ms`, and
+`soak_frame_count`. This is still a no-store proof: it does not write live relay
+events to Postgres.
+
+Add `FEEDGEN_FIREHOSE_RELAY_CURSOR_PROBE=1` to perform a second no-store
 connection with the first pass's highest observed sequence as the cursor:
 
 ```sh
@@ -220,9 +237,10 @@ semantics, so callers must not assume the first returned frame is strictly
 greater than the requested cursor.
 
 Together, the no-store relay proofs cover bounded relay reachability, local
-frame validation, and relay-side cursor parameter behavior without storing
-events. They still do not prove signed commit/MST validity, long-running live
-ingestion, feedgen DB writes from live events, archive worker behavior,
+frame validation, short bounded connection-soak behavior, and relay-side cursor
+parameter behavior without storing events. They still do not prove signed
+commit/MST validity, long-running live ingestion, feedgen DB writes from live
+events, archive worker behavior,
 bots/FreshRSS supply, ranker integration, public edge/TLS, protected
 credentials, or production data restore.
 
