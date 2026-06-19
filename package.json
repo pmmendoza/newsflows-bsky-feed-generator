@@ -14,7 +14,7 @@
     "archiveWorker": "ts-node src/archive-worker.ts",
     "build": "tsc",
     "test:feed-catalog-admin": "ts-node scripts/test_feed_catalog_admin.ts",
-    "test:execute": "ts-node scripts/test_describe_generator_catalog.ts && ts-node scripts/test_publisher_did_resolver.ts && ts-node scripts/test_firehose_cursor_await.ts && ts-node scripts/test_firehose_ingest_synthetic.ts && ts-node scripts/test_firehose_websocket_synthetic.ts && bash scripts/rehearse_feedgen_db_restore_synthetic.sh && ts-node scripts/test_publisher_post_backfill.ts && ts-node scripts/test_ranker_priority_helper_execute.ts && ts-node scripts/test_policies_execute.ts && ts-node scripts/test_catalog_dispatch_execute.ts && ts-node scripts/test_make_handler_dispatcher_execute.ts && ts-node scripts/test_buildfeed_smoke.ts && ts-node scripts/test_retired_priority_endpoints.ts"
+    "test:execute": "ts-node scripts/test_describe_generator_catalog.ts && ts-node scripts/test_publisher_did_resolver.ts && ts-node scripts/test_firehose_cursor_await.ts && ts-node scripts/test_firehose_ingest_synthetic.ts && ts-node scripts/test_firehose_websocket_synthetic.ts && ts-node scripts/test_firehose_relay_connectivity.ts && bash scripts/rehearse_feedgen_db_restore_synthetic.sh && ts-node scripts/test_publisher_post_backfill.ts && ts-node scripts/test_ranker_priority_helper_execute.ts && ts-node scripts/test_policies_execute.ts && ts-node scripts/test_catalog_dispatch_execute.ts && ts-node scripts/test_make_handler_dispatcher_execute.ts && ts-node scripts/test_buildfeed_smoke.ts && ts-node scripts/test_retired_priority_endpoints.ts"
   },
   "dependencies": {
     "@atproto/api": "^0.13.28",

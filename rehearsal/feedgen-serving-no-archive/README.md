@@ -181,6 +181,32 @@ prove production relay connectivity, signed commit/MST validity, long-running
 live ingestion, archive worker behavior, bots/FreshRSS supply, ranker
 integration, public edge/TLS, protected credentials, or production data restore.
 
+## No-Store Relay Connectivity Rehearsal
+
+Use `scripts/test_firehose_relay_connectivity.ts` to prove that the configured
+ATProto relay endpoint can deliver valid `com.atproto.sync.subscribeRepos`
+frames to feedgen's local dependency stack without writing to feedgen Postgres.
+The script is guarded and skips unless explicitly enabled:
+
+```sh
+FEEDGEN_FIREHOSE_RELAY_CONNECTIVITY=1 \
+FEEDGEN_FIREHOSE_RELAY_MAX_FRAMES=3 \
+FEEDGEN_FIREHOSE_RELAY_TIMEOUT_MS=15000 \
+  npx ts-node scripts/test_firehose_relay_connectivity.ts
+```
+
+The proof connects to `FEEDGEN_SUBSCRIPTION_ENDPOINT`, or `wss://bsky.network`
+by default, validates frames with the generated feedgen lexicons, counts event
+types, records only sequence bounds, and exits after the frame limit or timeout.
+The output deliberately omits raw repo DIDs, handles, URIs, CAR blocks, and DB
+rows.
+
+This proves bounded production-relay connectivity and local frame validation
+only. It still does not prove relay-side cursor semantics, signed commit/MST
+validity, long-running live ingestion, feedgen DB writes from live events,
+archive worker behavior, bots/FreshRSS supply, ranker integration, public
+edge/TLS, protected credentials, or production data restore.
+
 ## Synthetic DB Dump/Restore Rehearsal
 
 Use `scripts/rehearse_feedgen_db_restore_synthetic.sh` to prove the bounded
