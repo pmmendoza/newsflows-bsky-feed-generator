@@ -53,7 +53,6 @@ pg_dump \
 psql "$target_dsn" -v ON_ERROR_STOP=1 >/dev/null <<'SQL'
 DROP SCHEMA IF EXISTS feedgen_ops CASCADE;
 DROP SCHEMA IF EXISTS public CASCADE;
-CREATE SCHEMA public;
 SQL
 
 pg_restore \
