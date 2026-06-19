@@ -150,7 +150,14 @@ async function waitForServer(server: XrpcStreamServer): Promise<void> {
 
 async function closeServer(server: XrpcStreamServer): Promise<void> {
   await new Promise<void>((resolve) => {
-    server.wss.close(() => resolve())
+    const timeout = setTimeout(() => resolve(), 1_000)
+    for (const client of server.wss.clients) {
+      client.terminate()
+    }
+    server.wss.close(() => {
+      clearTimeout(timeout)
+      resolve()
+    })
   })
 }
 
