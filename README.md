@@ -61,6 +61,13 @@ starts feedgen in `FEEDGEN_READ_ONLY_MODE=true`, disables archive outbox, seeds
 one synthetic chronological feed, and keeps ranker, archive worker, bots, Caddy,
 production data, and raw secrets out of scope.
 
+The archive-worker profile is
+`rehearsal/feedgen-archive-worker/`: a disposable Postgres profile that creates
+the worker-required `feedgen_ops.archive_outbox` / DLQ tables and
+`research_archive` request/post/capture/served surfaces, seeds synthetic outbox
+rows, and proves archive drain without production data, Caddy, bots, ranker, or
+raw secrets.
+
 ## Central Feed Catalog Ops
 
 The non-secret desired state for publisher accounts, active and
@@ -131,6 +138,11 @@ in the BSKY root `host_topology.yml`; feedgen production deploys follow
   `FEEDGEN_READ_ONLY_MODE=true`, and `FEEDGEN_ARCHIVE_OUTBOX_ENABLED=false`;
   it deliberately excludes ranker, archive worker, research archive, bots, Caddy,
   production data, and raw secrets.
+- **2026-06-20** — Add feedgen-owned `feedgen-archive-worker` rehearsal profile
+  artifacts for the archive/full-profile rebuild path. The profile materializes
+  guarded disposable archive/research schema surfaces and synthetic outbox rows
+  so the archive worker can be proven from committed setup inputs rather than
+  ad hoc SQL.
 - **2026-06-08** — Document central desired-state feed catalog operations.
   Feedgen `feedgen_ops.feed_catalog` is the feedgen-owned runtime
   materialization/readback surface for `config/newsflows/catalogs/publishers.yml`;
