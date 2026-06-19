@@ -11,10 +11,14 @@
  *   FEEDGEN_SYNTHETIC_FIREHOSE_WS_REHEARSAL=1 \
  *     npx ts-node scripts/test_firehose_websocket_synthetic.ts
  *
- * The test skips unless both env vars are set, so normal execute smoke runs do
- * not accidentally write synthetic rows to an arbitrary database.
+ * Set FEEDGEN_SYNTHETIC_FIREHOSE_WS_RECONNECT=1 to also prove a bounded
+ * reconnect/resume pass against the synthetic stream.
+ *
+ * The test skips unless the base env vars are set, so normal execute smoke runs
+ * do not accidentally write synthetic rows to an arbitrary database.
  */
 
+import assert from 'assert'
 import {
   runSyntheticFirehoseWebsocketRehearsal,
 } from '../src/rehearsal/synthetic-firehose-websocket'
@@ -32,7 +36,17 @@ async function main() {
 
   const result = await runSyntheticFirehoseWebsocketRehearsal({
     connectionString: dsn,
+    reconnect:
+      process.env.FEEDGEN_SYNTHETIC_FIREHOSE_WS_RECONNECT === '1',
   })
+
+  if (process.env.FEEDGEN_SYNTHETIC_FIREHOSE_WS_RECONNECT === '1') {
+    assert.equal(result.connection_count, 2)
+    assert.equal(result.reconnect_resume_cursor, 20)
+    assert.equal(result.cursor, 40)
+    assert.equal(result.post_count, 2)
+    assert.equal(result.engagement_count, 2)
+  }
 
   console.log(JSON.stringify(result, null, 2))
   console.log('OK: synthetic firehose WebSocket transport smoke clean')

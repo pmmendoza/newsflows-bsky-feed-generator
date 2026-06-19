@@ -162,11 +162,24 @@ subscription iterator feed that event to `FirehoseSubscription.handleEvent()`.
 The expected readback is one `post` row, one type-2 `engagement` row, and
 `sub_state.cursor = 20` for the synthetic loopback service URL.
 
-This proves bounded synthetic WebSocket transport and cursor persistence. It
-still does not prove reconnect behavior, production relay connectivity, signed
-commit/MST validity, long-running live ingestion, archive worker behavior,
-bots/FreshRSS supply, ranker integration, public edge/TLS, protected
-credentials, or production data restore.
+Set `FEEDGEN_SYNTHETIC_FIREHOSE_WS_RECONNECT=1` to add a bounded reconnect pass:
+
+```sh
+FEEDGEN_TEST_DSN='postgresql://feedgen:feedgen@localhost:5436/feedgen-db-staging' \
+FEEDGEN_SYNTHETIC_FIREHOSE_WS_REHEARSAL=1 \
+FEEDGEN_SYNTHETIC_FIREHOSE_WS_RECONNECT=1 \
+  npx ts-node scripts/test_firehose_websocket_synthetic.ts
+```
+
+The reconnect variant runs a second subscription against the same synthetic
+service URL and expects the second request to include `cursor=20`, then persists
+a second CAR-backed post/like event and `sub_state.cursor = 40`.
+
+This proves bounded synthetic WebSocket transport, cursor persistence, and
+cursor resume across a reconnect-like second subscription. It still does not
+prove production relay connectivity, signed commit/MST validity, long-running
+live ingestion, archive worker behavior, bots/FreshRSS supply, ranker
+integration, public edge/TLS, protected credentials, or production data restore.
 
 ## Synthetic DB Dump/Restore Rehearsal
 

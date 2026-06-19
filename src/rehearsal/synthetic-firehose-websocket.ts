@@ -17,6 +17,10 @@ import {
 } from './synthetic-firehose-ingest'
 
 const CURSOR_SEQ = 20
+const RECONNECT_CURSOR_SEQ = 40
+const RECONNECT_POST_RKEY = 'synthetic-post-reconnect'
+const RECONNECT_LIKE_RKEY = 'synthetic-like-reconnect'
+const RECONNECT_POST_TEXT = 'synthetic firehose post after reconnect'
 
 export type SyntheticFirehoseWebsocketResult = {
   status: 'ok'
@@ -33,10 +37,13 @@ export type SyntheticFirehoseWebsocketResult = {
   post_cid: string
   engagement_type: number
   car_block_count: number
+  connection_count: number
+  reconnect_resume_cursor: number | null
 }
 
 type Options = {
   connectionString: string
+  reconnect?: boolean
 }
 
 export async function runSyntheticFirehoseWebsocketRehearsal(
@@ -58,16 +65,36 @@ export async function runSyntheticFirehoseWebsocketRehearsal(
 
     const postUri = `at://${SYNTHETIC_REPO}/app.bsky.feed.post/${POST_RKEY}`
     const likeUri = `at://${SYNTHETIC_REPO}/app.bsky.feed.like/${LIKE_RKEY}`
+    const reconnectBundle = options.reconnect
+      ? await buildSyntheticCommitEvent({
+          repo: SYNTHETIC_REPO,
+          postRkey: RECONNECT_POST_RKEY,
+          likeRkey: RECONNECT_LIKE_RKEY,
+          text: RECONNECT_POST_TEXT,
+          seq: RECONNECT_CURSOR_SEQ,
+        })
+      : null
+    const reconnectPostUri = `at://${SYNTHETIC_REPO}/app.bsky.feed.post/${RECONNECT_POST_RKEY}`
+    const reconnectLikeUri = `at://${SYNTHETIC_REPO}/app.bsky.feed.like/${RECONNECT_LIKE_RKEY}`
 
     await db.deleteFrom('engagement').where('uri', '=', likeUri).execute()
     await db.deleteFrom('post').where('uri', '=', postUri).execute()
-    let requestUrl = ''
+    await db
+      .deleteFrom('engagement')
+      .where('uri', '=', reconnectLikeUri)
+      .execute()
+    await db.deleteFrom('post').where('uri', '=', reconnectPostUri).execute()
+    const requestUrls: string[] = []
     server = new XrpcStreamServer({
       host: '127.0.0.1',
       port: 0,
       async *handler(req) {
-        requestUrl = req.url ?? ''
-        yield new MessageFrame(stripType(bundle.event), { type: '#commit' })
+        requestUrls.push(req.url ?? '')
+        const event =
+          reconnectBundle && requestUrls.length > 1
+            ? reconnectBundle.event
+            : bundle.event
+        yield new MessageFrame(stripType(event), { type: '#commit' })
       },
     })
 
@@ -84,16 +111,23 @@ export async function runSyntheticFirehoseWebsocketRehearsal(
       5_000,
       'synthetic firehose WebSocket subscription did not finish',
     )
+    if (options.reconnect) {
+      await withTimeout(
+        new FirehoseSubscription(db, serviceUrl).run(10),
+        5_000,
+        'synthetic firehose WebSocket reconnect subscription did not finish',
+      )
+    }
 
     const posts = await db
       .selectFrom('post')
       .selectAll()
-      .where('uri', '=', postUri)
+      .where('uri', 'in', [postUri, reconnectPostUri])
       .execute()
     const engagements = await db
       .selectFrom('engagement')
       .selectAll()
-      .where('uri', '=', likeUri)
+      .where('uri', 'in', [likeUri, reconnectLikeUri])
       .execute()
     const cursor = await db
       .selectFrom('sub_state')
@@ -101,32 +135,57 @@ export async function runSyntheticFirehoseWebsocketRehearsal(
       .where('service', '=', serviceUrl)
       .executeTakeFirst()
 
-    assert.equal(posts.length, 1)
-    assert.equal(posts[0].cid, bundle.postCid)
-    assert.equal(posts[0].author, SYNTHETIC_REPO)
-    assert.equal(posts[0].text, POST_TEXT)
-    assert.equal(engagements.length, 1)
-    assert.equal(engagements[0].subjectUri, postUri)
-    assert.equal(engagements[0].subjectCid, bundle.postCid)
-    assert.equal(engagements[0].type, 2)
-    assert.equal(Number(cursor?.cursor), CURSOR_SEQ)
-    assert.ok(requestUrl.startsWith(`/xrpc/${ids.ComAtprotoSyncSubscribeRepos}`))
+    const postByUri = new Map(posts.map((post) => [post.uri, post]))
+    const engagementByUri = new Map(engagements.map((eng) => [eng.uri, eng]))
+    const post = postByUri.get(postUri)
+    const engagement = engagementByUri.get(likeUri)
+
+    assert.equal(posts.length, options.reconnect ? 2 : 1)
+    assert.equal(post?.cid, bundle.postCid)
+    assert.equal(post?.author, SYNTHETIC_REPO)
+    assert.equal(post?.text, POST_TEXT)
+    assert.equal(engagements.length, options.reconnect ? 2 : 1)
+    assert.equal(engagement?.subjectUri, postUri)
+    assert.equal(engagement?.subjectCid, bundle.postCid)
+    assert.equal(engagement?.type, 2)
+    assert.equal(
+      Number(cursor?.cursor),
+      options.reconnect ? RECONNECT_CURSOR_SEQ : CURSOR_SEQ,
+    )
+    assert.ok(
+      requestUrls[0]?.startsWith(`/xrpc/${ids.ComAtprotoSyncSubscribeRepos}`),
+    )
+    if (options.reconnect) {
+      const reconnectPost = postByUri.get(reconnectPostUri)
+      const reconnectEngagement = engagementByUri.get(reconnectLikeUri)
+      assert.equal(reconnectPost?.cid, reconnectBundle?.postCid)
+      assert.equal(reconnectPost?.author, SYNTHETIC_REPO)
+      assert.equal(reconnectPost?.text, RECONNECT_POST_TEXT)
+      assert.equal(reconnectEngagement?.subjectUri, reconnectPostUri)
+      assert.equal(reconnectEngagement?.subjectCid, reconnectBundle?.postCid)
+      assert.equal(reconnectEngagement?.type, 2)
+      assert.equal(readCursorFromRequestUrl(requestUrls[1]), CURSOR_SEQ)
+    }
 
     return {
       status: 'ok',
       transport: 'xrpc_websocket',
       repo: SYNTHETIC_REPO,
       service_url: serviceUrl,
-      request_url: requestUrl,
+      request_url: requestUrls.join(','),
       post_uri: postUri,
       like_uri: likeUri,
       post_count: posts.length,
       engagement_count: engagements.length,
       cursor_service: serviceUrl,
       cursor: Number(cursor?.cursor),
-      post_cid: posts[0].cid,
-      engagement_type: engagements[0].type,
+      post_cid: post?.cid ?? '',
+      engagement_type: engagement?.type ?? 0,
       car_block_count: bundle.carBlockCount,
+      connection_count: requestUrls.length,
+      reconnect_resume_cursor: options.reconnect
+        ? readCursorFromRequestUrl(requestUrls[1])
+        : null,
     }
   } finally {
     if (server) {
@@ -134,6 +193,13 @@ export async function runSyntheticFirehoseWebsocketRehearsal(
     }
     await db.destroy()
   }
+}
+
+function readCursorFromRequestUrl(requestUrl: string | undefined): number | null {
+  if (!requestUrl) return null
+  const parsed = new URL(requestUrl, 'ws://synthetic.local')
+  const cursor = parsed.searchParams.get('cursor')
+  return cursor ? Number(cursor) : null
 }
 
 function stripType(evt: RepoEvent): Omit<Commit, '$type'> {
