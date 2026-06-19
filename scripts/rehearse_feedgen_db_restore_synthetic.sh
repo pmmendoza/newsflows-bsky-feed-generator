@@ -80,9 +80,9 @@ required_patterns=(
   '^subscriber=[1-9][0-9]*$'
   '^follows=[1-9][0-9]*$'
   '^post=[1-9][0-9]*$'
-  '^archive_outbox_regclass=f$'
-  '^ranker_schema=f$'
-  '^research_archive_schema=f$'
+  '^archive_outbox_regclass=false$'
+  '^ranker_schema=false$'
+  '^research_archive_schema=false$'
 )
 
 for pattern in "${required_patterns[@]}"; do
