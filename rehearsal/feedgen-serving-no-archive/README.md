@@ -145,6 +145,29 @@ behavior, cursor persistence, signed commit/MST validity, archive worker
 behavior, bots/FreshRSS supply, ranker integration, public edge/TLS, protected
 credentials, or production data restore.
 
+## Synthetic DB Dump/Restore Rehearsal
+
+Use `scripts/rehearse_feedgen_db_restore_synthetic.sh` to prove the bounded
+logical backup/restore mechanism for this disposable no-archive profile. The
+script is guarded and skips unless explicitly enabled:
+
+```sh
+FEEDGEN_DB_RESTORE_REHEARSAL=1 \
+FEEDGEN_RESTORE_SYNTHETIC_ONLY=1 \
+FEEDGEN_SOURCE_DSN='postgresql://feedgen:feedgen@source:5432/feedgen-db-staging' \
+FEEDGEN_TARGET_DSN='postgresql://feedgen:feedgen@target:5432/feedgen-db-staging' \
+  bash scripts/rehearse_feedgen_db_restore_synthetic.sh
+```
+
+The source and target DSNs must point at disposable synthetic Postgres
+instances. The script creates a custom-format `pg_dump` from the source DB,
+restores it into the target DB, and verifies raw-free counts for
+`feedgen_ops.feed_catalog`, `subscriber`, `follows`, `post`, `request_log`, and
+`request_posts`. It explicitly excludes `feedgen_ops.archive_outbox` and checks
+that `ranker_prod` and `research_archive` are absent. This proves only the
+logical dump/restore mechanism and the minimal warm-start shape for this
+profile; it does not authorize or validate a production dump.
+
 ## Exclusion Gates
 
 This profile is invalid if any of the following are required for the proof:
