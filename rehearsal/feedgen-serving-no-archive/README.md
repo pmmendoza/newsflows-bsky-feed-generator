@@ -240,7 +240,36 @@ Together, the no-store relay proofs cover bounded relay reachability, local
 frame validation, short bounded connection-soak behavior, and relay-side cursor
 parameter behavior without storing events. They still do not prove signed
 commit/MST validity, long-running live ingestion, feedgen DB writes from live
-events, archive worker behavior,
+events, archive worker behavior, bots/FreshRSS supply, ranker integration,
+public edge/TLS, protected credentials, or production data restore.
+
+## Live Relay Disposable-DB Write Rehearsal
+
+Use `scripts/test_firehose_live_db_rehearsal.ts` to prove that bounded live
+relay commit frames can pass through `FirehoseSubscription.handleEvent()` and
+write aggregate-verifiable rows to a disposable Postgres database. The script is
+guarded and skips unless explicitly enabled:
+
+```sh
+FEEDGEN_TEST_DSN='postgresql://feedgen:feedgen@localhost:5436/feedgen-db-staging' \
+FEEDGEN_FIREHOSE_LIVE_DB_REHEARSAL=1 \
+FEEDGEN_FIREHOSE_LIVE_DB_MIN_STORED_ROWS=1 \
+FEEDGEN_FIREHOSE_LIVE_DB_MAX_FRAMES=300 \
+FEEDGEN_FIREHOSE_LIVE_DB_TIMEOUT_MS=30000 \
+  npx ts-node scripts/test_firehose_live_db_rehearsal.ts
+```
+
+This proof migrates only the disposable database referenced by
+`FEEDGEN_TEST_DSN`, forces `FEEDGEN_SCOPED_INGESTION=false` for the bounded
+test, connects to `FEEDGEN_SUBSCRIPTION_ENDPOINT` or `wss://bsky.network` by
+default, passes live commit frames into the normal firehose handler, persists
+the cursor in disposable `sub_state`, and reports only aggregate row counts and
+sequence bounds. It deliberately omits raw repo DIDs, handles, URIs, CAR blocks,
+post text, and production DB values.
+
+This closes the narrow live-relay-to-disposable-DB write proof. It still does
+not prove production DB writes, signed commit/MST validity, scoped production
+catalog behavior, long-running live ingestion, archive worker behavior,
 bots/FreshRSS supply, ranker integration, public edge/TLS, protected
 credentials, or production data restore.
 
