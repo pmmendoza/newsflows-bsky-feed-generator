@@ -12,15 +12,15 @@ import type {
 import { FirehoseSubscription } from '../subscription'
 import { invalidatePublisherDidCache } from '../util/publisher-dids'
 
-const SYNTHETIC_REPO = 'did:plc:syntheticfirehose'
-const BLOCKED_REPO = 'did:plc:blockedfirehose'
+export const SYNTHETIC_REPO = 'did:plc:syntheticfirehose'
+export const BLOCKED_REPO = 'did:plc:blockedfirehose'
 const SYNTHETIC_SUBSCRIBER = 'did:plc:syntheticsubscriber'
 const SYNTHETIC_PUBLISHER = 'did:plc:syntheticpublisher'
-const POST_RKEY = 'synthetic-post'
-const LIKE_RKEY = 'synthetic-like'
+export const POST_RKEY = 'synthetic-post'
+export const LIKE_RKEY = 'synthetic-like'
 const BLOCKED_POST_RKEY = 'blocked-post'
 const BLOCKED_LIKE_RKEY = 'blocked-like'
-const POST_TEXT = 'synthetic firehose post'
+export const POST_TEXT = 'synthetic firehose post'
 const BLOCKED_POST_TEXT = 'blocked synthetic firehose post'
 
 export type SyntheticFirehoseIngestResult = {
@@ -194,9 +194,10 @@ type SyntheticCommitSpec = {
   postRkey: string
   likeRkey: string
   text: string
+  seq?: number
 }
 
-async function buildSyntheticCommitEvent(
+export async function buildSyntheticCommitEvent(
   spec: SyntheticCommitSpec,
 ): Promise<SyntheticCommitBundle> {
   const now = new Date().toISOString()
@@ -216,7 +217,7 @@ async function buildSyntheticCommitEvent(
 
   const event = {
     $type: 'com.atproto.sync.subscribeRepos#commit',
-    seq: 1,
+    seq: spec.seq ?? 1,
     repo: spec.repo,
     rebase: false,
     tooBig: false,
