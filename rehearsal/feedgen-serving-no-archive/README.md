@@ -273,6 +273,25 @@ catalog behavior, long-running live ingestion, archive worker behavior,
 bots/FreshRSS supply, ranker integration, public edge/TLS, protected
 credentials, or production data restore.
 
+Set `FEEDGEN_FIREHOSE_LIVE_DB_MIN_DURATION_MS` to keep the live-write proof open
+until the stored-row floor, frame floor, and minimum duration are all reached:
+
+```sh
+FEEDGEN_TEST_DSN='postgresql://feedgen:feedgen@localhost:5436/feedgen-db-staging' \
+FEEDGEN_FIREHOSE_LIVE_DB_REHEARSAL=1 \
+FEEDGEN_FIREHOSE_LIVE_DB_MIN_STORED_ROWS=5 \
+FEEDGEN_FIREHOSE_LIVE_DB_MAX_FRAMES=10 \
+FEEDGEN_FIREHOSE_LIVE_DB_MIN_DURATION_MS=30000 \
+FEEDGEN_FIREHOSE_LIVE_DB_TIMEOUT_MS=50000 \
+  npx ts-node scripts/test_firehose_live_db_rehearsal.ts
+```
+
+When a minimum duration is set, `FEEDGEN_FIREHOSE_LIVE_DB_MAX_FRAMES` acts as a
+frame floor rather than an upper bound. The result reports `soak_status`,
+`soak_min_duration_ms`, `soak_observed_duration_ms`, `soak_frame_count`, and
+`soak_stored_total`. This is still a bounded disposable-DB proof, not a
+production ingestion soak or production datastore/cold-start policy.
+
 ## Synthetic DB Dump/Restore Rehearsal
 
 Use `scripts/rehearse_feedgen_db_restore_synthetic.sh` to prove the bounded

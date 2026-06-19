@@ -9,6 +9,9 @@
  *   FEEDGEN_TEST_DSN='postgresql://feedgen:feedgen@localhost:5436/feedgen-db-staging' \
  *   FEEDGEN_FIREHOSE_LIVE_DB_REHEARSAL=1 \
  *     npx ts-node scripts/test_firehose_live_db_rehearsal.ts
+ *
+ * Set FEEDGEN_FIREHOSE_LIVE_DB_MIN_DURATION_MS to keep the live write proof
+ * open until both the stored-row/frame floors and minimum duration are reached.
  */
 
 import assert from 'assert'
@@ -38,6 +41,9 @@ async function main() {
     timeoutMs: Number(
       process.env.FEEDGEN_FIREHOSE_LIVE_DB_TIMEOUT_MS ?? '30000',
     ),
+    minDurationMs: Number(
+      process.env.FEEDGEN_FIREHOSE_LIVE_DB_MIN_DURATION_MS ?? '0',
+    ),
   })
 
   assert.equal(result.status, 'ok')
@@ -49,6 +55,16 @@ async function main() {
   assert.ok(result.post_count + result.engagement_count >= result.stored_total)
   assert.ok(result.cursor_persisted)
   assert.equal(result.raw_values_in_output, false)
+  const minDurationMs = Number(
+    process.env.FEEDGEN_FIREHOSE_LIVE_DB_MIN_DURATION_MS ?? '0',
+  )
+  if (minDurationMs > 0) {
+    assert.equal(result.soak_status, 'ok')
+    assert.equal(result.soak_min_duration_ms, minDurationMs)
+    assert.ok(result.soak_observed_duration_ms >= minDurationMs)
+    assert.ok(result.soak_frame_count >= result.max_frames)
+    assert.ok(result.soak_stored_total >= result.min_stored_rows)
+  }
 
   console.log(JSON.stringify(result, null, 2))
   console.log('OK: live firehose disposable DB rehearsal clean')

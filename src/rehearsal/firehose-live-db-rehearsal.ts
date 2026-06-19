@@ -16,6 +16,7 @@ type Options = {
   minStoredRows: number
   maxFrames: number
   timeoutMs: number
+  minDurationMs?: number
 }
 
 export type FirehoseLiveDbRehearsalResult = {
@@ -36,6 +37,11 @@ export type FirehoseLiveDbRehearsalResult = {
   cursor_value: number
   timeout_ms: number
   max_frames: number
+  soak_status: 'ok' | 'skipped'
+  soak_min_duration_ms: number
+  soak_observed_duration_ms: number
+  soak_frame_count: number
+  soak_stored_total: number
   raw_values_in_output: false
 }
 
@@ -51,6 +57,12 @@ export async function runFirehoseLiveDbRehearsal(
   assert.ok(options.minStoredRows > 0, 'minStoredRows must be positive')
   assert.ok(options.maxFrames > 0, 'maxFrames must be positive')
   assert.ok(options.timeoutMs > 0, 'timeoutMs must be positive')
+  const minDurationMs = options.minDurationMs ?? 0
+  assert.ok(minDurationMs >= 0, 'minDurationMs must not be negative')
+  assert.ok(
+    minDurationMs < options.timeoutMs,
+    'minDurationMs must be lower than timeoutMs',
+  )
 
   const previousScopedIngestion = process.env.FEEDGEN_SCOPED_INGESTION
   const previousAllowlistRefresh = process.env.FEEDGEN_ALLOWLIST_REFRESH_MS
@@ -67,6 +79,7 @@ export async function runFirehoseLiveDbRehearsal(
       minStoredRows: options.minStoredRows,
       maxFrames: options.maxFrames,
       timeoutMs: options.timeoutMs,
+      minDurationMs,
       before,
     })
     return result
@@ -91,8 +104,10 @@ async function consumeLiveRelayIntoDb(options: {
   minStoredRows: number
   maxFrames: number
   timeoutMs: number
+  minDurationMs: number
   before: RowCounts
 }): Promise<FirehoseLiveDbRehearsalResult> {
+  const startedAt = Date.now()
   const abort = new AbortController()
   const serviceHost = new URL(options.serviceUrl).host
   const firehose = new FirehoseSubscription(options.db, options.serviceUrl)
@@ -140,8 +155,9 @@ async function consumeLiveRelayIntoDb(options: {
           counts.engagements -
           options.before.engagements
         if (
-          storedTotal >= options.minStoredRows ||
-          frameCount >= options.maxFrames
+          storedTotal >= options.minStoredRows &&
+          frameCount >= options.maxFrames &&
+          Date.now() - startedAt >= options.minDurationMs
         ) {
           abort.abort(new Error('live db rehearsal frame limit reached'))
         }
@@ -160,6 +176,7 @@ async function consumeLiveRelayIntoDb(options: {
     const storedPostCount = after.posts - options.before.posts
     const storedEngagementCount = after.engagements - options.before.engagements
     const storedTotal = storedPostCount + storedEngagementCount
+    const durationMs = Date.now() - startedAt
     assert.ok(frameCount > 0, 'relay produced no valid frames')
     assert.ok(commitCount > 0, 'relay produced no commit frames')
     assert.ok(seqs.length > 0, 'relay produced no sequence-bearing commits')
@@ -174,6 +191,16 @@ async function consumeLiveRelayIntoDb(options: {
     )
     assert.ok(typeof persistedCursor === 'number', 'cursor was not persisted')
     assert.equal(persistedCursor, lastCursor)
+    if (options.minDurationMs > 0) {
+      assert.ok(
+        durationMs >= options.minDurationMs,
+        'live DB soak duration ended before the minimum duration',
+      )
+      assert.ok(
+        frameCount >= options.maxFrames,
+        'live DB soak ended before the frame floor',
+      )
+    }
 
     return {
       status: 'ok',
@@ -193,6 +220,11 @@ async function consumeLiveRelayIntoDb(options: {
       cursor_value: persistedCursor,
       timeout_ms: options.timeoutMs,
       max_frames: options.maxFrames,
+      soak_status: options.minDurationMs > 0 ? 'ok' : 'skipped',
+      soak_min_duration_ms: options.minDurationMs,
+      soak_observed_duration_ms: durationMs,
+      soak_frame_count: frameCount,
+      soak_stored_total: storedTotal,
       raw_values_in_output: false,
     }
   } finally {
