@@ -7,6 +7,7 @@
  */
 import { Kysely } from 'kysely'
 import { DatabaseSchema } from '../../db/schema'
+import { applyPoliticianFilterIfEnabled } from '../politician-filter'
 
 export function publisherQueryChronological(
   db: Kysely<DatabaseSchema>,
@@ -15,12 +16,14 @@ export function publisherQueryChronological(
   cursorOffset: number,
   limit: number,
   publisherDid: string,
+  shortname = '',
 ) {
-  return db
+  const base = db
     .selectFrom('post')
     .selectAll()
     .where('author', '=', publisherDid)
     .where('post.indexedAt', '>=', timeLimit)
+  return applyPoliticianFilterIfEnabled(base, shortname)
     .orderBy('indexedAt', 'desc')
     .orderBy('cid', 'desc')
     .offset(cursorOffset)
@@ -34,13 +37,15 @@ export function followsQueryChronological(
   cursorOffset: number,
   limit: number,
   publisherDid: string,
+  shortname = '',
 ) {
-  return db
+  const base = db
     .selectFrom('post')
     .selectAll()
     .where('author', '!=', publisherDid)
     .where('post.indexedAt', '>=', timeLimit)
     .where((eb) => eb('author', 'in', requesterFollows))
+  return applyPoliticianFilterIfEnabled(base, shortname)
     .orderBy('indexedAt', 'desc')
     .orderBy('cid', 'desc')
     .offset(cursorOffset)

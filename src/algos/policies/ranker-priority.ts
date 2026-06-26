@@ -8,6 +8,7 @@
 import { Kysely } from 'kysely'
 import { DatabaseSchema } from '../../db/schema'
 import { applyPriorityOrderForFeed } from '../ranker-priority-helper'
+import { applyPoliticianFilterIfEnabled } from '../politician-filter'
 
 export function publisherQueryRankerPriority(
   db: Kysely<DatabaseSchema>,
@@ -23,7 +24,10 @@ export function publisherQueryRankerPriority(
     .selectAll('post')
     .where('author', '=', publisherDid)
     .where('post.indexedAt', '>=', timeLimit)
-  return applyPriorityOrderForFeed(base, shortname).offset(cursorOffset).limit(limit)
+  return applyPriorityOrderForFeed(
+    applyPoliticianFilterIfEnabled(base, shortname),
+    shortname,
+  ).offset(cursorOffset).limit(limit)
 }
 
 export function followsQueryRankerPriority(
@@ -41,5 +45,8 @@ export function followsQueryRankerPriority(
     .where('author', '!=', publisherDid)
     .where('post.indexedAt', '>=', timeLimit)
     .where((eb) => eb('author', 'in', requesterFollows))
-  return applyPriorityOrderForFeed(base, shortname).offset(cursorOffset).limit(limit)
+  return applyPriorityOrderForFeed(
+    applyPoliticianFilterIfEnabled(base, shortname),
+    shortname,
+  ).offset(cursorOffset).limit(limit)
 }

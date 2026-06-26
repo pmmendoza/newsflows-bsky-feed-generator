@@ -70,9 +70,9 @@ export function pickPolicy(
     case 'chronological':
       return {
         buildPublisher: (db, t, f, c, l) =>
-          publisherQueryChronological(db, t, f, c, l, publisherDid),
+          publisherQueryChronological(db, t, f, c, l, publisherDid, shortname),
         buildFollows: (db, t, f, c, l) =>
-          followsQueryChronological(db, t, f, c, l, publisherDid),
+          followsQueryChronological(db, t, f, c, l, publisherDid, shortname),
       }
     case 'ranker-priority':
       return {
@@ -84,9 +84,9 @@ export function pickPolicy(
     case 'engagement-sorted':
       return {
         buildPublisher: (db, t, f, c, l) =>
-          publisherQueryEngagement(db, t, f, c, l, publisherDid),
+          publisherQueryEngagement(db, t, f, c, l, publisherDid, shortname),
         buildFollows: (db, t, f, c, l) =>
-          followsQueryEngagement(db, t, f, c, l, publisherDid),
+          followsQueryEngagement(db, t, f, c, l, publisherDid, shortname),
       }
   }
 }

@@ -12,6 +12,7 @@ export type DatabaseSchema = {
   'feedgen_ops.study_catalog': StudyCatalog
   'feedgen_ops.study_registry': StudyRegistry
   'ranker_prod.feed_current_priority': FeedCurrentPriority
+  'ranker_prod.post_politician': PostPolitician
   'research_archive.post_snapshot': PostSnapshot
   'research_archive.post_snapshot_capture_source': PostSnapshotCaptureSource
   'research_archive.request_event': RequestEvent
@@ -214,6 +215,15 @@ export type FeedCurrentPriority = {
   score?: number | null
   run_id: string
   updated_at?: string | Date
+}
+
+export type PostPolitician = {
+  post_uri: string
+  has_politician: boolean
+  matched_entities: any
+  classifier_version: string
+  roster_version: string
+  classified_at: string | Date
 }
 
 export type ServedPostEvent = {
