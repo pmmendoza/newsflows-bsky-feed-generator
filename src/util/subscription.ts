@@ -17,12 +17,30 @@ export abstract class FirehoseSubscriptionBase {
   public sub: Subscription<RepoEvent>
   private hasLoggedStartCursor = false
   private hasPersistedCursor = false
+  private abortController?: AbortController
+  private idleWatchdog?: NodeJS.Timeout
+  private reconnectTimer?: NodeJS.Timeout
+  private lastProgressMs = Date.now()
+  private runGeneration = 0
+  private stopped = false
+  private idleTimeoutMs: number
 
-  constructor(public db: Database, public service: string) {
-    this.sub = new Subscription({
-      service: service,
+  constructor(
+    public db: Database,
+    public service: string,
+    options: { idleTimeoutMs?: number } = {},
+  ) {
+    this.idleTimeoutMs = Math.max(0, options.idleTimeoutMs ?? 0)
+    this.sub = this.createSubscription()
+  }
+
+  protected createSubscription(): Subscription<RepoEvent> {
+    this.abortController = new AbortController()
+    return new Subscription({
+      service: this.service,
       method: ids.ComAtprotoSyncSubscribeRepos,
       getParams: () => this.getCursor(),
+      signal: this.abortController.signal,
       validate: (value: unknown) => {
         try {
           return lexicons.assertValidXrpcMessage<RepoEvent>(
@@ -39,6 +57,11 @@ export abstract class FirehoseSubscriptionBase {
   abstract handleEvent(evt: RepoEvent): Promise<void>
 
   async run(subscriptionReconnectDelay: number) {
+    const generation = ++this.runGeneration
+    this.stopped = false
+    this.lastProgressMs = Date.now()
+    this.startIdleWatchdog(subscriptionReconnectDelay)
+
     try {
       if (!this.hasLoggedStartCursor) {
         try {
@@ -63,19 +86,75 @@ export abstract class FirehoseSubscriptionBase {
       }
 
       for await (const evt of this.sub) {
+        if (generation !== this.runGeneration || this.stopped) break
+        this.lastProgressMs = Date.now()
         await this.handleEvent(evt)
+        this.lastProgressMs = Date.now()
         // update stored cursor every 20 events or so
         if (isCommit(evt) && evt.seq % 20 === 0) {
           await this.updateCursor(evt.seq)
+          this.lastProgressMs = Date.now()
         }
       }
     } catch (err) {
+      if (this.stopped || generation !== this.runGeneration) return
       console.error('repo subscription errored', err)
-      setTimeout(
-        () => this.run(subscriptionReconnectDelay),
-        subscriptionReconnectDelay,
-      )
+      this.scheduleReconnect(subscriptionReconnectDelay, 'error')
+    } finally {
+      if (generation === this.runGeneration && !this.reconnectTimer) {
+        this.stopIdleWatchdog()
+      }
     }
+  }
+
+  stop() {
+    this.stopped = true
+    this.runGeneration += 1
+    this.stopIdleWatchdog()
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer)
+      this.reconnectTimer = undefined
+    }
+    this.abortController?.abort()
+  }
+
+  private startIdleWatchdog(subscriptionReconnectDelay: number) {
+    this.stopIdleWatchdog()
+    if (this.idleTimeoutMs <= 0) return
+
+    const intervalMs = Math.max(10, Math.min(this.idleTimeoutMs, 30_000))
+    this.idleWatchdog = setInterval(() => {
+      const idleForMs = Date.now() - this.lastProgressMs
+      if (idleForMs < this.idleTimeoutMs) return
+
+      this.scheduleReconnect(
+        subscriptionReconnectDelay,
+        `idle for ${idleForMs}ms (limit ${this.idleTimeoutMs}ms)`,
+      )
+    }, intervalMs)
+  }
+
+  private stopIdleWatchdog() {
+    if (!this.idleWatchdog) return
+    clearInterval(this.idleWatchdog)
+    this.idleWatchdog = undefined
+  }
+
+  private scheduleReconnect(subscriptionReconnectDelay: number, reason: string) {
+    if (this.stopped || this.reconnectTimer) return
+
+    console.error(`[${this.service}] Reconnecting repo subscription: ${reason}`)
+    this.runGeneration += 1
+    this.hasLoggedStartCursor = false
+    this.stopIdleWatchdog()
+    this.abortController?.abort()
+    this.sub = this.createSubscription()
+    this.lastProgressMs = Date.now()
+
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = undefined
+      void this.run(subscriptionReconnectDelay)
+    }, subscriptionReconnectDelay)
   }
 
   async updateCursor(cursor: number) {

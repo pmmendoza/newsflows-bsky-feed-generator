@@ -73,7 +73,9 @@ export class FeedGenerator {
             `postgres://${cfg.legacyPgUser ?? 'feedgen'}:${cfg.legacyPgPassword ?? 'feedgen'}@${cfg.legacyPgHost ?? 'localhost'}:${cfg.legacyPgPort ?? 5432}/${cfg.legacyPgDatabase ?? 'feedgen-db'}`,
         )
       : undefined
-    const firehose = new FirehoseSubscription(db, cfg.subscriptionEndpoint)
+    const firehose = new FirehoseSubscription(db, cfg.subscriptionEndpoint, {
+      idleTimeoutMs: cfg.subscriptionIdleTimeoutMs,
+    })
 
     const didCache = new MemoryCache()
     const didResolver = new DidResolver({

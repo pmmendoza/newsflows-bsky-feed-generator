@@ -28,6 +28,7 @@ export type Config = {
   serviceDid: string
   publisherDid: string
   subscriptionReconnectDelay: number
+  subscriptionIdleTimeoutMs: number
   // Canary testing mode: prevents mutating operations against production DB.
   readOnlyMode?: boolean
 }

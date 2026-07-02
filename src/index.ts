@@ -28,6 +28,8 @@ const run = async () => {
       maybeStr(process.env.FEEDGEN_PUBLISHER_DID) ?? 'did:example:alice',
     subscriptionReconnectDelay:
       maybeInt(process.env.FEEDGEN_SUBSCRIPTION_RECONNECT_DELAY) ?? 3000,
+    subscriptionIdleTimeoutMs:
+      maybeInt(process.env.FEEDGEN_SUBSCRIPTION_IDLE_TIMEOUT_MS) ?? 0,
     readOnlyMode: maybeBool(process.env.FEEDGEN_READ_ONLY_MODE) ?? false,
     hostname,
     serviceDid,
