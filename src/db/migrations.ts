@@ -201,47 +201,58 @@ migrations['003'] = {
 migrations['004_exact_feed_subscriptions'] = {
   async up(db: Kysely<unknown>) {
     await sql`
-      ALTER TABLE subscriber
-      ADD COLUMN IF NOT EXISTS access_scope varchar NOT NULL DEFAULT 'omni'
-    `.execute(db)
-    await sql`
-      ALTER TABLE subscriber
-      DROP CONSTRAINT IF EXISTS subscriber_access_scope_check
-    `.execute(db)
-    await sql`
-      ALTER TABLE subscriber
-      ADD CONSTRAINT subscriber_access_scope_check
-      CHECK (access_scope IN ('omni', 'assigned', 'none'))
+      DO $$
+      BEGIN
+        IF NOT EXISTS (
+          SELECT 1 FROM information_schema.columns
+          WHERE table_schema = 'public' AND table_name = 'subscriber'
+            AND column_name = 'access_scope'
+        ) THEN
+          ALTER TABLE subscriber
+          ADD COLUMN access_scope varchar NOT NULL DEFAULT 'omni';
+        END IF;
+        IF NOT EXISTS (
+          SELECT 1 FROM pg_constraint
+          WHERE conrelid = 'subscriber'::regclass
+            AND conname = 'subscriber_access_scope_check'
+        ) THEN
+          ALTER TABLE subscriber ADD CONSTRAINT subscriber_access_scope_check
+          CHECK (access_scope IN ('omni', 'assigned', 'none'));
+        END IF;
+      END $$
     `.execute(db)
 
-    await sql`CREATE SCHEMA IF NOT EXISTS feedgen_ops`.execute(db)
     await sql`
-      CREATE TABLE IF NOT EXISTS feedgen_ops.subscriber_feed_assignment (
-        assignment_id bigserial PRIMARY KEY,
-        feed_id varchar NOT NULL,
-        did varchar NOT NULL REFERENCES subscriber(did) ON DELETE CASCADE,
-        active_from timestamptz NOT NULL DEFAULT now(),
-        active_until timestamptz,
-        source varchar,
-        status varchar NOT NULL DEFAULT 'active',
-        CONSTRAINT subscriber_feed_assignment_interval_check
-          CHECK (active_until IS NULL OR active_until > active_from),
-        CONSTRAINT subscriber_feed_assignment_status_check
-          CHECK (
-            (active_until IS NULL AND status = 'active') OR
-            (active_until IS NOT NULL AND status IN ('removed', 'replaced', 'omni'))
-          )
-      )
-    `.execute(db)
-    await sql`
-      CREATE UNIQUE INDEX IF NOT EXISTS subscriber_feed_assignment_active_uq
-      ON feedgen_ops.subscriber_feed_assignment (feed_id, did)
-      WHERE active_until IS NULL
-    `.execute(db)
-    await sql`
-      CREATE INDEX IF NOT EXISTS subscriber_feed_assignment_did_active_idx
-      ON feedgen_ops.subscriber_feed_assignment (did)
-      WHERE active_until IS NULL
+      DO $$
+      BEGIN
+        IF NOT EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = 'feedgen_ops') THEN
+          CREATE SCHEMA feedgen_ops;
+        END IF;
+        IF to_regclass('feedgen_ops.subscriber_feed_assignment') IS NULL THEN
+          CREATE TABLE feedgen_ops.subscriber_feed_assignment (
+            assignment_id bigserial PRIMARY KEY,
+            feed_id varchar NOT NULL,
+            did varchar NOT NULL REFERENCES subscriber(did) ON DELETE CASCADE,
+            active_from timestamptz NOT NULL DEFAULT now(),
+            active_until timestamptz,
+            source varchar,
+            status varchar NOT NULL DEFAULT 'active',
+            CONSTRAINT subscriber_feed_assignment_interval_check
+              CHECK (active_until IS NULL OR active_until > active_from),
+            CONSTRAINT subscriber_feed_assignment_status_check
+              CHECK (
+                (active_until IS NULL AND status = 'active') OR
+                (active_until IS NOT NULL AND status IN ('removed', 'replaced', 'omni'))
+              )
+          );
+          CREATE UNIQUE INDEX subscriber_feed_assignment_active_uq
+            ON feedgen_ops.subscriber_feed_assignment (feed_id, did)
+            WHERE active_until IS NULL;
+          CREATE INDEX subscriber_feed_assignment_did_active_idx
+            ON feedgen_ops.subscriber_feed_assignment (did)
+            WHERE active_until IS NULL;
+        END IF;
+      END $$
     `.execute(db)
   },
   async down(db: Kysely<unknown>) {
