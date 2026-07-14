@@ -90,7 +90,7 @@ async function readPolicyRow(
     }
   } catch (err) {
     // Catalog read failed — DON'T cache the failure; the next request
-    // retries. Log + return null so the caller can fall back.
+    // retries. Log + return null so the caller denies access.
     console.warn(
       `[${new Date().toISOString()}] - access-policy: feed_catalog read failed for rkey=${rkey}; error=${
         err instanceof Error ? err.message : String(err)

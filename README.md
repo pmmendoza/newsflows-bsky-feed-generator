@@ -74,6 +74,9 @@ integration may mint and apply the temporary token without exposing a long-lived
 key to client-side code. Survey alignment is separate owner-gated work and is
 not implied to be active. Future feed/study restrictions belong in token claims,
 not a second mutation endpoint. `GET /api/subscribe` is retired and returns `410`.
+The retired GET and admin-apply `410` stubs remain until the separately approved
+survey migration is applied, readback proves no legacy caller remains, and the
+feedgen owner signs off on deletion.
 
 This authorizes retrieval of the named NEWSFLOWS feed. It does not save or pin
 the feed in a participant's Bluesky client. See the BSKY root
