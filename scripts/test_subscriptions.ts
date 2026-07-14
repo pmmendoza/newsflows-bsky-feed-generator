@@ -523,6 +523,42 @@ async function main() {
         body: JSON.stringify(body),
       })
       assert(adminExact.status === 200, 'administrator must support exact-feed modes')
+      const inspect = await fetch(`${base}/api/admin/subscribers/inspect?did=${encodeURIComponent(did)}`, {
+        headers: { 'api-key': 'subscription-admin-test-key' },
+      })
+      assert(inspect.status === 200, 'admin subscriber inspect must remain available')
+      const plan = await fetch(`${base}/api/admin/subscribers/plan`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'api-key': 'subscription-admin-test-key' },
+        body: JSON.stringify({ ...body, mode: 'omni' }),
+      })
+      assert(plan.status === 200, 'admin subscriber plan must remain available')
+      const beforeRetiredApply = await inspectSubscription(db, identity)
+      const unauthorizedRetiredApply = await fetch(`${base}/api/admin/subscribers/apply`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ ...body, mode: 'omni' }),
+      })
+      const unauthorizedRetiredApplyPayload = await unauthorizedRetiredApply.json() as any
+      assert(
+        unauthorizedRetiredApply.status === 410 && unauthorizedRetiredApplyPayload.error === 'retired_endpoint',
+        'retired admin subscriber apply must return the same stable 410 without a key',
+      )
+      const retiredApply = await fetch(`${base}/api/admin/subscribers/apply`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'api-key': 'subscription-admin-test-key' },
+        body: JSON.stringify({ ...body, mode: 'omni' }),
+      })
+      const retiredApplyPayload = await retiredApply.json() as any
+      assert(
+        retiredApply.status === 410 && retiredApplyPayload.error === 'retired_endpoint',
+        'admin subscriber apply must be retired with a stable 410 response',
+      )
+      const afterRetiredApply = await inspectSubscription(db, identity)
+      assert(
+        JSON.stringify(afterRetiredApply) === JSON.stringify(beforeRetiredApply),
+        'retired admin subscriber apply must not mutate subscription state',
+      )
       await fetch(`${base}/api/subscribe`, {
         method: 'POST',
         headers: { 'content-type': 'application/json', 'api-key': 'subscription-admin-test-key' },

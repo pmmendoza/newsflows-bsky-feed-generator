@@ -66,13 +66,11 @@ export default function registerSubscriberAdminEndpoints(server: Server, ctx: Ap
     }
   })
 
-  server.xrpc.router.post('/api/admin/subscribers/apply', async (req, res) => {
-    const endpoint = '/api/admin/subscribers/apply'
-    if (!isApiKeyAuthorized(req, adminAuth)) return unauthorized(res, endpoint)
-    try {
-      return res.json(await executeSubscription(ctx, normalize(req.body as LegacyAdminInput), true))
-    } catch (error) {
-      return endpointError(res, error)
-    }
+  server.xrpc.router.post('/api/admin/subscribers/apply', (_req, res) => {
+    return res.status(410).json({
+      ok: false,
+      error: 'retired_endpoint',
+      message: 'Use authenticated POST /api/subscribe for subscription mutations',
+    })
   })
 }
