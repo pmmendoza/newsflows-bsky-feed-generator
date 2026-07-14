@@ -11,6 +11,7 @@ export type DatabaseSchema = {
   'feedgen_ops.feed_catalog': FeedCatalog
   'feedgen_ops.study_catalog': StudyCatalog
   'feedgen_ops.study_registry': StudyRegistry
+  'feedgen_ops.subscriber_feed_assignment': SubscriberFeedAssignment
   'ranker_prod.feed_current_priority': FeedCurrentPriority
   'ranker_prod.post_politician': PostPolitician
   'research_archive.post_snapshot': PostSnapshot
@@ -61,6 +62,7 @@ export type SubState = {
 export type Subscriber = {
   handle: string
   did: string
+  access_scope?: 'omni' | 'assigned' | 'none'
 }
 
 export type RequestLog = {
@@ -204,6 +206,16 @@ export type StudyRegistry = {
   active_until?: string | Date | null
   source?: string | null
   status: string
+}
+
+export type SubscriberFeedAssignment = {
+  assignment_id?: number | string
+  feed_id: string
+  did: string
+  active_from: string | Date
+  active_until?: string | Date | null
+  source?: string | null
+  status: 'active' | 'removed' | 'replaced' | 'omni'
 }
 
 // ranker_prod.feed_current_priority. Current per-(feed, post) score surface,

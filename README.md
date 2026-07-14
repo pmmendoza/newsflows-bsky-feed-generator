@@ -24,7 +24,8 @@ Retired priority endpoints: `/api/prioritize` and `/api/priorities` return
 
 ## Local Development Notes
 
-To import subscribers, create csv file subscribers.csv in the project directory. Should have columns handle and did, supply either, the other will be looked up.
+`subscribers.csv` is a backfill helper only. Live enrollment uses the exact-feed
+subscription API below.
 
 Start Feed generator (Terminal 1):
 
@@ -50,7 +51,25 @@ Publish to Bluesky (Terminal 2):
 yarn publishFeed
 ```
 
-Subscription endpoint: <http://localhost:3000/api/subscribe?handle=news-flows-nl.bsky.social>
+## Exact-feed subscription
+
+`POST /api/subscribe` is the only live mutation endpoint. It accepts exactly one
+of `identifier`, `handle`, or `did`, plus a feed rkey and mode:
+
+```json
+{"handle":"participant.bsky.social","feed":"newsflow-be-1","mode":"replace"}
+```
+
+Modes are `replace`, `add`, `remove`, and `omni`. Both the administrator key and
+a signed per-user token minted by `POST /api/subscription-token` can use every
+mode; per-user tokens remain bound to their DID. Qualtrics mints and applies the
+temporary token through server-side WebService steps, so no long-lived key
+enters survey JavaScript. Future feed/study restrictions belong in token claims,
+not a second mutation endpoint. `GET /api/subscribe` is retired and returns
+`410`.
+
+This authorizes retrieval of the named NEWSFLOWS feed. It does not save or pin
+the feed in a participant's Bluesky client.
 
 ## Rehearsal Profiles
 

@@ -1,305 +1,80 @@
-/**
- * Sprint 6 Lane D / TASK-039.03 unit test for the access-policy
- * dispatcher (`src/util/access-policy.ts`).
- *
- * Each case constructs a minimal fake `Database` whose query-builder
- * returns a controlled result for the three tables the dispatcher
- * reads: `feedgen_ops.feed_catalog`, `subscriber`, and
- * `feedgen_ops.study_registry`. Then it asserts the verdict.
- *
- * Why a fake DB and not Kysely DummyDriver: the dispatcher uses
- * `executeTakeFirst()` which requires a real-shaped result, not an
- * SQL string compile. Mocking the chain with a fake is more direct.
- *
- * Run: `npx ts-node scripts/test_access_policy.ts`
- * Exits non-zero on failure.
- */
-
 import {
   evaluateAccessPolicy,
   invalidatePolicyCache,
   type FeedCatalogPolicyRow,
 } from '../src/util/access-policy'
 
-let failed = 0
-let passed = 0
-
-function assert(cond: boolean, label: string, detail?: string) {
-  if (cond) {
-    passed++
-    console.log(`  ✓ ${label}`)
-  } else {
-    failed++
-    console.log(`  ✗ ${label}${detail ? ` — ${detail}` : ''}`)
-  }
+type State = {
+  catalog: FeedCatalogPolicyRow | null
+  scope?: 'omni' | 'assigned' | 'none'
+  assignment?: boolean
+  study?: boolean
+  fail?: 'catalog' | 'subscriber' | 'assignment' | 'study'
 }
 
-// ---------------------------------------------------------------------
-// Fake Database. Each test sets `feedCatalogRow`, `subscriberHit`,
-// `studyRegistryHit` then invokes evaluateAccessPolicy.
-// ---------------------------------------------------------------------
-
-type FakeState = {
-  feedCatalogRow: FeedCatalogPolicyRow | null
-  subscriberHit: boolean
-  studyRegistryHit: boolean
-  catalogReadShouldFail: boolean
-}
-
-function makeFakeDb(state: FakeState): any {
+function fakeDb(state: State): any {
   return {
     selectFrom(table: string) {
-      const target =
-        table === 'feedgen_ops.feed_catalog'
-          ? 'catalog'
-          : table === 'subscriber'
-          ? 'subscriber'
-          : table === 'feedgen_ops.study_registry'
-          ? 'study_registry'
-          : 'unknown'
+      const target = table === 'feedgen_ops.feed_catalog'
+        ? 'catalog'
+        : table === 'subscriber'
+        ? 'subscriber'
+        : table === 'feedgen_ops.subscriber_feed_assignment'
+        ? 'assignment'
+        : 'study'
       return {
-        select() {
-          return this
-        },
-        where() {
-          return this
-        },
+        select() { return this },
+        where() { return this },
         async executeTakeFirst() {
-          if (target === 'catalog') {
-            if (state.catalogReadShouldFail) throw new Error('simulated catalog failure')
-            if (state.feedCatalogRow === null) return undefined
-            return state.feedCatalogRow
-          }
-          if (target === 'subscriber') {
-            return state.subscriberHit ? { did: 'x' } : undefined
-          }
-          if (target === 'study_registry') {
-            return state.studyRegistryHit ? { did: 'x' } : undefined
-          }
-          return undefined
+          if (state.fail === target) throw new Error(`simulated ${target} failure`)
+          if (target === 'catalog') return state.catalog ?? undefined
+          if (target === 'subscriber') return state.scope ? { access_scope: state.scope } : undefined
+          if (target === 'assignment') return state.assignment ? { did: 'did:plc:user' } : undefined
+          return state.study ? { did: 'did:plc:user' } : undefined
         },
       }
     },
   }
 }
 
-async function runCase(label: string, state: FakeState, did: string, rkey: string) {
-  invalidatePolicyCache() // each case starts cold
-  const db = makeFakeDb(state)
-  const verdict = await evaluateAccessPolicy(db as any, rkey, did)
-  console.log(`Case: ${label}`)
-  console.log(`  → allowed=${verdict.allowed} reason=${verdict.reason}`)
-  return verdict
+const subscriberDefault: FeedCatalogPolicyRow = {
+  feed_id: 'feed-be-1',
+  access_policy_id: 'subscriber-default',
+  study_id: 'study-be',
+  enabled: true,
+  retired_at: null,
+}
+const studyOnly: FeedCatalogPolicyRow = { ...subscriberDefault, access_policy_id: 'study-only' }
+
+let passed = 0
+async function check(label: string, state: State, allowed: boolean, reason: string) {
+  invalidatePolicyCache()
+  const verdict = await evaluateAccessPolicy(fakeDb(state), 'newsflow-be-1', 'did:plc:user')
+  if (verdict.allowed !== allowed || !verdict.reason.includes(reason)) {
+    throw new Error(`${label}: got ${JSON.stringify(verdict)}`)
+  }
+  passed++
+  console.log(`✓ ${label}`)
 }
 
-// ---------------------------------------------------------------------
-// Cases.
-// ---------------------------------------------------------------------
+async function main() {
+  await check('omni permits subscriber-default', { catalog: subscriberDefault, scope: 'omni' }, true, 'subscriber-default')
+  await check('exact assignment permits subscriber-default', { catalog: subscriberDefault, scope: 'assigned', assignment: true }, true, 'subscriber-default')
+  await check('sibling feed is denied', { catalog: subscriberDefault, scope: 'assigned', assignment: false }, false, 'not-assigned')
+  await check('none scope is denied', { catalog: subscriberDefault, scope: 'none' }, false, 'not-assigned')
+  await check('study-only requires assignment and lifecycle', { catalog: studyOnly, scope: 'assigned', assignment: true, study: true }, true, 'study-only:study-be')
+  await check('study-only denies missing lifecycle', { catalog: studyOnly, scope: 'assigned', assignment: true }, false, 'not-active-or-assigned')
+  await check('study-only denies missing assignment', { catalog: studyOnly, scope: 'assigned', study: true }, false, 'not-active-or-assigned')
+  await check('disabled feed is denied', { catalog: { ...subscriberDefault, enabled: false }, scope: 'omni' }, false, 'feed-disabled')
+  await check('retired feed is denied', { catalog: { ...subscriberDefault, retired_at: new Date() }, scope: 'omni' }, false, 'feed-disabled')
+  await check('missing catalog fails closed', { catalog: null, scope: 'omni' }, false, 'no-catalog-row')
+  await check('catalog read failure fails closed', { catalog: null, scope: 'omni', fail: 'catalog' }, false, 'no-catalog-row')
+  await check('assignment read failure fails closed', { catalog: subscriberDefault, scope: 'assigned', fail: 'assignment' }, false, 'access-state-read-failed')
+  await check('unknown policy fails closed', { catalog: { ...subscriberDefault, access_policy_id: 'open' }, scope: 'omni' }, false, 'unknown-policy')
+  console.log(`Summary: ${passed} passed`)
+}
 
-;(async () => {
-  // 1. subscriber-default + DID is in subscriber → allowed
-  {
-    const v = await runCase(
-      'subscriber-default + subscriber=hit → allowed',
-      {
-        feedCatalogRow: {
-          access_policy_id: 'subscriber-default',
-          study_id: null,
-          enabled: true,
-        },
-        subscriberHit: true,
-        studyRegistryHit: false,
-        catalogReadShouldFail: false,
-      },
-      'did:plc:user',
-      'newsflow-nl-2',
-    )
-    assert(v.allowed === true, '  allowed')
-    assert(v.reason === 'subscriber-default', '  reason matches')
-  }
-
-  // 2. subscriber-default + DID NOT in subscriber → denied
-  {
-    const v = await runCase(
-      'subscriber-default + subscriber=miss → denied',
-      {
-        feedCatalogRow: {
-          access_policy_id: 'subscriber-default',
-          study_id: null,
-          enabled: true,
-        },
-        subscriberHit: false,
-        studyRegistryHit: false,
-        catalogReadShouldFail: false,
-      },
-      'did:plc:rando',
-      'newsflow-nl-2',
-    )
-    assert(v.allowed === false, '  denied')
-    assert(v.reason.startsWith('subscriber-default:not-subscriber'), '  reason matches')
-  }
-
-  // 3. study-only + active study_registry hit → allowed
-  {
-    const v = await runCase(
-      'study-only + study_registry=hit → allowed',
-      {
-        feedCatalogRow: {
-          access_policy_id: 'study-only',
-          study_id: 'bsky-elif-2026-be',
-          enabled: true,
-        },
-        subscriberHit: true,
-        studyRegistryHit: true,
-        catalogReadShouldFail: false,
-      },
-      'did:plc:participant',
-      'newsflow-be-2',
-    )
-    assert(v.allowed === true, '  allowed')
-    assert(v.reason === 'study-only:bsky-elif-2026-be', '  reason includes study_id')
-  }
-
-  // 4. study-only + study_registry MISS → denied
-  {
-    const v = await runCase(
-      'study-only + study_registry=miss → denied',
-      {
-        feedCatalogRow: {
-          access_policy_id: 'study-only',
-          study_id: 'bsky-elif-2026-be',
-          enabled: true,
-        },
-        subscriberHit: true, // even though they're a subscriber
-        studyRegistryHit: false,
-        catalogReadShouldFail: false,
-      },
-      'did:plc:not-in-be',
-      'newsflow-be-2',
-    )
-    assert(v.allowed === false, '  denied (subscriber alone insufficient for study-only)')
-    assert(v.reason.endsWith(':not-active'), '  reason indicates study inactive')
-  }
-
-  // 5. study-only with NULL study_id → fail-closed
-  {
-    const v = await runCase(
-      'study-only + study_id=NULL → fail-closed',
-      {
-        feedCatalogRow: {
-          access_policy_id: 'study-only',
-          study_id: null,
-          enabled: true,
-        },
-        subscriberHit: true,
-        studyRegistryHit: true,
-        catalogReadShouldFail: false,
-      },
-      'did:plc:user',
-      'newsflow-misconfigured',
-    )
-    assert(v.allowed === false, '  denied')
-    assert(v.reason === 'study-only:misconfigured', '  reason flags misconfiguration')
-  }
-
-  // 6. disabled → empty feed
-  {
-    const v = await runCase(
-      'disabled → empty',
-      {
-        feedCatalogRow: {
-          access_policy_id: 'disabled',
-          study_id: null,
-          enabled: true,
-        },
-        subscriberHit: true,
-        studyRegistryHit: true,
-        catalogReadShouldFail: false,
-      },
-      'did:plc:user',
-      'newsflow-retired',
-    )
-    assert(v.allowed === false, '  denied')
-    assert(v.reason === 'disabled', '  reason')
-  }
-
-  // 7. enabled=false on the catalog row → empty
-  {
-    const v = await runCase(
-      'enabled=false → empty',
-      {
-        feedCatalogRow: {
-          access_policy_id: 'subscriber-default',
-          study_id: null,
-          enabled: false,
-        },
-        subscriberHit: true,
-        studyRegistryHit: false,
-        catalogReadShouldFail: false,
-      },
-      'did:plc:user',
-      'newsflow-soft-disabled',
-    )
-    assert(v.allowed === false, '  denied')
-    assert(v.reason === 'feed-disabled', '  reason')
-  }
-
-  // 8. Unknown access_policy_id → fail-closed
-  {
-    const v = await runCase(
-      'unknown access_policy_id → fail-closed',
-      {
-        feedCatalogRow: {
-          access_policy_id: 'open', // hypothetical relaxed CHECK
-          study_id: null,
-          enabled: true,
-        },
-        subscriberHit: true,
-        studyRegistryHit: false,
-        catalogReadShouldFail: false,
-      },
-      'did:plc:user',
-      'newsflow-future',
-    )
-    assert(v.allowed === false, '  denied (unknown policy)')
-    assert(v.reason === 'unknown-policy', '  reason')
-  }
-
-  // 9. No catalog row at all → fallback-to-legacy (allowed=true)
-  {
-    const v = await runCase(
-      'no-catalog-row → legacy fallback',
-      {
-        feedCatalogRow: null,
-        subscriberHit: false,
-        studyRegistryHit: false,
-        catalogReadShouldFail: false,
-      },
-      'did:plc:user',
-      'newsflow-uncatalogued',
-    )
-    assert(v.allowed === true, '  allowed (back-compat)')
-    assert(v.reason.startsWith('no-catalog-row'), '  reason flags fallback')
-  }
-
-  // 10. Catalog read FAILS → fallback-to-legacy
-  {
-    const v = await runCase(
-      'catalog-read fails → legacy fallback',
-      {
-        feedCatalogRow: null,
-        subscriberHit: false,
-        studyRegistryHit: false,
-        catalogReadShouldFail: true,
-      },
-      'did:plc:user',
-      'newsflow-nl-2',
-    )
-    assert(v.allowed === true, '  allowed (read-error fallback)')
-    assert(v.reason.startsWith('no-catalog-row'), '  reason flags fallback')
-  }
-
-  console.log()
-  console.log(`Summary: ${passed} passed, ${failed} failed`)
-  if (failed > 0) process.exit(1)
-})()
+main().catch((error) => {
+  console.error(error)
+  process.exit(1)
+})

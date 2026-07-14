@@ -18,7 +18,7 @@
 import { InvalidRequestError } from '@atproto/xrpc-server'
 import { Server } from '../lexicon'
 import { AppContext } from '../config'
-import { extractDidFromAuth } from '../auth'
+import { validateAuth } from '../auth'
 import { AtUri } from '@atproto/syntax'
 import { evaluateAccessPolicy } from '../util/access-policy'
 import { resolveDynamicHandler } from '../algos/catalog-dispatch'
@@ -57,7 +57,7 @@ export default function (server: Server, ctx: AppContext) {
     // Always require authentication; anonymous requests get empty feed.
     let requesterDid: string
     try {
-      requesterDid = await extractDidFromAuth(req)
+      requesterDid = await validateAuth(req, ctx.cfg.serviceDid, ctx.didResolver)
     } catch (e) {
       console.log(
         `[${new Date().toISOString()}] - request denied (no auth) rkey=${feedUri.rkey}`,

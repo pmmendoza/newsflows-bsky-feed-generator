@@ -1,68 +1,119 @@
+import crypto from 'crypto'
 import express from 'express'
+import jwt from 'jsonwebtoken'
 import { Server } from '../lexicon'
 import { AppContext } from '../config'
-import { getProfile } from '../util/queries';
+import {
+  executeSubscription,
+  parseSubscriptionMode,
+  resolveSubscriptionIdentity,
+  SubscriptionError,
+  SubscriptionInput,
+} from '../util/exact-subscription'
+import { ApiKeyAuthConfig, isApiKeyAuthorized } from '../util/api-auth'
 
+const adminAuth: ApiKeyAuthConfig = { primaryEnv: ['FEEDGEN_ADMIN_API_KEY'] }
+const studyTokenAuth: ApiKeyAuthConfig = { primaryEnv: ['STUDY_TOKEN_API_KEY'] }
+const ISSUER = 'newsflows-bsky-feed-generator'
+const AUDIENCE = 'newsflows-subscription'
+
+type SubscriptionTokenPayload = {
+  sub: string
+  scope: 'subscription:write'
+}
+
+function ttlSeconds(): number {
+  const value = Number(process.env.SUBSCRIPTION_TOKEN_TTL_SECONDS || 600)
+  return Number.isInteger(value) && value > 0 && value <= 3600 ? value : 600
+}
+
+function secret(): string {
+  const value = process.env.STUDY_JWT_SECRET?.trim()
+  if (!value) throw new SubscriptionError(500, 'server_not_configured', 'study JWT secret is not configured')
+  return value
+}
+
+function tokenSubject(req: express.Request): string {
+  const authorization = req.headers.authorization
+  if (typeof authorization !== 'string' || !authorization.startsWith('Bearer ')) {
+    throw new SubscriptionError(401, 'unauthorized', 'subscription authorization is required')
+  }
+  try {
+    const decoded = jwt.verify(authorization.slice(7).trim(), secret(), {
+      algorithms: ['HS256'],
+      issuer: ISSUER,
+      audience: AUDIENCE,
+    })
+    if (!decoded || typeof decoded !== 'object') throw new Error('invalid payload')
+    const payload = decoded as Partial<SubscriptionTokenPayload>
+    if (payload.scope !== 'subscription:write' || typeof payload.sub !== 'string') {
+      throw new SubscriptionError(403, 'forbidden', 'token lacks subscription scope')
+    }
+    return payload.sub
+  } catch (error) {
+    if (error instanceof SubscriptionError && error.status === 500) throw error
+    if (error instanceof SubscriptionError && error.status === 403) throw error
+    throw new SubscriptionError(401, 'invalid_subscription_token', 'subscription token is invalid or expired')
+  }
+}
+function endpointError(res: express.Response, error: unknown) {
+  const err = error instanceof SubscriptionError
+    ? error
+    : new SubscriptionError(500, 'internal_error', 'an unexpected error occurred')
+  if (err.status >= 500) console.error(`[${new Date().toISOString()}] - subscription: ${err.message}`)
+  return res.status(err.status).json({ ok: false, error: err.code, message: err.message })
+}
 
 export default function registerSubscribeEndpoint(server: Server, ctx: AppContext) {
-  server.xrpc.router.get('/api/subscribe', async (req, res) => {
-    const { handle, did } = req.query;
-    // Validate that either handle or did is provided
-    if (!handle && !did) {
-      return res.status(400).json({
-        error: 'BadRequest',
-        message: 'Either handle or did must be provided'
-      });
-    }
+  server.xrpc.router.get('/api/subscribe', (_req, res) => {
+    return res.status(410).json({
+      ok: false,
+      error: 'retired_endpoint',
+      message: 'Use authenticated POST /api/subscribe with identity, feed, and mode',
+    })
+  })
 
+  server.xrpc.router.post('/api/subscription-token', async (req, res) => {
+    if (!isApiKeyAuthorized(req, studyTokenAuth)) {
+      return res.status(401).json({ ok: false, error: 'unauthorized' })
+    }
     try {
-      let resolvedHandle = handle as string | undefined;
-      let resolvedDid = did as string | undefined;
-      let profileResult: any;
-      
-      try {
-        const actorToFetch = resolvedDid || resolvedHandle;
-        profileResult = await getProfile(actorToFetch as string);
-        
-        // Extract both handle and DID from the profile
-        resolvedHandle = profileResult.handle;
-        resolvedDid = profileResult.did;
-      } catch (err) {
-        return res.status(404).json({
-          error: 'NotFound',
-          message: `Could not get profile for: ${resolvedDid || resolvedHandle}`
-        });
-      }
-
-      // add new entry to db
-      await ctx.db
-        .insertInto('subscriber')
-        .values({
-          handle: resolvedHandle as string,
-          did: resolvedDid as string
-        })
-        .onConflict((oc) => oc.doNothing())
-        .execute()
-
-      console.log(`[${new Date().toISOString()}] - ${resolvedHandle || resolvedDid} subscribed to feeds`);
-
-      // Trigger background follows update without blocking the response
-      const { triggerFollowsUpdateForSubscriber } = require('../util/scheduled-updater');
-      triggerFollowsUpdateForSubscriber(ctx.db, resolvedDid as string);
-
-      // Return the resolved identifiers
+      const identity = await resolveSubscriptionIdentity(req.body as SubscriptionInput)
+      const ttl = ttlSeconds()
+      const exp = Math.floor(Date.now() / 1000) + ttl
+      const token = jwt.sign({ sub: identity.did, scope: 'subscription:write' }, secret(), {
+        algorithm: 'HS256',
+        issuer: ISSUER,
+        audience: AUDIENCE,
+        expiresIn: ttl,
+        jwtid: crypto.randomUUID(),
+      })
+      res.header('Cache-Control', 'no-store')
       return res.json({
-        message: 'User succesfully subscribed to feeds',
-        handle: resolvedHandle,
-        did: resolvedDid,
-        avatar: profileResult.avatar
-      });
+        ok: true,
+        handle: identity.handle,
+        did: identity.did,
+        token,
+        token_type: 'Bearer',
+        exp,
+      })
     } catch (error) {
-      console.error('Error in subscribe endpoint:', error);
-      return res.status(500).json({
-        error: 'InternalServerError',
-        message: 'An unexpected error occurred'
-      });
+      return endpointError(res, error)
     }
-  });
+  })
+
+  server.xrpc.router.post('/api/subscribe', async (req, res) => {
+    try {
+      const input = req.body as SubscriptionInput
+      const admin = isApiKeyAuthorized(req, adminAuth)
+      parseSubscriptionMode(input.mode)
+      const boundDid = admin ? undefined : tokenSubject(req)
+      const trustedInput = admin
+        ? input
+        : { ...input, source: 'subscription-token' }
+      return res.json(await executeSubscription(ctx, trustedInput, true, true, boundDid))
+    } catch (error) {
+      return endpointError(res, error)
+    }
+  })
 }

@@ -40,8 +40,30 @@ CREATE TABLE IF NOT EXISTS feedgen_ops.feed_catalog (
 
 CREATE TABLE IF NOT EXISTS public.subscriber (
   handle varchar NOT NULL,
-  did varchar PRIMARY KEY
+  did varchar PRIMARY KEY,
+  access_scope varchar NOT NULL DEFAULT 'omni' CHECK (
+    access_scope IN ('omni', 'assigned', 'none')
+  )
 );
+
+CREATE TABLE IF NOT EXISTS feedgen_ops.subscriber_feed_assignment (
+  assignment_id bigserial PRIMARY KEY,
+  feed_id varchar NOT NULL,
+  did varchar NOT NULL REFERENCES public.subscriber(did) ON DELETE CASCADE,
+  active_from timestamptz NOT NULL DEFAULT now(),
+  active_until timestamptz,
+  source varchar,
+  status varchar NOT NULL DEFAULT 'active',
+  CHECK (active_until IS NULL OR active_until > active_from),
+  CHECK (
+    (active_until IS NULL AND status = 'active') OR
+    (active_until IS NOT NULL AND status IN ('removed', 'replaced', 'omni'))
+  )
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS subscriber_feed_assignment_active_uq
+  ON feedgen_ops.subscriber_feed_assignment(feed_id, did)
+  WHERE active_until IS NULL;
 
 CREATE TABLE IF NOT EXISTS public.follows (
   subject varchar NOT NULL,

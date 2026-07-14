@@ -197,3 +197,59 @@ migrations['003'] = {
     `.execute(db)
   },
 }
+
+migrations['004_exact_feed_subscriptions'] = {
+  async up(db: Kysely<unknown>) {
+    await sql`
+      ALTER TABLE subscriber
+      ADD COLUMN IF NOT EXISTS access_scope varchar NOT NULL DEFAULT 'omni'
+    `.execute(db)
+    await sql`
+      ALTER TABLE subscriber
+      DROP CONSTRAINT IF EXISTS subscriber_access_scope_check
+    `.execute(db)
+    await sql`
+      ALTER TABLE subscriber
+      ADD CONSTRAINT subscriber_access_scope_check
+      CHECK (access_scope IN ('omni', 'assigned', 'none'))
+    `.execute(db)
+
+    await sql`CREATE SCHEMA IF NOT EXISTS feedgen_ops`.execute(db)
+    await sql`
+      CREATE TABLE IF NOT EXISTS feedgen_ops.subscriber_feed_assignment (
+        assignment_id bigserial PRIMARY KEY,
+        feed_id varchar NOT NULL,
+        did varchar NOT NULL REFERENCES subscriber(did) ON DELETE CASCADE,
+        active_from timestamptz NOT NULL DEFAULT now(),
+        active_until timestamptz,
+        source varchar,
+        status varchar NOT NULL DEFAULT 'active',
+        CONSTRAINT subscriber_feed_assignment_interval_check
+          CHECK (active_until IS NULL OR active_until > active_from),
+        CONSTRAINT subscriber_feed_assignment_status_check
+          CHECK (
+            (active_until IS NULL AND status = 'active') OR
+            (active_until IS NOT NULL AND status IN ('removed', 'replaced', 'omni'))
+          )
+      )
+    `.execute(db)
+    await sql`
+      CREATE UNIQUE INDEX IF NOT EXISTS subscriber_feed_assignment_active_uq
+      ON feedgen_ops.subscriber_feed_assignment (feed_id, did)
+      WHERE active_until IS NULL
+    `.execute(db)
+    await sql`
+      CREATE INDEX IF NOT EXISTS subscriber_feed_assignment_did_active_idx
+      ON feedgen_ops.subscriber_feed_assignment (did)
+      WHERE active_until IS NULL
+    `.execute(db)
+  },
+  async down(db: Kysely<unknown>) {
+    await sql`
+      DROP TABLE IF EXISTS feedgen_ops.subscriber_feed_assignment
+    `.execute(db)
+    await sql`
+      ALTER TABLE subscriber DROP COLUMN IF EXISTS access_scope
+    `.execute(db)
+  },
+}
