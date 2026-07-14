@@ -202,22 +202,40 @@ migrations['004_exact_feed_subscriptions'] = {
   async up(db: Kysely<unknown>) {
     await sql`
       DO $$
+      DECLARE
+        access_scope_exists boolean;
       BEGIN
-        IF NOT EXISTS (
+        SELECT EXISTS (
           SELECT 1 FROM information_schema.columns
           WHERE table_schema = 'public' AND table_name = 'subscriber'
             AND column_name = 'access_scope'
-        ) THEN
+        ) INTO access_scope_exists;
+        IF NOT access_scope_exists THEN
           ALTER TABLE subscriber
           ADD COLUMN access_scope varchar NOT NULL DEFAULT 'omni';
-        END IF;
-        IF NOT EXISTS (
+          ALTER TABLE subscriber ADD CONSTRAINT subscriber_access_scope_check
+          CHECK (access_scope IN ('omni', 'assigned', 'none'));
+          COMMENT ON COLUMN subscriber.access_scope IS
+            'feedgen:migration:004_exact_feed_subscriptions';
+        ELSIF NOT EXISTS (
+          SELECT 1 FROM information_schema.columns
+          WHERE table_schema = 'public' AND table_name = 'subscriber'
+            AND column_name = 'access_scope'
+            AND data_type = 'character varying'
+            AND is_nullable = 'NO'
+            AND column_default LIKE '%omni%'
+        ) OR NOT EXISTS (
           SELECT 1 FROM pg_constraint
           WHERE conrelid = 'subscriber'::regclass
             AND conname = 'subscriber_access_scope_check'
+            AND contype = 'c'
+            AND convalidated
+            AND pg_get_constraintdef(oid) LIKE '%access_scope%'
+            AND pg_get_constraintdef(oid) LIKE '%omni%'
+            AND pg_get_constraintdef(oid) LIKE '%assigned%'
+            AND pg_get_constraintdef(oid) LIKE '%none%'
         ) THEN
-          ALTER TABLE subscriber ADD CONSTRAINT subscriber_access_scope_check
-          CHECK (access_scope IN ('omni', 'assigned', 'none'));
+          RAISE EXCEPTION '004_exact_feed_subscriptions schema mismatch: subscriber.access_scope must be varchar NOT NULL DEFAULT omni with subscriber_access_scope_check';
         END IF;
       END $$
     `.execute(db)
@@ -251,16 +269,125 @@ migrations['004_exact_feed_subscriptions'] = {
           CREATE INDEX subscriber_feed_assignment_did_active_idx
             ON feedgen_ops.subscriber_feed_assignment (did)
             WHERE active_until IS NULL;
+          COMMENT ON TABLE feedgen_ops.subscriber_feed_assignment IS
+            'feedgen:migration:004_exact_feed_subscriptions';
+        ELSIF NOT (
+          EXISTS (
+            SELECT 1 FROM information_schema.columns
+            WHERE table_schema = 'feedgen_ops' AND table_name = 'subscriber_feed_assignment'
+              AND column_name = 'assignment_id' AND data_type = 'bigint'
+              AND is_nullable = 'NO' AND column_default IS NOT NULL
+          ) AND EXISTS (
+            SELECT 1 FROM information_schema.columns
+            WHERE table_schema = 'feedgen_ops' AND table_name = 'subscriber_feed_assignment'
+              AND column_name = 'feed_id' AND data_type = 'character varying' AND is_nullable = 'NO'
+          ) AND EXISTS (
+            SELECT 1 FROM information_schema.columns
+            WHERE table_schema = 'feedgen_ops' AND table_name = 'subscriber_feed_assignment'
+              AND column_name = 'did' AND data_type = 'character varying' AND is_nullable = 'NO'
+          ) AND EXISTS (
+            SELECT 1 FROM information_schema.columns
+            WHERE table_schema = 'feedgen_ops' AND table_name = 'subscriber_feed_assignment'
+              AND column_name = 'active_from' AND data_type = 'timestamp with time zone'
+              AND is_nullable = 'NO' AND column_default IS NOT NULL
+          ) AND EXISTS (
+            SELECT 1 FROM information_schema.columns
+            WHERE table_schema = 'feedgen_ops' AND table_name = 'subscriber_feed_assignment'
+              AND column_name = 'active_until' AND data_type = 'timestamp with time zone' AND is_nullable = 'YES'
+          ) AND EXISTS (
+            SELECT 1 FROM information_schema.columns
+            WHERE table_schema = 'feedgen_ops' AND table_name = 'subscriber_feed_assignment'
+              AND column_name = 'source' AND data_type = 'character varying' AND is_nullable = 'YES'
+          ) AND EXISTS (
+            SELECT 1 FROM information_schema.columns
+            WHERE table_schema = 'feedgen_ops' AND table_name = 'subscriber_feed_assignment'
+              AND column_name = 'status' AND data_type = 'character varying'
+              AND is_nullable = 'NO' AND column_default LIKE '%active%'
+          ) AND EXISTS (
+            SELECT 1 FROM pg_constraint
+            WHERE conrelid = 'feedgen_ops.subscriber_feed_assignment'::regclass
+              AND conname = 'subscriber_feed_assignment_pkey'
+              AND contype = 'p'
+              AND convalidated
+              AND pg_get_constraintdef(oid) LIKE '%(assignment_id)%'
+          ) AND EXISTS (
+            SELECT 1 FROM pg_constraint
+            WHERE conrelid = 'feedgen_ops.subscriber_feed_assignment'::regclass
+              AND conname = 'subscriber_feed_assignment_did_fkey'
+              AND contype = 'f'
+              AND convalidated
+              AND pg_get_constraintdef(oid) LIKE '%FOREIGN KEY (did)%'
+              AND pg_get_constraintdef(oid) LIKE '%REFERENCES subscriber(did) ON DELETE CASCADE%'
+          ) AND EXISTS (
+            SELECT 1 FROM pg_constraint
+            WHERE conrelid = 'feedgen_ops.subscriber_feed_assignment'::regclass
+              AND conname = 'subscriber_feed_assignment_interval_check'
+              AND contype = 'c'
+              AND convalidated
+              AND pg_get_constraintdef(oid) LIKE '%active_until IS NULL%'
+              AND pg_get_constraintdef(oid) LIKE '%active_until > active_from%'
+          ) AND EXISTS (
+            SELECT 1 FROM pg_constraint
+            WHERE conrelid = 'feedgen_ops.subscriber_feed_assignment'::regclass
+              AND conname = 'subscriber_feed_assignment_status_check'
+              AND contype = 'c'
+              AND convalidated
+              AND pg_get_constraintdef(oid) LIKE '%active_until IS NULL%'
+              AND pg_get_constraintdef(oid) LIKE '%status%active%'
+              AND pg_get_constraintdef(oid) LIKE '%removed%'
+              AND pg_get_constraintdef(oid) LIKE '%replaced%'
+              AND pg_get_constraintdef(oid) LIKE '%omni%'
+          ) AND EXISTS (
+            SELECT 1 FROM pg_indexes
+            WHERE schemaname = 'feedgen_ops' AND tablename = 'subscriber_feed_assignment'
+              AND indexname = 'subscriber_feed_assignment_active_uq'
+              AND indexdef LIKE 'CREATE UNIQUE INDEX%'
+              AND indexdef LIKE '%(feed_id, did)%'
+              AND indexdef LIKE '%WHERE (active_until IS NULL)%'
+          ) AND EXISTS (
+            SELECT 1 FROM pg_indexes
+            WHERE schemaname = 'feedgen_ops' AND tablename = 'subscriber_feed_assignment'
+              AND indexname = 'subscriber_feed_assignment_did_active_idx'
+              AND indexdef LIKE '%(did)%'
+              AND indexdef LIKE '%WHERE (active_until IS NULL)%'
+          )
+        ) THEN
+          RAISE EXCEPTION '004_exact_feed_subscriptions schema mismatch: feedgen_ops.subscriber_feed_assignment is missing required columns, constraints, or indexes';
         END IF;
       END $$
     `.execute(db)
   },
   async down(db: Kysely<unknown>) {
     await sql`
-      DROP TABLE IF EXISTS feedgen_ops.subscriber_feed_assignment
+      DO $$
+      BEGIN
+        IF to_regclass('feedgen_ops.subscriber_feed_assignment') IS NOT NULL
+          AND obj_description(
+            'feedgen_ops.subscriber_feed_assignment'::regclass,
+            'pg_class'
+          ) = 'feedgen:migration:004_exact_feed_subscriptions'
+        THEN
+          DROP TABLE feedgen_ops.subscriber_feed_assignment;
+        END IF;
+      END $$
     `.execute(db)
     await sql`
-      ALTER TABLE subscriber DROP COLUMN IF EXISTS access_scope
+      DO $$
+      DECLARE
+        access_scope_attnum integer;
+      BEGIN
+        SELECT attnum INTO access_scope_attnum
+        FROM pg_attribute
+        WHERE attrelid = 'subscriber'::regclass
+          AND attname = 'access_scope'
+          AND NOT attisdropped;
+        IF access_scope_attnum IS NOT NULL
+          AND col_description('subscriber'::regclass, access_scope_attnum)
+            = 'feedgen:migration:004_exact_feed_subscriptions'
+        THEN
+          ALTER TABLE subscriber DROP COLUMN access_scope;
+        END IF;
+      END $$
     `.execute(db)
   },
 }
