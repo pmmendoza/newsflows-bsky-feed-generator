@@ -69,11 +69,11 @@ enrollment path.
 
 Modes are `replace`, `add`, `remove`, and `omni`. Both the administrator key and
 a signed per-user token minted by `POST /api/subscription-token` can use every
-mode; per-user tokens remain bound to their DID. Qualtrics mints and applies the
-temporary token through server-side WebService steps, so no long-lived key
-enters survey JavaScript. Future feed/study restrictions belong in token claims,
-not a second mutation endpoint. `GET /api/subscribe` is retired and returns
-`410`.
+mode; per-user tokens remain bound to their DID. An approved server-side
+integration may mint and apply the temporary token without exposing a long-lived
+key to client-side code. Survey alignment is separate owner-gated work and is
+not implied to be active. Future feed/study restrictions belong in token claims,
+not a second mutation endpoint. `GET /api/subscribe` is retired and returns `410`.
 
 This authorizes retrieval of the named NEWSFLOWS feed. It does not save or pin
 the feed in a participant's Bluesky client. See the BSKY root
