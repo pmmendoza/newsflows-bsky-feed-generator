@@ -8,9 +8,8 @@
  * `allowed=false`.
  *
  * Operator-confirmed enum (2026-05-04):
- *   - subscriber-default: any DID in `public.subscriber` is allowed
- *   - study-only: DID must be active in `study_registry` for the
- *     feed's `study_id` AND status NOT LIKE '%:stop_tracking'
+ *   - subscriber-default: subscriber has omni scope or an active exact assignment
+ *   - study-only: exact-feed access plus active lifecycle membership
  *   - disabled: always empty
  *
  * Catalog reads use a 5-minute LRU cache (per process) to avoid one
@@ -31,9 +30,11 @@ import { Database } from '../db'
 export type AccessPolicyId = 'subscriber-default' | 'study-only' | 'disabled'
 
 export type FeedCatalogPolicyRow = {
+  feed_id: string
   access_policy_id: string
   study_id: string | null
   enabled: boolean
+  retired_at: string | Date | null
 }
 
 export type AccessVerdict = {
@@ -75,14 +76,16 @@ async function readPolicyRow(
   try {
     const result = await db
       .selectFrom('feedgen_ops.feed_catalog')
-      .select(['access_policy_id', 'study_id', 'enabled'])
+      .select(['feed_id', 'access_policy_id', 'study_id', 'enabled', 'retired_at'])
       .where('rkey', '=', rkey)
       .executeTakeFirst()
     if (result) {
       row = {
+        feed_id: String(result.feed_id),
         access_policy_id: String(result.access_policy_id),
         study_id: result.study_id ?? null,
         enabled: Boolean(result.enabled),
+        retired_at: result.retired_at ?? null,
       }
     }
   } catch (err) {
@@ -102,17 +105,43 @@ async function readPolicyRow(
   return row
 }
 
-async function isInSubscriber(
+async function readSubscriberScope(
   db: Database,
   did: string,
-): Promise<boolean> {
-  if (!did) return false
+): Promise<'omni' | 'assigned' | 'none' | null> {
+  if (!did) return null
   const result = await db
     .selectFrom('subscriber')
-    .select('did')
+    .select('access_scope')
     .where('did', '=', did)
     .executeTakeFirst()
+  return result?.access_scope ?? null
+}
+
+async function hasActiveFeedAssignment(
+  db: Database,
+  did: string,
+  feedId: string,
+): Promise<boolean> {
+  const result = await db
+    .selectFrom('feedgen_ops.subscriber_feed_assignment')
+    .select('did')
+    .where('did', '=', did)
+    .where('feed_id', '=', feedId)
+    .where('active_until', 'is', null)
+    .executeTakeFirst()
   return Boolean(result)
+}
+
+async function hasFeedAccess(
+  db: Database,
+  did: string,
+  feedId: string,
+): Promise<boolean> {
+  const scope = await readSubscriberScope(db, did)
+  if (scope === 'omni') return true
+  if (scope !== 'assigned') return false
+  return hasActiveFeedAssignment(db, did, feedId)
 }
 
 async function isInActiveStudyRegistry(
@@ -154,44 +183,49 @@ export async function evaluateAccessPolicy(
 ): Promise<AccessVerdict> {
   const row = await readPolicyRow(db, rkey)
   if (!row) {
-    // No catalog row at all means the feed is not registered. Conservative:
-    // allow the request to proceed via the legacy subscriber check (for
-    // back-compat during the catalog-rollout window). The catalog-driven
-    // describe (Sprint 6 Lane D, env-gated) won't list it anyway.
-    return { allowed: true, reason: 'no-catalog-row:fallback-to-legacy' }
+    return { allowed: false, reason: 'no-catalog-row' }
   }
-  if (!row.enabled) {
+  if (!row.enabled || row.retired_at) {
     return { allowed: false, reason: 'feed-disabled' }
   }
-  switch (row.access_policy_id) {
-    case 'disabled':
-      return { allowed: false, reason: 'disabled' }
-    case 'subscriber-default': {
-      const ok = await isInSubscriber(db, requesterDid)
-      return ok
-        ? { allowed: true, reason: 'subscriber-default' }
-        : { allowed: false, reason: 'subscriber-default:not-subscriber' }
-    }
-    case 'study-only': {
-      if (!row.study_id) {
-        // Misconfigured — fail-closed (per design doc operator decision).
-        console.warn(
-          `[${new Date().toISOString()}] - access-policy: rkey=${rkey} has access_policy_id='study-only' but no study_id; fail-closed`,
-        )
-        return { allowed: false, reason: 'study-only:misconfigured' }
+  try {
+    switch (row.access_policy_id) {
+      case 'disabled':
+        return { allowed: false, reason: 'disabled' }
+      case 'subscriber-default': {
+        const ok = await hasFeedAccess(db, requesterDid, row.feed_id)
+        return ok
+          ? { allowed: true, reason: 'subscriber-default' }
+          : { allowed: false, reason: 'subscriber-default:not-assigned' }
       }
-      const ok = await isInActiveStudyRegistry(db, requesterDid, row.study_id)
-      return ok
-        ? { allowed: true, reason: `study-only:${row.study_id}` }
-        : { allowed: false, reason: `study-only:${row.study_id}:not-active` }
+      case 'study-only': {
+        if (!row.study_id) {
+          console.warn(
+            `[${new Date().toISOString()}] - access-policy: rkey=${rkey} has access_policy_id='study-only' but no study_id; fail-closed`,
+          )
+          return { allowed: false, reason: 'study-only:misconfigured' }
+        }
+        const [feedAccess, activeStudy] = await Promise.all([
+          hasFeedAccess(db, requesterDid, row.feed_id),
+          isInActiveStudyRegistry(db, requesterDid, row.study_id),
+        ])
+        return feedAccess && activeStudy
+          ? { allowed: true, reason: `study-only:${row.study_id}` }
+          : { allowed: false, reason: `study-only:${row.study_id}:not-active-or-assigned` }
+      }
+      default: {
+        console.warn(
+          `[${new Date().toISOString()}] - access-policy: rkey=${rkey} has unknown access_policy_id=${row.access_policy_id}; fail-closed`,
+        )
+        return { allowed: false, reason: 'unknown-policy' }
+      }
     }
-    default: {
-      // Unknown policy — should be impossible after migration 013's CHECK
-      // constraint, but fail-closed in case a future DDL relaxes it.
-      console.warn(
-        `[${new Date().toISOString()}] - access-policy: rkey=${rkey} has unknown access_policy_id=${row.access_policy_id}; fail-closed`,
-      )
-      return { allowed: false, reason: 'unknown-policy' }
-    }
+  } catch (err) {
+    console.warn(
+      `[${new Date().toISOString()}] - access-policy: access-state read failed for rkey=${rkey}; error=${
+        err instanceof Error ? err.message : String(err)
+      }`,
+    )
+    return { allowed: false, reason: 'access-state-read-failed' }
   }
 }

@@ -1,0 +1,353 @@
+import { Transaction } from 'kysely'
+import { AppContext } from '../config'
+import { Database } from '../db'
+import { DatabaseSchema, FeedCatalog } from '../db/schema'
+import { getProfile } from './queries'
+import { triggerFollowsUpdateForSubscriber } from './scheduled-updater'
+
+export type SubscriptionMode = 'replace' | 'add' | 'remove' | 'omni'
+export type AccessScope = 'omni' | 'assigned' | 'none'
+
+export type SubscriptionInput = {
+  identifier?: string
+  did?: string
+  handle?: string
+  feed?: string
+  rkey?: string
+  mode?: string
+  source?: string
+}
+
+export type ResolvedIdentity = {
+  input: string
+  handle: string
+  did: string
+  avatar?: string
+}
+
+export type AssignmentView = {
+  feed_id: string
+  feed: string
+  study_id: string | null
+}
+
+export type SubscriptionResult = {
+  ok: true
+  message: string
+  handle: string
+  did: string
+  avatar?: string
+  feed: string
+  mode: SubscriptionMode
+  access_scope: AccessScope
+  changed: boolean
+  assignments: AssignmentView[]
+  current_access_scope?: AccessScope
+  current_assignments?: AssignmentView[]
+  apply_performed: boolean
+}
+
+type Db = Database | Transaction<DatabaseSchema>
+
+export class SubscriptionError extends Error {
+  constructor(
+    public status: number,
+    public code: string,
+    message: string,
+  ) {
+    super(message)
+  }
+}
+
+function values(input: SubscriptionInput, keys: Array<keyof SubscriptionInput>): string[] {
+  return keys
+    .map((key) => input[key])
+    .filter((value): value is string => typeof value === 'string' && value.trim().length > 0)
+    .map((value) => value.trim())
+}
+
+export function parseSubscriptionMode(value: unknown): SubscriptionMode {
+  if (value === 'replace' || value === 'add' || value === 'remove' || value === 'omni') {
+    return value
+  }
+  throw new SubscriptionError(400, 'invalid_mode', 'mode must be replace, add, remove, or omni')
+}
+
+export async function resolveSubscriptionIdentity(input: SubscriptionInput): Promise<ResolvedIdentity> {
+  const identifiers = values(input, ['identifier', 'did', 'handle'])
+  if (identifiers.length !== 1) {
+    throw new SubscriptionError(400, 'invalid_identity', 'provide exactly one of identifier, did, or handle')
+  }
+  const actor = identifiers[0]
+  try {
+    const profile = await getProfile(actor)
+    if (!profile?.did || !profile.handle) throw new Error('profile missing DID or handle')
+    return {
+      input: actor,
+      handle: profile.handle,
+      did: profile.did,
+      avatar: profile.avatar,
+    }
+  } catch {
+    throw new SubscriptionError(404, 'identity_not_found', `could not resolve Bluesky identity: ${actor}`)
+  }
+}
+
+export async function resolveSubscriptionFeed(db: Db, input: SubscriptionInput): Promise<FeedCatalog> {
+  const feeds = values(input, ['feed', 'rkey'])
+  if (feeds.length !== 1) {
+    throw new SubscriptionError(400, 'invalid_feed', 'provide exactly one of feed or rkey')
+  }
+  const requested = feeds[0]
+  const urlMatch = requested.match(/\/feed\/([^/?#]+)/)
+  let rkey = requested
+  if (urlMatch) {
+    try {
+      rkey = decodeURIComponent(urlMatch[1])
+    } catch {
+      throw new SubscriptionError(400, 'invalid_feed', `invalid feed URL: ${requested}`)
+    }
+  }
+  const feed = await db
+    .selectFrom('feedgen_ops.feed_catalog')
+    .selectAll()
+    .where('rkey', '=', rkey)
+    .executeTakeFirst()
+  if (!feed) throw new SubscriptionError(404, 'feed_not_found', `unknown feed: ${requested}`)
+  if (!feed.enabled || feed.retired_at || feed.access_policy_id === 'disabled') {
+    throw new SubscriptionError(409, 'feed_disabled', `feed is disabled: ${requested}`)
+  }
+  return feed
+}
+
+async function readAssignments(db: Db, did: string): Promise<AssignmentView[]> {
+  const rows = await db
+    .selectFrom('feedgen_ops.subscriber_feed_assignment as assignment')
+    .innerJoin('feedgen_ops.feed_catalog as feed', 'feed.feed_id', 'assignment.feed_id')
+    .select([
+      'assignment.feed_id as feed_id',
+      'feed.rkey as feed',
+      'feed.study_id as study_id',
+    ])
+    .where('assignment.did', '=', did)
+    .where('assignment.active_until', 'is', null)
+    .orderBy('feed.rkey', 'asc')
+    .execute()
+  return rows.map((row) => ({
+    feed_id: row.feed_id,
+    feed: row.feed,
+    study_id: row.study_id ?? null,
+  }))
+}
+
+async function readScope(db: Db, did: string): Promise<AccessScope | null> {
+  const row = await db
+    .selectFrom('subscriber')
+    .select('access_scope')
+    .where('did', '=', did)
+    .executeTakeFirst()
+  return row ? row.access_scope ?? 'omni' : null
+}
+
+export async function inspectSubscription(
+  db: Db,
+  identity: ResolvedIdentity,
+): Promise<{ access_scope: AccessScope; assignments: AssignmentView[]; subscribed: boolean }> {
+  const [scope, assignments] = await Promise.all([
+    readScope(db, identity.did),
+    readAssignments(db, identity.did),
+  ])
+  return {
+    access_scope: scope ?? 'none',
+    assignments,
+    subscribed: scope !== null,
+  }
+}
+
+function sameStudy(assignment: AssignmentView, feed: FeedCatalog): boolean {
+  return feed.study_id === null || feed.study_id === undefined
+    ? assignment.feed_id === feed.feed_id
+    : assignment.study_id === feed.study_id
+}
+
+function project(
+  currentScope: AccessScope,
+  current: AssignmentView[],
+  feed: FeedCatalog,
+  mode: SubscriptionMode,
+): { scope: AccessScope; assignments: AssignmentView[] } {
+  const target: AssignmentView = {
+    feed_id: feed.feed_id,
+    feed: feed.rkey,
+    study_id: feed.study_id ?? null,
+  }
+  if (mode === 'omni') return { scope: 'omni', assignments: [] }
+  if (mode === 'add') {
+    if (currentScope === 'omni') return { scope: 'assigned', assignments: [target] }
+    const assignments = current.some((row) => row.feed_id === feed.feed_id)
+      ? current
+      : [...current, target].sort((a, b) => a.feed.localeCompare(b.feed))
+    return { scope: 'assigned', assignments }
+  }
+  if (mode === 'remove') {
+    if (currentScope === 'omni') {
+      throw new SubscriptionError(409, 'mode_conflict', 'remove requires exact-feed scope; use replace first')
+    }
+    const assignments = current.filter((row) => row.feed_id !== feed.feed_id)
+    return { scope: assignments.length ? 'assigned' : 'none', assignments }
+  }
+  const assignments = [
+    ...current.filter((row) => !sameStudy(row, feed)),
+    target,
+  ].sort((a, b) => a.feed.localeCompare(b.feed))
+  return { scope: 'assigned', assignments }
+}
+
+function changed(
+  currentScope: AccessScope,
+  current: AssignmentView[],
+  nextScope: AccessScope,
+  next: AssignmentView[],
+): boolean {
+  if (currentScope !== nextScope || current.length !== next.length) return true
+  return current.some((row, index) => row.feed_id !== next[index]?.feed_id)
+}
+
+async function applyProjectedState(
+  trx: Transaction<DatabaseSchema>,
+  identity: ResolvedIdentity,
+  mode: SubscriptionMode,
+  source: string,
+  before: AssignmentView[],
+  next: { scope: AccessScope; assignments: AssignmentView[] },
+): Promise<void> {
+  const now = new Date()
+  const nextIds = new Set(next.assignments.map((row) => row.feed_id))
+  const closeIds = before.filter((row) => !nextIds.has(row.feed_id)).map((row) => row.feed_id)
+  if (closeIds.length) {
+    await trx
+      .updateTable('feedgen_ops.subscriber_feed_assignment')
+      .set({
+        active_until: now,
+        source,
+        status: mode === 'omni' ? 'omni' : mode === 'remove' ? 'removed' : 'replaced',
+      })
+      .where('did', '=', identity.did)
+      .where('feed_id', 'in', closeIds)
+      .where('active_until', 'is', null)
+      .execute()
+  }
+
+  const beforeIds = new Set(before.map((row) => row.feed_id))
+  const open = next.assignments.filter((row) => !beforeIds.has(row.feed_id))
+  for (const assignment of open) {
+    await trx
+      .insertInto('feedgen_ops.subscriber_feed_assignment')
+      .values({
+        feed_id: assignment.feed_id,
+        did: identity.did,
+        active_from: now,
+        active_until: null,
+        source,
+        status: 'active',
+      })
+      .execute()
+  }
+
+  const update = await trx
+    .updateTable('subscriber')
+    .set({ handle: identity.handle, access_scope: next.scope })
+    .where('did', '=', identity.did)
+    .executeTakeFirst()
+  if (mode === 'remove' && Number(update.numUpdatedRows) === 0) {
+    throw new SubscriptionError(404, 'subscriber_not_found', `identity is not subscribed: ${identity.did}`)
+  }
+}
+
+export async function executeSubscription(
+  ctx: AppContext,
+  input: SubscriptionInput,
+  apply: boolean,
+  updateFollows = true,
+  boundDid?: string,
+): Promise<SubscriptionResult> {
+  const mode = parseSubscriptionMode(input.mode)
+  const identity = await resolveSubscriptionIdentity(input)
+  if (boundDid && boundDid !== identity.did) {
+    throw new SubscriptionError(403, 'identity_mismatch', 'subscription identity does not match token subject')
+  }
+  const feed = await resolveSubscriptionFeed(ctx.db, input)
+  const source = input.source?.trim() || 'feedgen-subscription-api'
+
+  const beforeState = await inspectSubscription(ctx.db, identity)
+  const next = project(beforeState.access_scope, beforeState.assignments, feed, mode)
+  const willChange = changed(
+    beforeState.access_scope,
+    beforeState.assignments,
+    next.scope,
+    next.assignments,
+  )
+  let didChange = willChange
+
+  if (apply) {
+    didChange = await ctx.db.transaction().execute(async (trx) => {
+      const inserted = mode === 'remove'
+        ? undefined
+        : await trx
+          .insertInto('subscriber')
+          .values({ handle: identity.handle, did: identity.did, access_scope: 'omni' })
+          .onConflict((oc) => oc.column('did').doNothing())
+          .returning('did')
+          .executeTakeFirst()
+      const locked = await trx
+        .selectFrom('subscriber')
+        .select('did')
+        .where('did', '=', identity.did)
+        .forUpdate()
+        .executeTakeFirst()
+      if (mode === 'remove' && !locked) return false
+      const current = await inspectSubscription(trx, identity)
+      const effectiveScope = inserted ? 'none' : current.access_scope
+      const projected = project(effectiveScope, current.assignments, feed, mode)
+      const transactionChanged = changed(
+        effectiveScope,
+        current.assignments,
+        projected.scope,
+        projected.assignments,
+      )
+      if (!transactionChanged) return false
+      await applyProjectedState(
+        trx,
+        identity,
+        mode,
+        source,
+        current.assignments,
+        projected,
+      )
+      return true
+    })
+    if (didChange && updateFollows && mode !== 'remove') {
+      triggerFollowsUpdateForSubscriber(ctx.db, identity.did)
+    }
+  }
+
+  const finalState = apply ? await inspectSubscription(ctx.db, identity) : {
+    access_scope: next.scope,
+    assignments: next.assignments,
+  }
+  return {
+    ok: true,
+    message: apply ? 'Subscription updated' : 'Subscription plan',
+    handle: identity.handle,
+    did: identity.did,
+    avatar: identity.avatar,
+    feed: feed.rkey,
+    mode,
+    access_scope: finalState.access_scope,
+    changed: didChange,
+    assignments: finalState.assignments,
+    current_access_scope: apply ? undefined : beforeState.access_scope,
+    current_assignments: apply ? undefined : beforeState.assignments,
+    apply_performed: apply,
+  }
+}
