@@ -56,9 +56,16 @@ yarn publishFeed
 `POST /api/subscribe` is the only live mutation endpoint. It accepts exactly one
 of `identifier`, `handle`, or `did`, plus a feed rkey and mode:
 
-```json
-{"handle":"participant.bsky.social","feed":"newsflow-be-1","mode":"replace"}
+```bash
+curl -X POST "$FEEDGEN_BASE_URL/api/subscribe" \
+  -H "api-key: $FEEDGEN_ADMIN_API_KEY" \
+  -H "content-type: application/json" \
+  --data '{"handle":"participant.bsky.social","feed":"newsflow-be-1","mode":"replace"}'
 ```
+
+Use `{"did":"did:plc:...", ...}` instead when the participant DID is already
+known. `subscribers.csv` remains a backfill helper, not a parallel live
+enrollment path.
 
 Modes are `replace`, `add`, `remove`, and `omni`. Both the administrator key and
 a signed per-user token minted by `POST /api/subscription-token` can use every
@@ -69,7 +76,9 @@ not a second mutation endpoint. `GET /api/subscribe` is retired and returns
 `410`.
 
 This authorizes retrieval of the named NEWSFLOWS feed. It does not save or pin
-the feed in a participant's Bluesky client.
+the feed in a participant's Bluesky client. See the BSKY root
+[`docs/api_endpoints.md`](https://github.com/pmmendoza/newsflows-bsky-ecosystem/blob/main/docs/api_endpoints.md)
+for the canonical API contract, responses, errors, and token flow.
 
 ## Rehearsal Profiles
 

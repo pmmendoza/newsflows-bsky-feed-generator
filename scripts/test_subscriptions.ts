@@ -18,6 +18,145 @@ function assert(condition: unknown, message: string): asserts condition {
   if (!condition) throw new Error(message)
 }
 
+async function testMalformedOwnerSchemaIsRejected(db: ReturnType<typeof createDb>) {
+  await migrateToLatest(db)
+  const migrator = new Migrator({ db, provider: migrationProvider })
+  const down = await migrator.migrateDown()
+  if (down.error) throw down.error
+
+  await sql`
+    ALTER TABLE subscriber ADD COLUMN access_scope varchar;
+    CREATE SCHEMA IF NOT EXISTS feedgen_ops;
+    CREATE TABLE feedgen_ops.subscriber_feed_assignment (
+      assignment_id bigserial PRIMARY KEY,
+      feed_id varchar NOT NULL,
+      did varchar NOT NULL REFERENCES subscriber(did) ON DELETE CASCADE,
+      active_from timestamptz NOT NULL DEFAULT now(),
+      active_until timestamptz,
+      source varchar,
+      status varchar NOT NULL DEFAULT 'active'
+    )
+  `.execute(db)
+
+  let migrationError: unknown
+  try {
+    await migrateToLatest(db)
+  } catch (error) {
+    migrationError = error
+  }
+  assert(migrationError instanceof Error, 'malformed owner-applied subscription schema must fail migration')
+  assert(
+    migrationError.message.includes('004_exact_feed_subscriptions schema mismatch'),
+    'malformed owner-applied schema must fail with an actionable migration error',
+  )
+
+  await sql`
+    DROP TABLE feedgen_ops.subscriber_feed_assignment;
+    ALTER TABLE subscriber DROP CONSTRAINT IF EXISTS subscriber_access_scope_check;
+    ALTER TABLE subscriber DROP COLUMN access_scope
+  `.execute(db)
+}
+
+async function testIneffectiveOwnerConstraintsAreRejected(db: ReturnType<typeof createDb>) {
+  await sql`
+    ALTER TABLE subscriber
+      ADD COLUMN access_scope varchar NOT NULL DEFAULT 'omni',
+      ADD CONSTRAINT subscriber_access_scope_check CHECK (true);
+    CREATE TABLE feedgen_ops.subscriber_feed_assignment (
+      assignment_id bigserial PRIMARY KEY,
+      feed_id varchar NOT NULL,
+      did varchar NOT NULL REFERENCES subscriber(did) ON DELETE CASCADE,
+      active_from timestamptz NOT NULL DEFAULT now(),
+      active_until timestamptz,
+      source varchar,
+      status varchar NOT NULL DEFAULT 'active',
+      CONSTRAINT subscriber_feed_assignment_interval_check CHECK (true),
+      CONSTRAINT subscriber_feed_assignment_status_check CHECK (true)
+    );
+    CREATE UNIQUE INDEX subscriber_feed_assignment_active_uq
+      ON feedgen_ops.subscriber_feed_assignment (feed_id, did)
+      WHERE active_until IS NULL;
+    CREATE INDEX subscriber_feed_assignment_did_active_idx
+      ON feedgen_ops.subscriber_feed_assignment (did)
+      WHERE active_until IS NULL
+  `.execute(db)
+
+  let migrationError: unknown
+  try {
+    await migrateToLatest(db)
+  } catch (error) {
+    migrationError = error
+  }
+  assert(migrationError instanceof Error, 'ineffective owner-applied constraints must fail migration')
+  assert(
+    migrationError.message.includes('004_exact_feed_subscriptions schema mismatch'),
+    'ineffective owner-applied constraints must fail with an actionable migration error',
+  )
+
+  await sql`
+    DROP TABLE feedgen_ops.subscriber_feed_assignment;
+    ALTER TABLE subscriber DROP CONSTRAINT IF EXISTS subscriber_access_scope_check;
+    ALTER TABLE subscriber DROP COLUMN access_scope
+  `.execute(db)
+}
+
+async function testValidOwnerSchemaSurvivesRollback(db: ReturnType<typeof createDb>) {
+  await sql`
+    ALTER TABLE subscriber
+      ADD COLUMN access_scope varchar NOT NULL DEFAULT 'omni',
+      ADD CONSTRAINT subscriber_access_scope_check
+        CHECK (access_scope IN ('omni', 'assigned', 'none'));
+    COMMENT ON COLUMN subscriber.access_scope IS 'owner-applied subscription schema';
+    CREATE TABLE feedgen_ops.subscriber_feed_assignment (
+      assignment_id bigserial PRIMARY KEY,
+      feed_id varchar NOT NULL,
+      did varchar NOT NULL REFERENCES subscriber(did) ON DELETE CASCADE,
+      active_from timestamptz NOT NULL DEFAULT now(),
+      active_until timestamptz,
+      source varchar,
+      status varchar NOT NULL DEFAULT 'active',
+      CONSTRAINT subscriber_feed_assignment_interval_check
+        CHECK (active_until IS NULL OR active_until > active_from),
+      CONSTRAINT subscriber_feed_assignment_status_check
+        CHECK (
+          (active_until IS NULL AND status = 'active') OR
+          (active_until IS NOT NULL AND status IN ('removed', 'replaced', 'omni'))
+        )
+    );
+    CREATE UNIQUE INDEX subscriber_feed_assignment_active_uq
+      ON feedgen_ops.subscriber_feed_assignment (feed_id, did)
+      WHERE active_until IS NULL;
+    CREATE INDEX subscriber_feed_assignment_did_active_idx
+      ON feedgen_ops.subscriber_feed_assignment (did)
+      WHERE active_until IS NULL;
+    COMMENT ON TABLE feedgen_ops.subscriber_feed_assignment IS 'owner-applied subscription schema'
+  `.execute(db)
+
+  await migrateToLatest(db)
+  const migrator = new Migrator({ db, provider: migrationProvider })
+  const down = await migrator.migrateDown()
+  if (down.error) throw down.error
+
+  const objects = await sql<{ table_exists: boolean; column_exists: boolean }>`
+    SELECT
+      to_regclass('feedgen_ops.subscriber_feed_assignment') IS NOT NULL AS table_exists,
+      EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = 'public' AND table_name = 'subscriber'
+          AND column_name = 'access_scope'
+      ) AS column_exists
+  `.execute(db)
+  assert(
+    objects.rows[0]?.table_exists && objects.rows[0]?.column_exists,
+    'rollback must preserve valid owner-applied subscription objects',
+  )
+
+  await sql`
+    DROP TABLE feedgen_ops.subscriber_feed_assignment;
+    ALTER TABLE subscriber DROP COLUMN access_scope
+  `.execute(db)
+}
+
 async function main() {
   const dsn = process.env.FEEDGEN_TEST_DSN
   if (!dsn || process.env.FEEDGEN_SUBSCRIPTION_TEST_CONFIRM !== 'disposable') {
@@ -26,10 +165,14 @@ async function main() {
 
   const db = createDb(dsn)
   const ctx = { db } as AppContext
-  const identity = await resolveSubscriptionIdentity({ handle: HANDLE })
-  const did = identity.did
+  let did = ''
 
   try {
+    await testMalformedOwnerSchemaIsRejected(db)
+    await testIneffectiveOwnerConstraintsAreRejected(db)
+    await testValidOwnerSchemaSurvivesRollback(db)
+    const identity = await resolveSubscriptionIdentity({ handle: HANDLE })
+    did = identity.did
     await migrateToLatest(db)
     await sql`
       CREATE SCHEMA IF NOT EXISTS feedgen_ops;
