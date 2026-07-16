@@ -36,6 +36,7 @@ import {
   isApiKeyAuthorized,
   logUnauthorized,
 } from '../util/api-auth'
+import { isSubscribableFeed } from '../util/subscribable-feed'
 
 const adminWriteAuth: ApiKeyAuthConfig = {
   primaryEnv: ['FEEDGEN_ADMIN_API_KEY'],
@@ -258,13 +259,21 @@ export function feedCatalogItemPayload(row: FeedCatalog) {
   }
 }
 
-export function feedCatalogListPayload(rows: FeedCatalog[]) {
+export function feedCatalogListPayload(rows: FeedCatalog[], subscribableOnly = false) {
+  const feeds = subscribableOnly ? rows.filter(isSubscribableFeed) : rows
   return {
     schema_version: 1,
-    feed_count: rows.length,
-    feeds: rows.map(feedCatalogItemPayload),
+    feed_count: feeds.length,
+    feeds: feeds.map(feedCatalogItemPayload),
+    subscribable_only: subscribableOnly,
     raw_values_in_output: false,
   }
+}
+
+export function parseSubscribableFilter(value: unknown): boolean {
+  if (value === undefined || value === 'false') return false
+  if (value === 'true') return true
+  throw new Error('subscribable must be true or false')
 }
 
 export function feedCatalogShowPayload(row: FeedCatalog) {
@@ -601,9 +610,15 @@ export default function registerFeedCatalogAdminEndpoint(
       return res.status(401).json({ error: 'Unauthorized: Invalid API key' })
     }
 
+    let subscribableOnly: boolean
+    try {
+      subscribableOnly = parseSubscribableFilter(req.query?.subscribable)
+    } catch (err) {
+      return res.status(400).json({ error: err instanceof Error ? err.message : 'invalid subscribable filter' })
+    }
     try {
       const rows = await readCatalogRows(ctx)
-      return res.json(feedCatalogListPayload(rows))
+      return res.json(feedCatalogListPayload(rows, subscribableOnly))
     } catch (err) {
       console.error(
         `[${new Date().toISOString()}] - feed_catalog-admin: read error. ${err instanceof Error ? err.message : String(err)}`,

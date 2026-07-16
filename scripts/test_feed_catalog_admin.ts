@@ -15,6 +15,7 @@ import {
   feedCatalogListPayload,
   feedCatalogNotFoundPayload,
   feedCatalogShowPayload,
+  parseSubscribableFilter,
   validateUpdate,
 } from '../src/methods/feed-catalog-admin'
 import { FeedCatalog } from '../src/db/schema'
@@ -68,6 +69,31 @@ function testListPayload() {
   assertEqual(payload.feeds[0].rkey, 'newsflow-nl-2', 'list preserves given row order')
   assertEqual(payload.feeds[1].operator_status, 'active', 'list item operator_status')
   assertEqual(payload.feeds[1].published.status, 'unknown', 'list published placeholder')
+}
+
+function testSubscribableListPayload() {
+  const payload = feedCatalogListPayload([
+    baseFeed,
+    { ...otherFeed, enabled: false },
+    { ...otherFeed, rkey: 'newsflow-nl-3', retired_at: '2026-07-01T00:00:00Z' },
+    { ...otherFeed, rkey: 'newsflow-nl-4', access_policy_id: 'disabled' },
+  ], true)
+  assertEqual(payload.feed_count, 1, 'subscribable list feed_count')
+  assertEqual(payload.feeds[0].rkey, 'newsflow-nl-1', 'subscribable list active feed')
+  assertEqual(payload.subscribable_only, true, 'subscribable list marker')
+}
+
+function testSubscribableFilterParsing() {
+  assertEqual(parseSubscribableFilter(undefined), false, 'missing filter')
+  assertEqual(parseSubscribableFilter('true'), true, 'true filter')
+  assertEqual(parseSubscribableFilter('false'), false, 'false filter')
+  let rejected = false
+  try {
+    parseSubscribableFilter('yes')
+  } catch {
+    rejected = true
+  }
+  assert(rejected, 'invalid subscribable filter should be rejected')
 }
 
 function testShowPayload() {
@@ -322,6 +348,8 @@ function testApplyBlockedPayload() {
 
 const tests = [
   testListPayload,
+  testSubscribableListPayload,
+  testSubscribableFilterParsing,
   testShowPayload,
   testMissingFeedPayload,
   testInvalidAccessPolicy,

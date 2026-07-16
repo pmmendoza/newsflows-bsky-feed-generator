@@ -4,6 +4,7 @@ import { Database } from '../db'
 import { DatabaseSchema, FeedCatalog } from '../db/schema'
 import { getProfile } from './queries'
 import { triggerFollowsUpdateForSubscriber } from './scheduled-updater'
+import { isSubscribableFeed } from './subscribable-feed'
 
 export type SubscriptionMode = 'replace' | 'add' | 'remove' | 'omni'
 export type AccessScope = 'omni' | 'assigned' | 'none'
@@ -114,7 +115,7 @@ export async function resolveSubscriptionFeed(db: Db, input: SubscriptionInput):
     .where('rkey', '=', rkey)
     .executeTakeFirst()
   if (!feed) throw new SubscriptionError(404, 'feed_not_found', `unknown feed: ${requested}`)
-  if (!feed.enabled || feed.retired_at || feed.access_policy_id === 'disabled') {
+  if (!isSubscribableFeed(feed)) {
     throw new SubscriptionError(409, 'feed_disabled', `feed is disabled: ${requested}`)
   }
   return feed

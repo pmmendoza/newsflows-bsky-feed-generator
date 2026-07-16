@@ -34,6 +34,12 @@ status fields:
 - `health.status`: currently `unknown`
 - `raw_values_in_output:false`
 
+Add `?subscribable=true` to return only rows accepted by
+`POST /api/subscribe`: `enabled:true`, no `retired_at`, and an access policy
+other than `disabled`. The response includes `subscribable_only:true`. The
+filter and subscription mutation share one feedgen-owned predicate; clients
+should require the marker rather than assuming an older server applied it.
+
 `GET /api/admin/feed_catalog/:rkey`
 
 Returns one catalog row or `404` with `{"error":"rkey=<rkey> not found"}`.
