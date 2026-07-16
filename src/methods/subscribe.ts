@@ -69,7 +69,7 @@ export default function registerSubscribeEndpoint(server: Server, ctx: AppContex
     return res.status(410).json({
       ok: false,
       error: 'retired_endpoint',
-      message: 'Use authenticated POST /api/subscribe with identity, feed, and mode',
+      message: 'Use authenticated POST /api/subscribe with identity and mode; exact-feed modes also require feed',
     })
   })
 

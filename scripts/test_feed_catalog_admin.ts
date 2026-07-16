@@ -77,6 +77,7 @@ function testSubscribableListPayload() {
     { ...otherFeed, enabled: false },
     { ...otherFeed, rkey: 'newsflow-nl-3', retired_at: '2026-07-01T00:00:00Z' },
     { ...otherFeed, rkey: 'newsflow-nl-4', access_policy_id: 'disabled' },
+    { ...otherFeed, rkey: 'newsflow-nl-5', access_policy_id: 'unknown-policy' },
   ], true)
   assertEqual(payload.feed_count, 1, 'subscribable list feed_count')
   assertEqual(payload.feeds[0].rkey, 'newsflow-nl-1', 'subscribable list active feed')

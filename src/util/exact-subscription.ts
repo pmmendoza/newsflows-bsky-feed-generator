@@ -38,7 +38,7 @@ export type SubscriptionResult = {
   handle: string
   did: string
   avatar?: string
-  feed: string
+  feed: string | null
   mode: SubscriptionMode
   access_scope: AccessScope
   changed: boolean
@@ -174,15 +174,16 @@ function sameStudy(assignment: AssignmentView, feed: FeedCatalog): boolean {
 function project(
   currentScope: AccessScope,
   current: AssignmentView[],
-  feed: FeedCatalog,
+  feed: FeedCatalog | null,
   mode: SubscriptionMode,
 ): { scope: AccessScope; assignments: AssignmentView[] } {
+  if (mode === 'omni') return { scope: 'omni', assignments: [] }
+  if (!feed) throw new SubscriptionError(400, 'invalid_feed', `${mode} requires a feed`)
   const target: AssignmentView = {
     feed_id: feed.feed_id,
     feed: feed.rkey,
     study_id: feed.study_id ?? null,
   }
-  if (mode === 'omni') return { scope: 'omni', assignments: [] }
   if (mode === 'add') {
     if (currentScope === 'omni') return { scope: 'assigned', assignments: [target] }
     const assignments = current.some((row) => row.feed_id === feed.feed_id)
@@ -277,7 +278,11 @@ export async function executeSubscription(
   if (boundDid && boundDid !== identity.did) {
     throw new SubscriptionError(403, 'identity_mismatch', 'subscription identity does not match token subject')
   }
-  const feed = await resolveSubscriptionFeed(ctx.db, input)
+  const suppliedFeeds = values(input, ['feed', 'rkey'])
+  if (mode === 'omni' && suppliedFeeds.length > 0) {
+    throw new SubscriptionError(400, 'invalid_feed', 'omni does not accept feed or rkey')
+  }
+  const feed = mode === 'omni' ? null : await resolveSubscriptionFeed(ctx.db, input)
   const source = input.source?.trim() || 'feedgen-subscription-api'
 
   const beforeState = await inspectSubscription(ctx.db, identity)
@@ -342,7 +347,7 @@ export async function executeSubscription(
     handle: identity.handle,
     did: identity.did,
     avatar: identity.avatar,
-    feed: feed.rkey,
+    feed: feed?.rkey ?? null,
     mode,
     access_scope: finalState.access_scope,
     changed: didChange,

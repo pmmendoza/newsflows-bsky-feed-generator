@@ -166,6 +166,11 @@ async function main() {
   const db = createDb(dsn)
   const ctx = { db } as AppContext
   let did = ''
+  const listDids = [
+    'did:plc:subscriptionlistomni',
+    'did:plc:subscriptionlistassigned',
+    'did:plc:subscriptionlistnone',
+  ]
 
   try {
     await testMalformedOwnerSchemaIsRejected(db)
@@ -251,7 +256,15 @@ async function main() {
       addFromOmni.access_scope === 'assigned' && addFromOmni.assignments.map((row) => row.feed).join() === 'test-be-1',
       'add from migrated omni scope must enter exact-feed scope',
     )
-    await executeSubscription(ctx, { did, feed: 'test-be-1', mode: 'omni' }, true, false)
+    const feedlessOmni = await executeSubscription(ctx, { did, mode: 'omni' }, true, false)
+    assert(feedlessOmni.feed === null, 'omni must not require or invent a feed')
+    let omniWithFeedRejected = false
+    try {
+      await executeSubscription(ctx, { did, feed: 'test-be-1', mode: 'omni' }, false)
+    } catch (error) {
+      omniWithFeedRejected = error instanceof SubscriptionError && error.code === 'invalid_feed'
+    }
+    assert(omniWithFeedRejected, 'omni must reject a feed argument')
     await db.deleteFrom('subscriber').where('did', '=', did).execute()
     const removeMissing = await executeSubscription(
       ctx,
@@ -339,7 +352,7 @@ async function main() {
     await executeSubscription(ctx, { did, feed: 'test-be-2', mode: 'remove' }, true, false)
     const none = await executeSubscription(ctx, { did, feed: 'test-nl-1', mode: 'remove' }, true, false)
     assert(none.access_scope === 'none' && none.assignments.length === 0, 'removing last assignment must deny all')
-    const omni = await executeSubscription(ctx, { did, feed: 'test-be-1', mode: 'omni' }, true, false)
+    const omni = await executeSubscription(ctx, { did, mode: 'omni' }, true, false)
     assert(omni.access_scope === 'omni' && omni.assignments.length === 0, 'omni must clear exact assignments')
 
     let conflict = false
@@ -361,7 +374,7 @@ async function main() {
     const finalState = await inspectSubscription(db, identity)
     assert(finalState.assignments.length === 1, 'concurrent idempotent replace must leave one active row')
 
-    await executeSubscription(ctx, { did, feed: 'test-be-1', mode: 'omni' }, true, false)
+    await executeSubscription(ctx, { did, mode: 'omni' }, true, false)
     await sql`
       CREATE OR REPLACE FUNCTION feedgen_ops.reject_forced_subscription_test()
       RETURNS trigger LANGUAGE plpgsql AS $$
@@ -396,6 +409,7 @@ async function main() {
     `.execute(db)
 
     process.env.FEEDGEN_ADMIN_API_KEY = 'subscription-admin-test-key'
+    process.env.FEEDGEN_READ_API_KEY = 'subscription-read-test-key'
     process.env.STUDY_TOKEN_API_KEY = 'subscription-token-test-key'
     process.env.STUDY_JWT_SECRET = 'subscription-test-secret-that-is-long-enough'
     const FeedGenerator = (await import('../src/server')).default
@@ -450,9 +464,15 @@ async function main() {
       const tokenOmni = await fetch(`${base}/api/subscribe`, {
         method: 'POST',
         headers: { 'content-type': 'application/json', authorization: `Bearer ${tokenPayload.token}` },
-        body: JSON.stringify({ ...body, mode: 'omni' }),
+        body: JSON.stringify({ handle: HANDLE, mode: 'omni' }),
       })
       assert(tokenOmni.status === 200, 'per-user token must currently support omni mode')
+      const tokenOmniWithFeed = await fetch(`${base}/api/subscribe`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', authorization: `Bearer ${tokenPayload.token}` },
+        body: JSON.stringify({ ...body, mode: 'omni' }),
+      })
+      assert(tokenOmniWithFeed.status === 400, 'omni with a feed must fail before mutation')
 
       const ruben = await resolveSubscriptionIdentity({ handle: 'rubencallahan.bsky.social' })
       const identityMismatch = await fetch(`${base}/api/subscribe`, {
@@ -511,10 +531,132 @@ async function main() {
       }
       assert(requesterRejected, 'decode-only or forged requester JWT must be rejected')
 
+      await sql`
+        CREATE TABLE IF NOT EXISTS feedgen_ops.study_registry (
+          study_id varchar NOT NULL,
+          did varchar NOT NULL,
+          active_from timestamptz NOT NULL,
+          active_until timestamptz,
+          source varchar,
+          status varchar NOT NULL
+        )
+      `.execute(db)
+      await db.deleteFrom('feedgen_ops.study_registry').where('did', 'in', listDids).execute()
+      await db.deleteFrom('feedgen_ops.subscriber_feed_assignment').where('did', 'in', listDids).execute()
+      await db.deleteFrom('subscriber').where('did', 'in', listDids).execute()
+      await db.insertInto('subscriber').values([
+        { did: listDids[0], handle: 'list-omni.test', access_scope: 'omni' },
+        { did: listDids[1], handle: 'list-assigned.test', access_scope: 'assigned' },
+        { did: listDids[2], handle: 'list-none.test', access_scope: 'none' },
+      ]).execute()
+      await db.insertInto('feedgen_ops.subscriber_feed_assignment').values([
+        { did: listDids[1], feed_id: 'test-feed-be-1', active_from: new Date('2026-07-01T00:00:00Z'), active_until: null, source: 'subscription-test', status: 'active' },
+        { did: listDids[1], feed_id: 'test-feed-be-2', active_from: new Date('2026-07-02T00:00:00Z'), active_until: null, source: 'subscription-test', status: 'active' },
+      ]).execute()
+
+      const unauthorizedList = await fetch(`${base}/api/admin/subscribers`)
+      assert(unauthorizedList.status === 401, 'bulk subscriber owner readback must require authentication')
+      const firstPage = await fetch(`${base}/api/admin/subscribers?limit=1`, {
+        headers: { 'api-key': 'subscription-read-test-key' },
+      })
+      const firstPagePayload = await firstPage.json() as any
+      assert(firstPage.status === 200, 'read key must authorize bulk subscriber owner readback')
+      assert(
+        firstPagePayload.subscribers.length === 1 && Number.isInteger(firstPagePayload.next_cursor),
+        'bulk readback must paginate with an integer offset cursor',
+      )
+      const secondPage = await fetch(`${base}/api/admin/subscribers?limit=1&cursor=${firstPagePayload.next_cursor}`, {
+        headers: { 'api-key': 'subscription-read-test-key' },
+      })
+      const secondPagePayload = await secondPage.json() as any
+      assert(secondPage.status === 200, 'subscriber cursor must retrieve the next page')
+      assert(secondPagePayload.subscribers[0].did > firstPagePayload.subscribers[0].did, 'subscriber pages must use stable DID ordering')
+      const invalidCursor = await fetch(`${base}/api/admin/subscribers?cursor=-1`, {
+        headers: { 'api-key': 'subscription-read-test-key' },
+      })
+      assert(invalidCursor.status === 400, 'subscriber cursor must be a non-negative integer offset')
+      const nonIntegerCursor = await fetch(`${base}/api/admin/subscribers?cursor=next`, {
+        headers: { 'api-key': 'subscription-read-test-key' },
+      })
+      assert(nonIntegerCursor.status === 400, 'subscriber cursor must reject non-integer values')
+
+      const assignedList = await fetch(`${base}/api/admin/subscribers?scope=assigned&limit=100`, {
+        headers: { 'api-key': 'subscription-read-test-key' },
+      })
+      const assignedPayload = await assignedList.json() as any
+      const assignedRow = assignedPayload.subscribers.find((row: any) => row.did === listDids[1])
+      assert(assignedList.status === 200 && assignedRow, 'scope filter must return assigned subscribers')
+      assert(
+        assignedRow.assignments.map((row: any) => row.feed).join(',') === 'test-be-1,test-be-2',
+        'bulk readback must return sorted active assignments',
+      )
+      assert(assignedRow.assignments[0].active_from, 'bulk readback must expose truthful assignment timestamps')
+      assert(assignedRow.scope_since === null, 'bulk readback must not fabricate a scope timestamp')
+
+      const defaultFeedList = await fetch(`${base}/api/admin/subscribers?feed=test-be-1&limit=100`, {
+        headers: { 'api-key': 'subscription-read-test-key' },
+      })
+      const defaultFeedPayload = await defaultFeedList.json() as any
+      const defaultFeedDids = defaultFeedPayload.subscribers.map((row: any) => row.did)
+      assert(defaultFeedDids.includes(listDids[0]) && defaultFeedDids.includes(listDids[1]), 'feed filter must include omni and exact access')
+      assert(!defaultFeedDids.includes(listDids[2]), 'feed filter must exclude none scope')
+
+      await db.updateTable('feedgen_ops.feed_catalog')
+        .set({ access_policy_id: 'study-only' })
+        .where('feed_id', '=', 'test-feed-be-2')
+        .execute()
+      const beforeLifecycle = await fetch(`${base}/api/admin/subscribers?feed=test-be-2&limit=100`, {
+        headers: { 'api-key': 'subscription-read-test-key' },
+      }).then((response) => response.json() as Promise<any>)
+      assert(!beforeLifecycle.subscribers.some((row: any) => row.did === listDids[1]), 'study-only feed filter must require active lifecycle membership')
+      await db.insertInto('feedgen_ops.study_registry').values({
+        study_id: 'test-study-be', did: listDids[1], active_from: new Date('2026-07-01T00:00:00Z'), active_until: null, source: 'subscription-test', status: 'active',
+      }).execute()
+      const afterLifecycle = await fetch(`${base}/api/admin/subscribers?feed=test-be-2&limit=100`, {
+        headers: { 'api-key': 'subscription-read-test-key' },
+      }).then((response) => response.json() as Promise<any>)
+      assert(afterLifecycle.subscribers.some((row: any) => row.did === listDids[1]), 'study-only feed filter must include active assigned members')
+      assert(!afterLifecycle.subscribers.some((row: any) => row.did === listDids[0]), 'study-only feed filter must reject omni scope without active lifecycle')
+      await db.insertInto('feedgen_ops.study_registry').values({
+        study_id: 'test-study-be', did: listDids[0], active_from: new Date('2026-07-01T00:00:00Z'), active_until: null, source: 'subscription-test', status: 'active',
+      }).execute()
+      const omniWithLifecycle = await fetch(`${base}/api/admin/subscribers?feed=test-be-2&limit=100`, {
+        headers: { 'api-key': 'subscription-read-test-key' },
+      }).then((response) => response.json() as Promise<any>)
+      assert(omniWithLifecycle.subscribers.some((row: any) => row.did === listDids[0]), 'study-only feed filter must include omni scope with active lifecycle')
+
+      const unknownFeedList = await fetch(`${base}/api/admin/subscribers?feed=not-a-feed`, {
+        headers: { 'api-key': 'subscription-read-test-key' },
+      })
+      assert(unknownFeedList.status === 404, 'unknown feed filters must fail closed')
+      await db.updateTable('feedgen_ops.feed_catalog').set({ enabled: false }).where('feed_id', '=', 'test-feed-be-1').execute()
+      const disabledFeedList = await fetch(`${base}/api/admin/subscribers?feed=test-be-1`, {
+        headers: { 'api-key': 'subscription-read-test-key' },
+      })
+      assert(disabledFeedList.status === 409, 'disabled feed filters must fail closed')
+      await db.updateTable('feedgen_ops.feed_catalog').set({ enabled: true }).where('feed_id', '=', 'test-feed-be-1').execute()
+
+      const readCatalog = await fetch(`${base}/api/admin/feed_catalog?subscribable=true`, {
+        headers: { 'api-key': 'subscription-read-test-key' },
+      })
+      assert(readCatalog.status === 200, 'read key must authorize feed catalog GET')
+      const writeCatalogWithReadKey = await fetch(`${base}/api/admin/feed_catalog`, {
+        method: 'POST', headers: { 'content-type': 'application/json', 'api-key': 'subscription-read-test-key' }, body: '{}',
+      })
+      assert(writeCatalogWithReadKey.status === 401, 'read key must not authorize feed catalog mutation')
+      const planWithReadKey = await fetch(`${base}/api/admin/subscribers/plan`, {
+        method: 'POST', headers: { 'content-type': 'application/json', 'api-key': 'subscription-read-test-key' }, body: JSON.stringify(body),
+      })
+      assert(planWithReadKey.status === 401, 'read key must not authorize subscriber planning')
+      const subscribeWithReadKey = await fetch(`${base}/api/subscribe`, {
+        method: 'POST', headers: { 'content-type': 'application/json', 'api-key': 'subscription-read-test-key' }, body: JSON.stringify(body),
+      })
+      assert(subscribeWithReadKey.status === 401, 'read key must not authorize subscription mutation')
+
       const omniResponse = await fetch(`${base}/api/subscribe`, {
         method: 'POST',
         headers: { 'content-type': 'application/json', 'api-key': 'subscription-admin-test-key' },
-        body: JSON.stringify({ ...body, mode: 'omni' }),
+        body: JSON.stringify({ handle: HANDLE, mode: 'omni' }),
       })
       assert(omniResponse.status === 200, 'administrator must be able to restore omni')
       const adminExact = await fetch(`${base}/api/subscribe`, {
@@ -530,7 +672,7 @@ async function main() {
       const plan = await fetch(`${base}/api/admin/subscribers/plan`, {
         method: 'POST',
         headers: { 'content-type': 'application/json', 'api-key': 'subscription-admin-test-key' },
-        body: JSON.stringify({ ...body, mode: 'omni' }),
+        body: JSON.stringify({ handle: HANDLE, mode: 'omni' }),
       })
       assert(plan.status === 200, 'admin subscriber plan must remain available')
       const beforeRetiredApply = await inspectSubscription(db, identity)
@@ -562,7 +704,7 @@ async function main() {
       await fetch(`${base}/api/subscribe`, {
         method: 'POST',
         headers: { 'content-type': 'application/json', 'api-key': 'subscription-admin-test-key' },
-        body: JSON.stringify({ ...body, mode: 'omni' }),
+        body: JSON.stringify({ handle: HANDLE, mode: 'omni' }),
       })
       assert((await fetch(`${base}/api/subscribe?handle=${encodeURIComponent(HANDLE)}`)).status === 410, 'legacy GET must be retired')
       await new Promise((resolve) => setTimeout(resolve, 1000))
@@ -572,6 +714,9 @@ async function main() {
 
     console.log('PASS: exact-feed migration, modes, isolation, concurrency, and endpoint security')
   } finally {
+    await db.deleteFrom('feedgen_ops.study_registry').where('did', 'in', listDids).execute().catch(() => undefined)
+    await db.deleteFrom('feedgen_ops.subscriber_feed_assignment').where('did', 'in', listDids).execute().catch(() => undefined)
+    await db.deleteFrom('subscriber').where('did', 'in', listDids).execute().catch(() => undefined)
     await db
       .deleteFrom('feedgen_ops.subscriber_feed_assignment')
       .where('did', '=', did)

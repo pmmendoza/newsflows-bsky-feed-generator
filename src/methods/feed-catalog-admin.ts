@@ -14,7 +14,8 @@
  * within 1 s. Removes the only remaining "must SSH and run psql" path
  * for routine catalog edits.
  *
- * Auth: FEEDGEN_ADMIN_API_KEY only (same as /api/update-engagement).
+ * Auth: GET accepts FEEDGEN_READ_API_KEY or FEEDGEN_ADMIN_API_KEY;
+ * dry-run and mutation require FEEDGEN_ADMIN_API_KEY.
  *
  * Out of scope:
  *   - Schema-evolving edits (column adds, etc.) — still require a
@@ -40,6 +41,9 @@ import { isSubscribableFeed } from '../util/subscribable-feed'
 
 const adminWriteAuth: ApiKeyAuthConfig = {
   primaryEnv: ['FEEDGEN_ADMIN_API_KEY'],
+}
+const readAuth: ApiKeyAuthConfig = {
+  primaryEnv: ['FEEDGEN_READ_API_KEY', 'FEEDGEN_ADMIN_API_KEY'],
 }
 
 export const ALLOWED_ACCESS_POLICIES = new Set([
@@ -605,7 +609,7 @@ export default function registerFeedCatalogAdminEndpoint(
   ctx: AppContext,
 ) {
   server.xrpc.router.get('/api/admin/feed_catalog', async (req, res) => {
-    if (!isApiKeyAuthorized(req, adminWriteAuth)) {
+    if (!isApiKeyAuthorized(req, readAuth)) {
       logUnauthorized('/api/admin/feed_catalog')
       return res.status(401).json({ error: 'Unauthorized: Invalid API key' })
     }
@@ -628,7 +632,7 @@ export default function registerFeedCatalogAdminEndpoint(
   })
 
   server.xrpc.router.get('/api/admin/feed_catalog/:rkey', async (req, res) => {
-    if (!isApiKeyAuthorized(req, adminWriteAuth)) {
+    if (!isApiKeyAuthorized(req, readAuth)) {
       logUnauthorized('/api/admin/feed_catalog/:rkey')
       return res.status(401).json({ error: 'Unauthorized: Invalid API key' })
     }

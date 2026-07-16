@@ -54,7 +54,8 @@ yarn publishFeed
 ## Exact-feed subscription
 
 `POST /api/subscribe` is the only live mutation endpoint. It accepts exactly one
-of `identifier`, `handle`, or `did`, plus a feed rkey and mode:
+of `identifier`, `handle`, or `did`, plus a mode. `replace`, `add`, and `remove`
+require one feed rkey; `omni` rejects a feed:
 
 ```bash
 curl -X POST "$FEEDGEN_BASE_URL/api/subscribe" \
@@ -77,6 +78,25 @@ not a second mutation endpoint. `GET /api/subscribe` is retired and returns `410
 The retired GET and admin-apply `410` stubs remain until the separately approved
 survey migration is applied, readback proves no legacy caller remains, and the
 feedgen owner signs off on deletion.
+
+Use feedless `omni` to restore universal enabled-feed access:
+
+```bash
+curl -X POST "$FEEDGEN_BASE_URL/api/subscribe" \
+  -H "api-key: $FEEDGEN_ADMIN_API_KEY" \
+  -H "content-type: application/json" \
+  --data '{"handle":"participant.bsky.social","mode":"omni"}'
+```
+
+`GET /api/admin/subscribers` is the canonical bulk owner readback. It accepts
+`limit` (1–500), a non-negative integer offset `cursor`, and optional `scope`
+or `feed` filters. Results are ordered by DID and include stored handles, scope,
+active assignments with their `active_from` timestamps, and `scope_since: null`
+because the current schema cannot truthfully reconstruct scope-change time.
+Feed filtering applies the same catalog, assignment, and `study-only` lifecycle
+rules as feed retrieval. Use `FEEDGEN_READ_API_KEY`; the administrator key is
+also accepted. Subscriber planning and all mutation endpoints remain
+administrator-only.
 
 This authorizes retrieval of the named NEWSFLOWS feed. It does not save or pin
 the feed in a participant's Bluesky client. See the BSKY root
@@ -123,6 +143,8 @@ bskyops feed apply --dry-run-json <packet.json> --environment <target> --confirm
 Do not hand-edit feed rows in Postgres. Existing-row changes must use
 `if_current` stale-state protection and readback; new active feed rows remain
 feedgen-owner insert tasks with publication and health assumption checks.
+Catalog `GET` routes accept `FEEDGEN_READ_API_KEY` or the administrator key;
+catalog dry-run and apply routes remain administrator-only.
 
 
 ## Build Image

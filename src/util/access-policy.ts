@@ -25,6 +25,7 @@
  * Migration: dev/storage/migrations/013_access_policy_check_constraint.sql
  */
 
+import { sql } from 'kysely'
 import { Database } from '../db'
 
 export type AccessPolicyId = 'subscriber-default' | 'study-only' | 'disabled'
@@ -40,6 +41,38 @@ export type FeedCatalogPolicyRow = {
 export type AccessVerdict = {
   allowed: boolean
   reason: string
+}
+
+export type FeedAccessState = {
+  scope: 'omni' | 'assigned' | 'none' | null
+  hasActiveAssignment: boolean
+  activeStudy: boolean
+}
+
+export function accessVerdictForState(
+  row: FeedCatalogPolicyRow | null,
+  state: FeedAccessState,
+): AccessVerdict {
+  if (!row) return { allowed: false, reason: 'no-catalog-row' }
+  if (!row.enabled || row.retired_at) return { allowed: false, reason: 'feed-disabled' }
+  const hasFeedAccess = state.scope === 'omni' || (
+    state.scope === 'assigned' && state.hasActiveAssignment
+  )
+  switch (row.access_policy_id) {
+    case 'disabled':
+      return { allowed: false, reason: 'disabled' }
+    case 'subscriber-default':
+      return hasFeedAccess
+        ? { allowed: true, reason: 'subscriber-default' }
+        : { allowed: false, reason: 'subscriber-default:not-assigned' }
+    case 'study-only':
+      if (!row.study_id) return { allowed: false, reason: 'study-only:misconfigured' }
+      return hasFeedAccess && state.activeStudy
+        ? { allowed: true, reason: `study-only:${row.study_id}` }
+        : { allowed: false, reason: `study-only:${row.study_id}:not-active-or-assigned` }
+    default:
+      return { allowed: false, reason: 'unknown-policy' }
+  }
 }
 
 const CACHE_TTL_MS = 5 * 60 * 1000
@@ -105,66 +138,43 @@ async function readPolicyRow(
   return row
 }
 
-async function readSubscriberScope(
+export async function readFeedAccessStates(
   db: Database,
-  did: string,
-): Promise<'omni' | 'assigned' | 'none' | null> {
-  if (!did) return null
-  const result = await db
-    .selectFrom('subscriber')
-    .select('access_scope')
-    .where('did', '=', did)
-    .executeTakeFirst()
-  return result?.access_scope ?? null
-}
-
-async function hasActiveFeedAssignment(
-  db: Database,
-  did: string,
-  feedId: string,
-): Promise<boolean> {
-  const result = await db
-    .selectFrom('feedgen_ops.subscriber_feed_assignment')
-    .select('did')
-    .where('did', '=', did)
-    .where('feed_id', '=', feedId)
-    .where('active_until', 'is', null)
-    .executeTakeFirst()
-  return Boolean(result)
-}
-
-async function hasFeedAccess(
-  db: Database,
-  did: string,
-  feedId: string,
-): Promise<boolean> {
-  const scope = await readSubscriberScope(db, did)
-  if (scope === 'omni') return true
-  if (scope !== 'assigned') return false
-  return hasActiveFeedAssignment(db, did, feedId)
-}
-
-async function isInActiveStudyRegistry(
-  db: Database,
-  did: string,
-  studyId: string,
-): Promise<boolean> {
-  if (!did || !studyId) return false
-  const result = await db
-    .selectFrom('feedgen_ops.study_registry')
-    .select('did')
-    .where('did', '=', did)
-    .where('study_id', '=', studyId)
-    .where((eb) => eb.not(eb('status', 'like', '%:stop_tracking')))
-    .where('active_from', '<=', new Date())
-    .where((eb) =>
-      eb.or([
-        eb('active_until', 'is', null),
-        eb('active_until', '>', new Date()),
-      ]),
-    )
-    .executeTakeFirst()
-  return Boolean(result)
+  row: FeedCatalogPolicyRow,
+  dids: string[],
+): Promise<Map<string, FeedAccessState>> {
+  if (dids.length === 0) return new Map()
+  const now = new Date()
+  const activeStudy = row.access_policy_id === 'study-only' && row.study_id
+    ? sql<boolean>`EXISTS (
+        SELECT 1 FROM feedgen_ops.study_registry registry
+        WHERE registry.did = subscriber.did
+          AND registry.study_id = ${row.study_id}
+          AND registry.status NOT LIKE ${'%:stop_tracking'}
+          AND registry.active_from <= ${now}
+          AND (registry.active_until IS NULL OR registry.active_until > ${now})
+      )`
+    : sql<boolean>`false`
+  const states = await db
+    .selectFrom('subscriber as subscriber')
+    .select([
+      'subscriber.did',
+      'subscriber.access_scope',
+      sql<boolean>`EXISTS (
+        SELECT 1 FROM feedgen_ops.subscriber_feed_assignment assignment
+        WHERE assignment.did = subscriber.did
+          AND assignment.feed_id = ${row.feed_id}
+          AND assignment.active_until IS NULL
+      )`.as('has_active_assignment'),
+      activeStudy.as('active_study'),
+    ])
+    .where('subscriber.did', 'in', dids)
+    .execute()
+  return new Map(states.map((state) => [state.did, {
+    scope: state.access_scope ?? 'omni',
+    hasActiveAssignment: state.has_active_assignment,
+    activeStudy: state.active_study,
+  }]))
 }
 
 /**
@@ -182,44 +192,26 @@ export async function evaluateAccessPolicy(
   requesterDid: string,
 ): Promise<AccessVerdict> {
   const row = await readPolicyRow(db, rkey)
-  if (!row) {
-    return { allowed: false, reason: 'no-catalog-row' }
-  }
-  if (!row.enabled || row.retired_at) {
-    return { allowed: false, reason: 'feed-disabled' }
+  if (!row || !row.enabled || row.retired_at || row.access_policy_id === 'disabled') {
+    return accessVerdictForState(row, {
+      scope: null,
+      hasActiveAssignment: false,
+      activeStudy: false,
+    })
   }
   try {
-    switch (row.access_policy_id) {
-      case 'disabled':
-        return { allowed: false, reason: 'disabled' }
-      case 'subscriber-default': {
-        const ok = await hasFeedAccess(db, requesterDid, row.feed_id)
-        return ok
-          ? { allowed: true, reason: 'subscriber-default' }
-          : { allowed: false, reason: 'subscriber-default:not-assigned' }
-      }
-      case 'study-only': {
-        if (!row.study_id) {
-          console.warn(
-            `[${new Date().toISOString()}] - access-policy: rkey=${rkey} has access_policy_id='study-only' but no study_id; fail-closed`,
-          )
-          return { allowed: false, reason: 'study-only:misconfigured' }
-        }
-        const [feedAccess, activeStudy] = await Promise.all([
-          hasFeedAccess(db, requesterDid, row.feed_id),
-          isInActiveStudyRegistry(db, requesterDid, row.study_id),
-        ])
-        return feedAccess && activeStudy
-          ? { allowed: true, reason: `study-only:${row.study_id}` }
-          : { allowed: false, reason: `study-only:${row.study_id}:not-active-or-assigned` }
-      }
-      default: {
-        console.warn(
-          `[${new Date().toISOString()}] - access-policy: rkey=${rkey} has unknown access_policy_id=${row.access_policy_id}; fail-closed`,
-        )
-        return { allowed: false, reason: 'unknown-policy' }
-      }
+    const states = await readFeedAccessStates(db, row, [requesterDid])
+    const verdict = accessVerdictForState(row, states.get(requesterDid) ?? {
+      scope: null,
+      hasActiveAssignment: false,
+      activeStudy: false,
+    })
+    if (verdict.reason === 'study-only:misconfigured' || verdict.reason === 'unknown-policy') {
+      console.warn(
+        `[${new Date().toISOString()}] - access-policy: rkey=${rkey} failed closed; reason=${verdict.reason}`,
+      )
     }
+    return verdict
   } catch (err) {
     console.warn(
       `[${new Date().toISOString()}] - access-policy: access-state read failed for rkey=${rkey}; error=${

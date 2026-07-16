@@ -32,6 +32,17 @@ function fakeDb(state: State): any {
           if (target === 'assignment') return state.assignment ? { did: 'did:plc:user' } : undefined
           return state.study ? { did: 'did:plc:user' } : undefined
         },
+        async execute() {
+          if (state.fail === 'subscriber' || state.fail === 'assignment' || state.fail === 'study') {
+            throw new Error(`simulated ${state.fail} failure`)
+          }
+          return state.scope ? [{
+            did: 'did:plc:user',
+            access_scope: state.scope,
+            has_active_assignment: Boolean(state.assignment),
+            active_study: Boolean(state.study),
+          }] : []
+        },
       }
     },
   }
@@ -65,6 +76,8 @@ async function main() {
   await check('study-only requires assignment and lifecycle', { catalog: studyOnly, scope: 'assigned', assignment: true, study: true }, true, 'study-only:study-be')
   await check('study-only denies missing lifecycle', { catalog: studyOnly, scope: 'assigned', assignment: true }, false, 'not-active-or-assigned')
   await check('study-only denies missing assignment', { catalog: studyOnly, scope: 'assigned', study: true }, false, 'not-active-or-assigned')
+  await check('study-only rejects missing study id', { catalog: { ...studyOnly, study_id: null }, scope: 'omni', study: true }, false, 'misconfigured')
+  await check('disabled policy denies omni', { catalog: { ...subscriberDefault, access_policy_id: 'disabled' }, scope: 'omni' }, false, 'disabled')
   await check('disabled feed is denied', { catalog: { ...subscriberDefault, enabled: false }, scope: 'omni' }, false, 'feed-disabled')
   await check('retired feed is denied', { catalog: { ...subscriberDefault, retired_at: new Date() }, scope: 'omni' }, false, 'feed-disabled')
   await check('missing catalog fails closed', { catalog: null, scope: 'omni' }, false, 'no-catalog-row')
