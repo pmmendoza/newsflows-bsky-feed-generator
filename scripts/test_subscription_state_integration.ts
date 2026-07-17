@@ -88,6 +88,13 @@ async function main() {
   assert(r.changed === true, '1: first omni must be a change')
   assert((await state()).scope === 'omni', '1: scope omni')
 
+  // 1b. First-time state:none must PERSIST none, not leave the bootstrap omni
+  //     row (deploy red-team BLOCKER 1).
+  await clean()
+  const rnone = await setSubscription(ctx, { ...ident, state: { scope: 'none' } }, true)
+  assert((await state()).scope === 'none', '1b: first-time none must persist none, not omni')
+  assert(rnone.access_scope === 'none', '1b: response scope none matches persisted')
+
   // 2. First-time enrollment with expected none/[] must succeed, not 409 (HIGH 1).
   await clean()
   r = await setSubscription(

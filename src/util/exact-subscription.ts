@@ -543,25 +543,33 @@ export async function setSubscription(
       .returning('did')
       .executeTakeFirst()
     await trx.selectFrom('subscriber').select('did').where('did', '=', identity.did).forUpdate().executeTakeFirst()
-    // A freshly-inserted subscriber's logical pre-state is none/[], not the
-    // bootstrap omni row — so CAS and change-detection see a first enrollment.
+    // Two views of "before":
+    //  - PHYSICAL: what the row actually holds now, incl. the bootstrap omni
+    //    row a fresh insert just created. Drives whether we must write, so a
+    //    first-time state:none normalizes the bootstrap omni row to none.
+    //  - LOGICAL: a freshly-inserted subscriber is none/[] (never subscribed),
+    //    used for CAS and for whether the participant's effective access
+    //    changed (follows trigger + the reported `changed`).
     const observed = await inspectSubscription(trx, identity)
-    const preScope: AccessScope = inserted ? 'none' : observed.access_scope
-    const preAssignments = inserted ? [] : observed.assignments
-    if (expected && !statesEqual(preScope, currentFeeds(preAssignments), expected)) {
+    const physScope: AccessScope = observed.access_scope
+    const physAssignments = observed.assignments
+    const logicalScope: AccessScope = inserted ? 'none' : observed.access_scope
+    const logicalAssignments = inserted ? [] : observed.assignments
+    if (expected && !statesEqual(logicalScope, currentFeeds(logicalAssignments), expected)) {
       throw new SubscriptionError(409, 'stale_state', 'current state does not match expected; re-read and retry')
     }
     const nextAssignments =
       desired.scope === 'assigned' ? await resolveDesiredAssignments(trx, desired.feeds, true) : []
     const next = { scope: desired.scope, assignments: nextAssignments }
-    const txChanged = changed(preScope, preAssignments, next.scope, next.assignments)
-    if (txChanged) {
-      await applyProjectedState(trx, identity, closeMode(next.scope), source, preAssignments, next)
+    const physChanged = changed(physScope, physAssignments, next.scope, next.assignments)
+    if (physChanged) {
+      await applyProjectedState(trx, identity, closeMode(next.scope), source, physAssignments, next)
     }
-    return { changed: txChanged, scope: next.scope, assignments: next.assignments }
+    const logicalChanged = changed(logicalScope, logicalAssignments, next.scope, next.assignments)
+    return { changed: physChanged || logicalChanged, followsRelevant: logicalChanged, scope: next.scope, assignments: next.assignments }
   })
 
-  if (result.changed && updateFollows && result.scope !== 'none') {
+  if (result.followsRelevant && updateFollows && result.scope !== 'none') {
     triggerFollowsUpdateForSubscriber(ctx.db, identity.did)
   }
   return {
