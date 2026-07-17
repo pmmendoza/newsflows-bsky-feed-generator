@@ -239,14 +239,17 @@ export type PostPolitician = {
   classified_at: string | Date
 }
 
-// BSR-owned politician-or-party eligibility surface (mission D4). Feedgen
-// consumes only `uri` + `eligible`; `party_ids` is party evidence for the
-// ranker/analysis and is not read by the serving filter.
+// BSR-owned politician-or-party eligibility surface (mission D4 fixed seam:
+// uri TEXT PK, eligible BOOLEAN NOT NULL, party_ids JSONB, updated_at TEXT).
+// Feedgen consumes only `uri` + `eligible`; `party_ids` is BSR/analysis party
+// evidence (nullable — a politician-only post may resolve no party) and is not
+// read by the serving filter. Any further columns are BSR-owner-defined and
+// not modelled here (feedgen never reads them).
 export type PostPoliticalEligibility = {
   uri: string
   eligible: boolean
-  party_ids: any
-  updated_at: string | Date
+  party_ids: string[] | null
+  updated_at: string
 }
 
 export type ServedPostEvent = {

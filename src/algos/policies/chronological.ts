@@ -20,7 +20,10 @@ export function publisherQueryChronological(
 ) {
   const base = db
     .selectFrom('post')
-    .selectAll()
+    // selectAll('post') not selectAll(): the eligibility LEFT JOIN adds a
+    // `pe.uri` column; a bare `*` projects both and node-postgres keeps the
+    // LAST, so pe.uri (NULL on fail-open rows) would clobber post.uri.
+    .selectAll('post')
     .where('author', '=', publisherDid)
     .where('post.indexedAt', '>=', timeLimit)
   return applyPoliticianFilterIfEnabled(base, shortname)
@@ -41,7 +44,7 @@ export function followsQueryChronological(
 ) {
   const base = db
     .selectFrom('post')
-    .selectAll()
+    .selectAll('post') // see publisher leg: avoid pe.uri clobbering post.uri
     .where('author', '!=', publisherDid)
     .where('post.indexedAt', '>=', timeLimit)
     .where((eb) => eb('author', 'in', requesterFollows))

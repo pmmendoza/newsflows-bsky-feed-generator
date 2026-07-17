@@ -32,8 +32,12 @@ services:
       FEEDGEN_SUBSCRIPTION_ENDPOINT: ${FEEDGEN_SUBSCRIPTION_ENDPOINT:-wss://bsky.network}
       FEEDGEN_HOSTNAME: ${FEEDGEN_HOSTNAME:-example.com}
       FEEDGEN_BUILD_SHA: ${FEEDGEN_BUILD_SHA:-""}
+      # Local dev deliberately keeps the BE politician-or-party filter OFF:
+      # a local DB has no `ranker_prod.post_political_eligibility` table, and
+      # an active filter would error the LEFT JOIN. Production defaults ON
+      # (kill-switch = set this to false). MAX_AGE_HOURS env retired: the
+      # eligibility surface exposes only uri+eligible (no freshness cutoff).
       FEEDGEN_BE_POLITICIAN_FILTER: ${FEEDGEN_BE_POLITICIAN_FILTER:-"false"}
-      FEEDGEN_BE_POLITICIAN_FILTER_MAX_AGE_HOURS: ${FEEDGEN_BE_POLITICIAN_FILTER_MAX_AGE_HOURS:-168}
       FEEDGEN_DESCRIBE_FROM_CATALOG: ${FEEDGEN_DESCRIBE_FROM_CATALOG:-"false"}
       FEEDGEN_PUBLISHER_DID: ${FEEDGEN_PUBLISHER_DID}
       NEWSBOT_CZ_DID: ${NEWSBOT_CZ_DID}

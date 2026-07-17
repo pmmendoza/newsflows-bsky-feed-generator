@@ -11,6 +11,18 @@ import {
   isPoliticianFilterRouted,
   politicianFilterStartupSummary,
 } from '../src/algos/politician-filter'
+import {
+  publisherQueryChronological,
+  followsQueryChronological,
+} from '../src/algos/policies/chronological'
+import {
+  publisherQueryEngagement,
+  followsQueryEngagement,
+} from '../src/algos/policies/engagement-sorted'
+import {
+  publisherQueryRankerPriority,
+  followsQueryRankerPriority,
+} from '../src/algos/policies/ranker-priority'
 
 let failed = 0
 let passed = 0
@@ -117,6 +129,28 @@ withEnv({ FEEDGEN_BE_POLITICIAN_FILTER: 'true' }, () => {
 withEnv({ FEEDGEN_BE_POLITICIAN_FILTER: 'false' }, () => {
   const killed = applyPoliticianFilterIfEnabled(basePostQuery(), 'newsflow-be-k').compile().sql
   assert(!/post_political_eligibility/i.test(killed), 'kill-switch: BE query served UNFILTERED (no join)')
+})
+
+// --- projection guard: every filtered policy must project post.* only --------
+// The eligibility LEFT JOIN adds a `pe.uri` column. A bare `select *` projects
+// both and node-postgres keeps the LAST, so pe.uri (NULL on fail-open rows)
+// clobbers post.uri and feed-builder serves broken URIs. All BE-routed policy
+// legs must compile to `select "post".*`, never a bare `select *`.
+console.log('projection guard (no pe.uri clobber)')
+withEnv({ FEEDGEN_BE_POLITICIAN_FILTER: 'true' }, () => {
+  const legs: Array<[string, any]> = [
+    ['chronological/publisher', publisherQueryChronological(db, '2026-06-26T00:00:00.000Z', ['did:x'], 0, 10, 'did:pub', 'newsflow-be-k')],
+    ['chronological/follows', followsQueryChronological(db, '2026-06-26T00:00:00.000Z', ['did:x'], 0, 10, 'did:pub', 'newsflow-be-k')],
+    ['engagement/publisher', publisherQueryEngagement(db, '2026-06-26T00:00:00.000Z', ['did:x'], 0, 10, 'did:pub', 'newsflow-be-k')],
+    ['engagement/follows', followsQueryEngagement(db, '2026-06-26T00:00:00.000Z', ['did:x'], 0, 10, 'did:pub', 'newsflow-be-k')],
+    ['ranker-priority/publisher', publisherQueryRankerPriority(db, '2026-06-26T00:00:00.000Z', ['did:x'], 0, 10, 'did:pub', 'newsflow-be-k')],
+    ['ranker-priority/follows', followsQueryRankerPriority(db, '2026-06-26T00:00:00.000Z', ['did:x'], 0, 10, 'did:pub', 'newsflow-be-k')],
+  ]
+  for (const [label, q] of legs) {
+    const s = q.compile().sql
+    assert(/select "post"\.\*/i.test(s), `${label} projects post.*`)
+    assert(!/select \*/i.test(s), `${label} has no bare select *`)
+  }
 })
 
 console.log(`Summary: ${passed} passed, ${failed} failed`)
