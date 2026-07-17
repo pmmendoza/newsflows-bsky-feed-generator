@@ -14,6 +14,7 @@ export type DatabaseSchema = {
   'feedgen_ops.subscriber_feed_assignment': SubscriberFeedAssignment
   'ranker_prod.feed_current_priority': FeedCurrentPriority
   'ranker_prod.post_politician': PostPolitician
+  'ranker_prod.post_political_eligibility': PostPoliticalEligibility
   'research_archive.post_snapshot': PostSnapshot
   'research_archive.post_snapshot_capture_source': PostSnapshotCaptureSource
   'research_archive.request_event': RequestEvent
@@ -236,6 +237,16 @@ export type PostPolitician = {
   classifier_version: string
   roster_version: string
   classified_at: string | Date
+}
+
+// BSR-owned politician-or-party eligibility surface (mission D4). Feedgen
+// consumes only `uri` + `eligible`; `party_ids` is party evidence for the
+// ranker/analysis and is not read by the serving filter.
+export type PostPoliticalEligibility = {
+  uri: string
+  eligible: boolean
+  party_ids: any
+  updated_at: string | Date
 }
 
 export type ServedPostEvent = {

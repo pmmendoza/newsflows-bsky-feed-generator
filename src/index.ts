@@ -1,8 +1,10 @@
 import dotenv from 'dotenv'
 import FeedGenerator from './server'
+import { politicianFilterStartupSummary } from './algos/politician-filter'
 
 const run = async () => {
   dotenv.config()
+  console.log(`[${new Date().toISOString()}] - ${politicianFilterStartupSummary()}`)
   const hostname = maybeStr(process.env.FEEDGEN_HOSTNAME) ?? 'example.com'
   const serviceDid =
     maybeStr(process.env.FEEDGEN_SERVICE_DID) ?? `did:web:${hostname}`

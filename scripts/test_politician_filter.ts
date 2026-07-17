@@ -8,7 +8,8 @@ import {
 import {
   applyPoliticianFilterIfEnabled,
   isPoliticianFilterEnabled,
-  politicianFilterFreshnessCutoffIso,
+  isPoliticianFilterRouted,
+  politicianFilterStartupSummary,
 } from '../src/algos/politician-filter'
 
 let failed = 0
@@ -41,30 +42,41 @@ function withEnv<T>(env: Record<string, string | undefined>, fn: () => T): T {
   }
 }
 
-console.log('BE politician filter env routing')
-withEnv({ FEEDGEN_BE_POLITICIAN_FILTER: 'true' }, () => {
-  assert(isPoliticianFilterEnabled('newsflow-be-1') === true, 'BE variant 1 enabled')
-  assert(isPoliticianFilterEnabled('newsflow-be-2') === true, 'BE variant 2 enabled')
-  assert(isPoliticianFilterEnabled('newsflow-be-3') === true, 'BE variant 3 enabled')
-  assert(isPoliticianFilterEnabled('newsflow-nl-1') === false, 'NL unchanged')
-  assert(isPoliticianFilterEnabled('newsflow-fr-2') === false, 'FR unchanged')
-})
+// --- routing (regex): be-(k|m|[123]) routed; be-4 and non-BE untouched --------
+console.log('BE politician-or-party filter routing')
+for (const rkey of ['newsflow-be-k', 'newsflow-be-m', 'newsflow-be-1', 'newsflow-be-2', 'newsflow-be-3']) {
+  assert(isPoliticianFilterRouted(rkey) === true, `${rkey} routed`)
+}
+for (const rkey of ['newsflow-be-4', 'newsflow-nl-1', 'newsflow-fr-2', 'newsflow-cz-3', 'newsflow-ir-5', 'newsflow-be-t2', '']) {
+  assert(isPoliticianFilterRouted(rkey) === false, `${rkey || '(empty)'} not routed`)
+}
 
+// --- kill-switch: default on; explicit falsy disables entirely ----------------
+console.log('kill-switch (FEEDGEN_BE_POLITICIAN_FILTER)')
 withEnv({ FEEDGEN_BE_POLITICIAN_FILTER: undefined }, () => {
-  assert(isPoliticianFilterEnabled('newsflow-be-1') === false, 'filter defaults off')
+  assert(isPoliticianFilterEnabled('newsflow-be-k') === true, 'default (unset) enabled for BE-K')
+  assert(isPoliticianFilterEnabled('newsflow-nl-1') === false, 'never enabled for non-BE even by default')
 })
-
-console.log('freshness cutoff')
-withEnv({ FEEDGEN_BE_POLITICIAN_FILTER_MAX_AGE_HOURS: '12' }, () => {
-  const now = new Date('2026-06-26T12:00:00.000Z')
-  assert(
-    politicianFilterFreshnessCutoffIso(now) === '2026-06-26T00:00:00.000Z',
-    '12h freshness env honoured',
-    politicianFilterFreshnessCutoffIso(now),
-  )
+withEnv({ FEEDGEN_BE_POLITICIAN_FILTER: 'true' }, () => {
+  assert(isPoliticianFilterEnabled('newsflow-be-m') === true, '=true enabled for BE-M')
 })
+for (const off of ['false', '0', 'no', 'off', 'FALSE', ' Off ']) {
+  withEnv({ FEEDGEN_BE_POLITICIAN_FILTER: off }, () => {
+    assert(isPoliticianFilterEnabled('newsflow-be-1') === false, `kill-switch '${off}' disables filter`)
+  })
+}
 
-console.log('query shape')
+// --- startup summary reflects state -------------------------------------------
+console.log('startup summary')
+withEnv({ FEEDGEN_BE_POLITICIAN_FILTER: undefined }, () =>
+  assert(/ENABLED/.test(politicianFilterStartupSummary()), 'summary says ENABLED when active'),
+)
+withEnv({ FEEDGEN_BE_POLITICIAN_FILTER: 'false' }, () =>
+  assert(/DISABLED/.test(politicianFilterStartupSummary()), 'summary says DISABLED under kill-switch'),
+)
+
+// --- query shape: OR semantics + fail-open, on the new BSR surface ------------
+console.log('query shape (OR semantics + fail-open)')
 const db = new Kysely<any>({
   dialect: {
     createAdapter: () => new PostgresAdapter(),
@@ -82,11 +94,29 @@ function basePostQuery() {
 }
 
 withEnv({ FEEDGEN_BE_POLITICIAN_FILTER: 'true' }, () => {
-  const beSql = applyPoliticianFilterIfEnabled(basePostQuery(), 'newsflow-be-1').compile().sql
+  const beSql = applyPoliticianFilterIfEnabled(basePostQuery(), 'newsflow-be-k').compile().sql
+  // Joins the new eligibility surface (consumes uri + eligible only).
+  assert(
+    /left join "ranker_prod"\."post_political_eligibility"/i.test(beSql),
+    'BE query joins post_political_eligibility',
+  )
+  assert(!/post_politician/i.test(beSql), 'BE query no longer joins the old post_politician table')
+  // A recognized politician-only post and a recognized party-only post both
+  // arrive as eligible=true from BSR, so the single OR clause admits both.
+  assert(/"pe"\."eligible" = /i.test(beSql), 'OR semantics: eligible=true rows are kept')
+  // no-row post (surface missing/behind) is kept — fail-open.
+  assert(/"pe"\."uri" is null/i.test(beSql), 'fail-open: rows with no eligibility row are kept')
+  // "neither" (recognized nothing) arrives as eligible=false and is the only
+  // present-row case the WHERE excludes; feedgen reads no party/politician cols.
+  assert(!/party_ids|has_party|has_politician/i.test(beSql), 'feedgen reads only uri + eligible')
+
   const nlSql = applyPoliticianFilterIfEnabled(basePostQuery(), 'newsflow-nl-1').compile().sql
-  assert(/left join "ranker_prod"\."post_politician"/i.test(beSql), 'BE query joins post_politician')
-  assert(/"pp"\."post_uri" is null/i.test(beSql), 'BE query keeps missing/stale rows fail-open')
-  assert(!/post_politician/i.test(nlSql), 'NL query has no politician join')
+  assert(!/post_political_eligibility/i.test(nlSql), 'non-BE query has no eligibility join')
+})
+
+withEnv({ FEEDGEN_BE_POLITICIAN_FILTER: 'false' }, () => {
+  const killed = applyPoliticianFilterIfEnabled(basePostQuery(), 'newsflow-be-k').compile().sql
+  assert(!/post_political_eligibility/i.test(killed), 'kill-switch: BE query served UNFILTERED (no join)')
 })
 
 console.log(`Summary: ${passed} passed, ${failed} failed`)
