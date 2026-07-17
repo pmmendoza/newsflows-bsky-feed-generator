@@ -6,6 +6,8 @@ import {
   inspectSubscription,
   resolveSubscriptionIdentity,
   resolveSubscriptionFeed,
+  setSubscription,
+  SetSubscriptionInput,
   SubscriptionError,
   SubscriptionInput,
 } from '../util/exact-subscription'
@@ -167,6 +169,11 @@ export default function registerSubscriberAdminEndpoints(server: Server, ctx: Ap
     const endpoint = '/api/admin/subscribers/plan'
     if (!isApiKeyAuthorized(req, adminAuth)) return unauthorized(res, endpoint)
     try {
+      const body = req.body as SetSubscriptionInput
+      // Atomic desired-state preview (apply=false) when a state is supplied.
+      if (body.state !== undefined) {
+        return res.json(await setSubscription(ctx, body, false))
+      }
       return res.json(await executeSubscription(ctx, normalize(req.body as LegacyAdminInput), false))
     } catch (error) {
       return endpointError(res, error)

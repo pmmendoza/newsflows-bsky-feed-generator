@@ -7,6 +7,8 @@ import {
   executeSubscription,
   parseSubscriptionMode,
   resolveSubscriptionIdentity,
+  setSubscription,
+  SetSubscriptionInput,
   SubscriptionError,
   SubscriptionInput,
 } from '../util/exact-subscription'
@@ -104,13 +106,18 @@ export default function registerSubscribeEndpoint(server: Server, ctx: AppContex
 
   server.xrpc.router.post('/api/subscribe', async (req, res) => {
     try {
-      const input = req.body as SubscriptionInput
+      const input = req.body as SetSubscriptionInput
       const admin = isApiKeyAuthorized(req, adminAuth)
-      parseSubscriptionMode(input.mode)
       const boundDid = admin ? undefined : tokenSubject(req)
       const trustedInput = admin
         ? input
         : { ...input, source: 'subscription-token' }
+      // Canonical atomic desired-state path (FEEDGEN-SUBSCRIBE-ATOMIC).
+      if (input.state !== undefined) {
+        return res.json(await setSubscription(ctx, trustedInput, true, true, boundDid))
+      }
+      // Legacy mode-based shim (deprecated): add/remove/replace/omni.
+      parseSubscriptionMode(input.mode)
       return res.json(await executeSubscription(ctx, trustedInput, true, true, boundDid))
     } catch (error) {
       return endpointError(res, error)

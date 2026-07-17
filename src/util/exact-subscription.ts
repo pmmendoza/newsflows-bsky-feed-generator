@@ -357,3 +357,148 @@ export async function executeSubscription(
     apply_performed: apply,
   }
 }
+
+// ---------------------------------------------------------------------------
+// Atomic desired-state subscription (FEEDGEN-SUBSCRIBE-ATOMIC).
+//
+// One operation sets the subscriber's ABSOLUTE desired state — no add/remove/
+// replace/omni verbs. Naturally idempotent (re-applying the same state is a
+// no-op) with an optional expected-state CAS guard for concurrency. Reuses the
+// proven applyProjectedState writer; the legacy mode API remains as a shim.
+// ---------------------------------------------------------------------------
+
+export type DesiredState = { scope: AccessScope; feeds: string[] }
+
+export type SetSubscriptionInput = SubscriptionInput & {
+  state?: { scope?: unknown; feeds?: unknown }
+  expected?: { scope?: unknown; feeds?: unknown } | null
+}
+
+export function parseDesiredState(input: SetSubscriptionInput): DesiredState {
+  const raw = input.state
+  if (!raw || typeof raw !== 'object') {
+    throw new SubscriptionError(400, 'invalid_state', 'state is required: {scope, feeds?}')
+  }
+  const scope = raw.scope
+  if (scope !== 'omni' && scope !== 'none' && scope !== 'assigned') {
+    throw new SubscriptionError(400, 'invalid_state', 'state.scope must be omni, none, or assigned')
+  }
+  if (scope === 'assigned') {
+    const feeds = raw.feeds
+    if (!Array.isArray(feeds) || feeds.length === 0) {
+      throw new SubscriptionError(400, 'invalid_state', 'state.scope=assigned requires a non-empty feeds list')
+    }
+    const cleaned = Array.from(new Set(
+      feeds.map((f) => (typeof f === 'string' ? f.trim() : '')).filter((f) => f.length > 0),
+    ))
+    if (!cleaned.length) {
+      throw new SubscriptionError(400, 'invalid_state', 'state.feeds must contain at least one feed rkey')
+    }
+    return { scope, feeds: cleaned }
+  }
+  if (Array.isArray(raw.feeds) && raw.feeds.length > 0) {
+    throw new SubscriptionError(400, 'invalid_state', `state.scope=${scope} does not accept feeds`)
+  }
+  return { scope, feeds: [] }
+}
+
+async function resolveDesiredAssignments(db: Db, rkeys: string[]): Promise<AssignmentView[]> {
+  const seen = new Set<string>()
+  const out: AssignmentView[] = []
+  for (const rkey of rkeys) {
+    const feed = await db
+      .selectFrom('feedgen_ops.feed_catalog')
+      .selectAll()
+      .where('rkey', '=', rkey)
+      .executeTakeFirst()
+    if (!feed) throw new SubscriptionError(404, 'feed_not_found', `unknown feed: ${rkey}`)
+    if (!isSubscribableFeed(feed)) {
+      throw new SubscriptionError(409, 'feed_disabled', `feed is disabled: ${rkey}`)
+    }
+    if (seen.has(feed.feed_id)) continue
+    seen.add(feed.feed_id)
+    out.push({ feed_id: feed.feed_id, feed: feed.rkey, study_id: feed.study_id ?? null })
+  }
+  return out.sort((a, b) => a.feed.localeCompare(b.feed))
+}
+
+function stateSignature(scope: AccessScope, assignments: AssignmentView[]): string {
+  return `${scope}|${assignments.map((a) => a.feed).sort().join(',')}`
+}
+
+// Close-row status for the temporal audit trail, per the desired scope
+// (constraint allows removed/replaced/omni on closed rows).
+function closeMode(scope: AccessScope): SubscriptionMode {
+  return scope === 'omni' ? 'omni' : scope === 'none' ? 'remove' : 'replace'
+}
+
+export async function setSubscription(
+  ctx: AppContext,
+  input: SetSubscriptionInput,
+  apply: boolean,
+  updateFollows = true,
+  boundDid?: string,
+): Promise<SubscriptionResult> {
+  const identity = await resolveSubscriptionIdentity(input)
+  if (boundDid && boundDid !== identity.did) {
+    throw new SubscriptionError(403, 'identity_mismatch', 'subscription identity does not match token subject')
+  }
+  const desired = parseDesiredState(input)
+  const source = input.source?.trim() || 'feedgen-subscription-api'
+
+  const beforeState = await inspectSubscription(ctx.db, identity)
+  const nextAssignments = desired.scope === 'assigned'
+    ? await resolveDesiredAssignments(ctx.db, desired.feeds)
+    : []
+  const next = { scope: desired.scope, assignments: nextAssignments }
+
+  const expected = input.expected
+  const wantExpected = expected !== undefined && expected !== null
+  const expectedSig = wantExpected
+    ? `${expected.scope}|${(Array.isArray(expected.feeds) ? expected.feeds : []).slice().sort().join(',')}`
+    : null
+
+  let didChange = changed(beforeState.access_scope, beforeState.assignments, next.scope, next.assignments)
+
+  if (apply) {
+    didChange = await ctx.db.transaction().execute(async (trx) => {
+      await trx
+        .insertInto('subscriber')
+        .values({ handle: identity.handle, did: identity.did, access_scope: 'omni' })
+        .onConflict((oc) => oc.column('did').doNothing())
+        .returning('did')
+        .executeTakeFirst()
+      await trx.selectFrom('subscriber').select('did').where('did', '=', identity.did).forUpdate().executeTakeFirst()
+      const current = await inspectSubscription(trx, identity)
+      if (wantExpected && stateSignature(current.access_scope, current.assignments) !== expectedSig) {
+        throw new SubscriptionError(409, 'stale_state', 'current state does not match expected; re-read and retry')
+      }
+      const txChanged = changed(current.access_scope, current.assignments, next.scope, next.assignments)
+      if (!txChanged) return false
+      await applyProjectedState(trx, identity, closeMode(next.scope), source, current.assignments, next)
+      return true
+    })
+    if (didChange && updateFollows && next.scope !== 'none') {
+      triggerFollowsUpdateForSubscriber(ctx.db, identity.did)
+    }
+  }
+
+  const finalState = apply
+    ? await inspectSubscription(ctx.db, identity)
+    : { access_scope: next.scope, assignments: next.assignments }
+  return {
+    ok: true,
+    message: apply ? 'Subscription updated' : 'Subscription plan',
+    handle: identity.handle,
+    did: identity.did,
+    avatar: identity.avatar,
+    feed: null,
+    mode: 'replace',
+    access_scope: finalState.access_scope,
+    changed: didChange,
+    assignments: finalState.assignments,
+    current_access_scope: apply ? undefined : beforeState.access_scope,
+    current_assignments: apply ? undefined : beforeState.assignments,
+    apply_performed: apply,
+  }
+}
