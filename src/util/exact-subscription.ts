@@ -374,7 +374,28 @@ export type SetSubscriptionInput = SubscriptionInput & {
   expected?: { scope?: unknown; feeds?: unknown } | null
 }
 
+type ExpectedState = { scope: AccessScope; feeds: string[] }
+
+function parseFeedList(value: unknown, ctxLabel: string): string[] {
+  if (value === undefined) return []
+  if (!Array.isArray(value)) {
+    throw new SubscriptionError(400, 'invalid_state', `${ctxLabel}.feeds must be an array of feed rkeys`)
+  }
+  const out: string[] = []
+  for (const f of value) {
+    if (typeof f !== 'string' || f.trim().length === 0) {
+      throw new SubscriptionError(400, 'invalid_state', `${ctxLabel}.feeds entries must be non-empty strings`)
+    }
+    out.push(f.trim())
+  }
+  return out
+}
+
 export function parseDesiredState(input: SetSubscriptionInput): DesiredState {
+  // A state body must not also carry legacy verbs — that ambiguity is a defect.
+  if (input.mode !== undefined || input.feed !== undefined || input.rkey !== undefined) {
+    throw new SubscriptionError(400, 'invalid_state', 'state cannot be combined with legacy mode/feed/rkey')
+  }
   const raw = input.state
   if (!raw || typeof raw !== 'object') {
     throw new SubscriptionError(400, 'invalid_state', 'state is required: {scope, feeds?}')
@@ -383,47 +404,79 @@ export function parseDesiredState(input: SetSubscriptionInput): DesiredState {
   if (scope !== 'omni' && scope !== 'none' && scope !== 'assigned') {
     throw new SubscriptionError(400, 'invalid_state', 'state.scope must be omni, none, or assigned')
   }
+  const feeds = parseFeedList(raw.feeds, 'state')
   if (scope === 'assigned') {
-    const feeds = raw.feeds
-    if (!Array.isArray(feeds) || feeds.length === 0) {
+    const deduped = Array.from(new Set(feeds)).sort()
+    if (!deduped.length) {
       throw new SubscriptionError(400, 'invalid_state', 'state.scope=assigned requires a non-empty feeds list')
     }
-    const cleaned = Array.from(new Set(
-      feeds.map((f) => (typeof f === 'string' ? f.trim() : '')).filter((f) => f.length > 0),
-    ))
-    if (!cleaned.length) {
-      throw new SubscriptionError(400, 'invalid_state', 'state.feeds must contain at least one feed rkey')
-    }
-    return { scope, feeds: cleaned }
+    return { scope, feeds: deduped }
   }
-  if (Array.isArray(raw.feeds) && raw.feeds.length > 0) {
+  if (feeds.length > 0) {
     throw new SubscriptionError(400, 'invalid_state', `state.scope=${scope} does not accept feeds`)
   }
   return { scope, feeds: [] }
 }
 
-async function resolveDesiredAssignments(db: Db, rkeys: string[]): Promise<AssignmentView[]> {
-  const seen = new Set<string>()
-  const out: AssignmentView[] = []
-  for (const rkey of rkeys) {
-    const feed = await db
-      .selectFrom('feedgen_ops.feed_catalog')
-      .selectAll()
-      .where('rkey', '=', rkey)
-      .executeTakeFirst()
-    if (!feed) throw new SubscriptionError(404, 'feed_not_found', `unknown feed: ${rkey}`)
-    if (!isSubscribableFeed(feed)) {
-      throw new SubscriptionError(409, 'feed_disabled', `feed is disabled: ${rkey}`)
-    }
-    if (seen.has(feed.feed_id)) continue
-    seen.add(feed.feed_id)
-    out.push({ feed_id: feed.feed_id, feed: feed.rkey, study_id: feed.study_id ?? null })
+function parseExpectedState(raw: { scope?: unknown; feeds?: unknown }): ExpectedState {
+  if (!raw || typeof raw !== 'object') {
+    throw new SubscriptionError(400, 'invalid_state', 'expected must be {scope, feeds?}')
   }
-  return out.sort((a, b) => a.feed.localeCompare(b.feed))
+  const scope = raw.scope
+  if (scope !== 'omni' && scope !== 'none' && scope !== 'assigned') {
+    throw new SubscriptionError(400, 'invalid_state', 'expected.scope must be omni, none, or assigned')
+  }
+  const feeds = Array.from(new Set(parseFeedList(raw.feeds, 'expected'))).sort()
+  if (scope !== 'assigned' && feeds.length > 0) {
+    throw new SubscriptionError(400, 'invalid_state', `expected.scope=${scope} does not accept feeds`)
+  }
+  return { scope, feeds }
 }
 
-function stateSignature(scope: AccessScope, assignments: AssignmentView[]): string {
-  return `${scope}|${assignments.map((a) => a.feed).sort().join(',')}`
+function currentFeeds(assignments: AssignmentView[]): string[] {
+  return assignments.map((a) => a.feed).sort()
+}
+
+// Structural state comparison (no delimiter serialization — feeds compared
+// element-wise on sorted rkeys).
+function statesEqual(scope: AccessScope, feeds: string[], expected: ExpectedState): boolean {
+  if (scope !== expected.scope) return false
+  if (feeds.length !== expected.feeds.length) return false
+  return feeds.every((f, i) => f === expected.feeds[i])
+}
+
+async function resolveFeedRow(
+  db: Db,
+  rkey: string,
+  lock: boolean,
+): Promise<{ feed_id: string; feed: string; study_id: string | null }> {
+  let q = db.selectFrom('feedgen_ops.feed_catalog').selectAll().where('rkey', '=', rkey)
+  if (lock) q = q.forShare()
+  const feed = await q.executeTakeFirst()
+  if (!feed) throw new SubscriptionError(404, 'feed_not_found', `unknown feed: ${rkey}`)
+  if (!isSubscribableFeed(feed)) {
+    throw new SubscriptionError(409, 'feed_disabled', `feed is disabled: ${rkey}`)
+  }
+  return { feed_id: feed.feed_id, feed: feed.rkey, study_id: feed.study_id ?? null }
+}
+
+// Resolve requested rkeys to assignments. When `lock` (inside the write
+// transaction) each catalog row is locked FOR SHARE and rechecked, closing the
+// eligibility check-to-write race; rkeys are visited in deterministic order.
+async function resolveDesiredAssignments(
+  db: Db,
+  rkeys: string[],
+  lock: boolean,
+): Promise<AssignmentView[]> {
+  const seen = new Set<string>()
+  const out: AssignmentView[] = []
+  for (const rkey of [...rkeys].sort()) {
+    const row = await resolveFeedRow(db, rkey, lock)
+    if (seen.has(row.feed_id)) continue
+    seen.add(row.feed_id)
+    out.push(row)
+  }
+  return out.sort((a, b) => a.feed.localeCompare(b.feed))
 }
 
 // Close-row status for the temporal audit trail, per the desired scope
@@ -445,60 +498,85 @@ export async function setSubscription(
   }
   const desired = parseDesiredState(input)
   const source = input.source?.trim() || 'feedgen-subscription-api'
+  const expected =
+    input.expected !== undefined && input.expected !== null ? parseExpectedState(input.expected) : null
 
   const beforeState = await inspectSubscription(ctx.db, identity)
-  const nextAssignments = desired.scope === 'assigned'
-    ? await resolveDesiredAssignments(ctx.db, desired.feeds)
-    : []
-  const next = { scope: desired.scope, assignments: nextAssignments }
 
-  const expected = input.expected
-  const wantExpected = expected !== undefined && expected !== null
-  const expectedSig = wantExpected
-    ? `${expected.scope}|${(Array.isArray(expected.feeds) ? expected.feeds : []).slice().sort().join(',')}`
-    : null
-
-  let didChange = changed(beforeState.access_scope, beforeState.assignments, next.scope, next.assignments)
-
-  if (apply) {
-    didChange = await ctx.db.transaction().execute(async (trx) => {
-      await trx
-        .insertInto('subscriber')
-        .values({ handle: identity.handle, did: identity.did, access_scope: 'omni' })
-        .onConflict((oc) => oc.column('did').doNothing())
-        .returning('did')
-        .executeTakeFirst()
-      await trx.selectFrom('subscriber').select('did').where('did', '=', identity.did).forUpdate().executeTakeFirst()
-      const current = await inspectSubscription(trx, identity)
-      if (wantExpected && stateSignature(current.access_scope, current.assignments) !== expectedSig) {
-        throw new SubscriptionError(409, 'stale_state', 'current state does not match expected; re-read and retry')
-      }
-      const txChanged = changed(current.access_scope, current.assignments, next.scope, next.assignments)
-      if (!txChanged) return false
-      await applyProjectedState(trx, identity, closeMode(next.scope), source, current.assignments, next)
-      return true
-    })
-    if (didChange && updateFollows && next.scope !== 'none') {
-      triggerFollowsUpdateForSubscriber(ctx.db, identity.did)
+  if (!apply) {
+    // Preview validates expected against the observed before-state too.
+    if (expected && !statesEqual(beforeState.access_scope, currentFeeds(beforeState.assignments), expected)) {
+      throw new SubscriptionError(409, 'stale_state', 'current state does not match expected; re-read and retry')
+    }
+    const nextAssignments =
+      desired.scope === 'assigned' ? await resolveDesiredAssignments(ctx.db, desired.feeds, false) : []
+    const didChange = changed(
+      beforeState.access_scope,
+      beforeState.assignments,
+      desired.scope,
+      nextAssignments,
+    )
+    return {
+      ok: true,
+      message: 'Subscription plan',
+      handle: identity.handle,
+      did: identity.did,
+      avatar: identity.avatar,
+      feed: null,
+      mode: 'replace',
+      access_scope: desired.scope,
+      changed: didChange,
+      assignments: nextAssignments,
+      current_access_scope: beforeState.access_scope,
+      current_assignments: beforeState.assignments,
+      apply_performed: false,
     }
   }
 
-  const finalState = apply
-    ? await inspectSubscription(ctx.db, identity)
-    : { access_scope: next.scope, assignments: next.assignments }
+  // Apply: one locked transaction. It returns the state it committed (its
+  // linearization point) so the response never reflects a concurrent writer.
+  const result = await ctx.db.transaction().execute(async (trx) => {
+    const inserted = await trx
+      .insertInto('subscriber')
+      .values({ handle: identity.handle, did: identity.did, access_scope: 'omni' })
+      .onConflict((oc) => oc.column('did').doNothing())
+      .returning('did')
+      .executeTakeFirst()
+    await trx.selectFrom('subscriber').select('did').where('did', '=', identity.did).forUpdate().executeTakeFirst()
+    // A freshly-inserted subscriber's logical pre-state is none/[], not the
+    // bootstrap omni row — so CAS and change-detection see a first enrollment.
+    const observed = await inspectSubscription(trx, identity)
+    const preScope: AccessScope = inserted ? 'none' : observed.access_scope
+    const preAssignments = inserted ? [] : observed.assignments
+    if (expected && !statesEqual(preScope, currentFeeds(preAssignments), expected)) {
+      throw new SubscriptionError(409, 'stale_state', 'current state does not match expected; re-read and retry')
+    }
+    const nextAssignments =
+      desired.scope === 'assigned' ? await resolveDesiredAssignments(trx, desired.feeds, true) : []
+    const next = { scope: desired.scope, assignments: nextAssignments }
+    const txChanged = changed(preScope, preAssignments, next.scope, next.assignments)
+    if (txChanged) {
+      await applyProjectedState(trx, identity, closeMode(next.scope), source, preAssignments, next)
+    }
+    return { changed: txChanged, scope: next.scope, assignments: next.assignments }
+  })
+
+  if (result.changed && updateFollows && result.scope !== 'none') {
+    triggerFollowsUpdateForSubscriber(ctx.db, identity.did)
+  }
   return {
     ok: true,
-    message: apply ? 'Subscription updated' : 'Subscription plan',
+    message: 'Subscription updated',
     handle: identity.handle,
     did: identity.did,
     avatar: identity.avatar,
     feed: null,
     mode: 'replace',
-    access_scope: finalState.access_scope,
-    changed: didChange,
-    assignments: finalState.assignments,
-    current_access_scope: apply ? undefined : beforeState.access_scope,
-    current_assignments: apply ? undefined : beforeState.assignments,
-    apply_performed: apply,
+    access_scope: result.scope,
+    changed: result.changed,
+    assignments: result.assignments,
+    current_access_scope: undefined,
+    current_assignments: undefined,
+    apply_performed: true,
   }
 }
