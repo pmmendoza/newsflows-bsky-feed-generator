@@ -66,9 +66,21 @@ async function main() {
 
   try {
     await db.transaction().execute(async (trx) => {
+      // Full deployed (migration-028) shape so inserts satisfy every NOT NULL
+      // column. IF NOT EXISTS no-ops against the real table; when absent we
+      // recreate it. All of this is rolled back at the end of the transaction.
       await sql`create schema if not exists ranker_prod`.execute(trx)
       await sql`create table if not exists ranker_prod.post_political_eligibility (
-        uri text primary key, eligible boolean not null, party_ids jsonb, updated_at text
+        uri text primary key,
+        eligible boolean not null,
+        has_politician boolean not null,
+        has_party boolean not null,
+        party_ids jsonb,
+        direct_party_ids jsonb not null default '[]',
+        inferred_party_ids jsonb not null default '[]',
+        reference_version text not null,
+        status text not null default 'ok',
+        updated_at text
       )`.execute(trx)
 
       await trx
@@ -82,8 +94,10 @@ async function main() {
       await trx
         .insertInto('ranker_prod.post_political_eligibility' as any)
         .values([
-          { uri: uriDrop, eligible: false, party_ids: null, updated_at: '2026-06-26T00:00:00.000Z' },
-          { uri: uriPass, eligible: true, party_ids: null, updated_at: '2026-06-26T00:00:00.000Z' },
+          // NOT NULL cols without a DB default (has_politician, has_party,
+          // reference_version) must be supplied; defaulted cols are omitted.
+          { uri: uriDrop, eligible: false, has_politician: false, has_party: false, reference_version: 'test', party_ids: null, updated_at: '2026-06-26T00:00:00.000Z' },
+          { uri: uriPass, eligible: true, has_politician: true, has_party: false, reference_version: 'test', party_ids: null, updated_at: '2026-06-26T00:00:00.000Z' },
         ] as any)
         .execute()
 
