@@ -13,6 +13,8 @@
     "start": "ts-node src/index.ts",
     "db:migrate": "ts-node src/scripts/migrate.ts",
     "db:migrate:status": "ts-node src/scripts/migrate-status.ts",
+    "db:migrate:built": "node dist/scripts/migrate.js",
+    "db:migrate:status:built": "node dist/scripts/migrate-status.js",
     "archiveWorker": "ts-node src/archive-worker.ts",
     "build": "tsc",
     "test:feed-catalog-admin": "ts-node scripts/test_feed_catalog_admin.ts",
