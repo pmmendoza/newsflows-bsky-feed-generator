@@ -141,6 +141,26 @@ async function main() {
     'feed_not_found',
   )
 
+  // 8. expected.subscribed membership CAS (batch-ops safety).
+  // 8a. Not a member + expected.subscribed:true -> 409 (batch-mutate on removed).
+  await clean()
+  await expectErr(
+    () => setSubscription(ctx, { ...ident, state: { scope: 'omni' }, expected: { scope: 'none', feeds: [], subscribed: true } }, true),
+    'stale_state',
+  )
+  // 8b. Not a member + expected.subscribed:false -> enrolls (batch-add new).
+  await clean()
+  r = await setSubscription(ctx, { ...ident, state: { scope: 'assigned', feeds: [FEED_A] }, expected: { scope: 'none', feeds: [], subscribed: false } }, true)
+  assert(r.changed === true && (await state()).scope === 'assigned', '8b: enroll-if-absent succeeds')
+  // 8c. Now a member + expected.subscribed:false -> 409 (batch-add must not touch existing).
+  await expectErr(
+    () => setSubscription(ctx, { ...ident, state: { scope: 'omni' }, expected: { scope: 'assigned', feeds: [FEED_A], subscribed: false } }, true),
+    'stale_state',
+  )
+  // 8d. Now a member + expected.subscribed:true + correct state -> mutates.
+  r = await setSubscription(ctx, { ...ident, state: { scope: 'omni' }, expected: { scope: 'assigned', feeds: [FEED_A], subscribed: true } }, true)
+  assert((await state()).scope === 'omni', '8d: mutate-existing succeeds')
+
   await clean()
   await new Promise((r) => setTimeout(r, 400)) // let async follows updates settle
   console.log('test_subscription_state_integration OK')

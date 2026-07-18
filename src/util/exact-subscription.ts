@@ -371,10 +371,14 @@ export type DesiredState = { scope: AccessScope; feeds: string[] }
 
 export type SetSubscriptionInput = SubscriptionInput & {
   state?: { scope?: unknown; feeds?: unknown }
-  expected?: { scope?: unknown; feeds?: unknown } | null
+  expected?: { scope?: unknown; feeds?: unknown; subscribed?: unknown } | null
 }
 
-type ExpectedState = { scope: AccessScope; feeds: string[] }
+// `subscribed` is an optional membership predicate for compare-and-set: it
+// distinguishes "subscriber row absent" (false) from "present" (true),
+// independent of access scope. Batch enrollment sets false (enroll only if not
+// already a member); batch mutation sets true (reject if removed since preview).
+type ExpectedState = { scope: AccessScope; feeds: string[]; subscribed?: boolean }
 
 function parseFeedList(value: unknown, ctxLabel: string): string[] {
   if (value === undefined) return []
@@ -418,7 +422,7 @@ export function parseDesiredState(input: SetSubscriptionInput): DesiredState {
   return { scope, feeds: [] }
 }
 
-function parseExpectedState(raw: { scope?: unknown; feeds?: unknown }): ExpectedState {
+function parseExpectedState(raw: { scope?: unknown; feeds?: unknown; subscribed?: unknown }): ExpectedState {
   if (!raw || typeof raw !== 'object') {
     throw new SubscriptionError(400, 'invalid_state', 'expected must be {scope, feeds?}')
   }
@@ -430,7 +434,14 @@ function parseExpectedState(raw: { scope?: unknown; feeds?: unknown }): Expected
   if (scope !== 'assigned' && feeds.length > 0) {
     throw new SubscriptionError(400, 'invalid_state', `expected.scope=${scope} does not accept feeds`)
   }
-  return { scope, feeds }
+  let subscribed: boolean | undefined
+  if (raw.subscribed !== undefined) {
+    if (typeof raw.subscribed !== 'boolean') {
+      throw new SubscriptionError(400, 'invalid_state', 'expected.subscribed must be a boolean')
+    }
+    subscribed = raw.subscribed
+  }
+  return { scope, feeds, subscribed }
 }
 
 function currentFeeds(assignments: AssignmentView[]): string[] {
@@ -505,7 +516,11 @@ export async function setSubscription(
 
   if (!apply) {
     // Preview validates expected against the observed before-state too.
-    if (expected && !statesEqual(beforeState.access_scope, currentFeeds(beforeState.assignments), expected)) {
+    if (
+      expected &&
+      (!statesEqual(beforeState.access_scope, currentFeeds(beforeState.assignments), expected) ||
+        (expected.subscribed !== undefined && expected.subscribed !== beforeState.subscribed))
+    ) {
       throw new SubscriptionError(409, 'stale_state', 'current state does not match expected; re-read and retry')
     }
     const nextAssignments =
@@ -555,7 +570,13 @@ export async function setSubscription(
     const physAssignments = observed.assignments
     const logicalScope: AccessScope = inserted ? 'none' : observed.access_scope
     const logicalAssignments = inserted ? [] : observed.assignments
-    if (expected && !statesEqual(logicalScope, currentFeeds(logicalAssignments), expected)) {
+    // Logical membership: a row we just bootstrapped was NOT a subscriber before.
+    const logicalSubscribed = !inserted
+    if (
+      expected &&
+      (!statesEqual(logicalScope, currentFeeds(logicalAssignments), expected) ||
+        (expected.subscribed !== undefined && expected.subscribed !== logicalSubscribed))
+    ) {
       throw new SubscriptionError(409, 'stale_state', 'current state does not match expected; re-read and retry')
     }
     const nextAssignments =
