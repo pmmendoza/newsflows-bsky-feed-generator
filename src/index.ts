@@ -33,6 +33,7 @@ const run = async () => {
     subscriptionIdleTimeoutMs:
       maybeInt(process.env.FEEDGEN_SUBSCRIPTION_IDLE_TIMEOUT_MS) ?? 0,
     readOnlyMode: maybeBool(process.env.FEEDGEN_READ_ONLY_MODE) ?? false,
+    autoMigrate: maybeBool(process.env.FEEDGEN_AUTO_MIGRATE) ?? false,
     hostname,
     serviceDid,
   })

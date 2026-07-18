@@ -13,7 +13,7 @@ import registerStudyEndpoints from './methods/study'
 import registerFeedCatalogAdminEndpoint from './methods/feed-catalog-admin'
 import registerSubscriberAdminEndpoints from './methods/subscriber-admin'
 import { importSubscribersFromCSV } from './util/import-subscribers'
-import { createDb, Database, migrateToLatest } from './db'
+import { createDb, Database, migrateToLatest, getPendingMigrations } from './db'
 import { FirehoseSubscription } from './subscription'
 import { AppContext, Config } from './config'
 import wellKnown from './well-known'
@@ -116,7 +116,21 @@ export class FeedGenerator {
 
   async start(): Promise<http.Server> {
     if (!this.cfg.readOnlyMode) {
-      await migrateToLatest(this.db)
+      if (this.cfg.autoMigrate) {
+        await migrateToLatest(this.db)
+      } else {
+        // Do NOT silently apply migrations on startup: a bad migration would
+        // brick the serving process. Fail fast if any are pending so they are
+        // applied explicitly (yarn db:migrate) before the new image serves.
+        const pending = await getPendingMigrations(this.db)
+        if (pending.length > 0) {
+          throw new Error(
+            `${pending.length} pending DB migration(s) [${pending.join(', ')}]. ` +
+              `Run 'yarn db:migrate' before starting, or set FEEDGEN_AUTO_MIGRATE=true ` +
+              `to apply on startup (dev/first-run only).`,
+          )
+        }
+      }
       this.firehose.run(this.cfg.subscriptionReconnectDelay)
     }
 

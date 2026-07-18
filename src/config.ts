@@ -31,4 +31,8 @@ export type Config = {
   subscriptionIdleTimeoutMs: number
   // Canary testing mode: prevents mutating operations against production DB.
   readOnlyMode?: boolean
+  // When true, apply pending DB migrations automatically on startup (dev/first-run
+  // convenience). Default false: production startup fails fast if migrations are
+  // pending, so migrations are applied explicitly (yarn db:migrate) before serving.
+  autoMigrate?: boolean
 }

@@ -23,4 +23,12 @@ export const migrateToLatest = async (db: Database) => {
   if (error) throw error
 }
 
+// Names of migrations that exist in the provider but have not been executed
+// against this database yet. Read-only: does not apply anything.
+export const getPendingMigrations = async (db: Database): Promise<string[]> => {
+  const migrator = new Migrator({ db, provider: migrationProvider })
+  const migrations = await migrator.getMigrations()
+  return migrations.filter((m) => !m.executedAt).map((m) => m.name)
+}
+
 export type Database = Kysely<DatabaseSchema>
