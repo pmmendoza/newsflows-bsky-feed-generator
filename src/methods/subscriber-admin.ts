@@ -186,6 +186,14 @@ export default function registerSubscriberAdminEndpoints(server: Server, ctx: Ap
         return parsed
       }
       const cursor = parseInteger(req.query?.cursor, 0, 'cursor')
+      const hasSnapshotBoundary = req.query?.through_assignment_id !== undefined
+      if (cursor > 0 && !hasSnapshotBoundary) {
+        throw new SubscriptionError(
+          400,
+          'history_snapshot_required',
+          'through_assignment_id from the first page is required when cursor is greater than zero',
+        )
+      }
       const limit = parseInteger(req.query?.limit, 100, 'limit')
       if (limit < 1 || limit > 200) {
         throw new SubscriptionError(400, 'invalid_limit', 'limit must be between 1 and 200')
@@ -196,7 +204,7 @@ export default function registerSubscriberAdminEndpoints(server: Server, ctx: Ap
         .where('did', '=', did)
         .executeTakeFirst()
       if (!subscriber) throw new SubscriptionError(404, 'identity_not_found', 'subscriber DID was not found')
-      const firstPage = req.query?.through_assignment_id === undefined
+      const firstPage = !hasSnapshotBoundary
       const throughAssignmentId = firstPage
         ? Number((await ctx.db
           .selectFrom('feedgen_ops.subscriber_feed_assignment as assignment')

@@ -592,11 +592,24 @@ async function main() {
       assert(firstHistoryPayload.assignments.length === 1 && firstHistoryPayload.assignments[0].feed === 'test-be-2', 'history must order rows by immutable assignment ID descending')
       assert(Number.isInteger(firstHistoryPayload.next_cursor) && Number.isInteger(firstHistoryPayload.through_assignment_id), 'history must return integer offset and snapshot boundaries')
       assert(firstHistoryPayload.raw_values_in_output === false, 'history must declare raw-free output')
+      const missingSnapshot = await fetch(`${base}/api/admin/subscribers/history?did=${encodeURIComponent(listDids[1])}&limit=1&cursor=1`, {
+        headers: { 'api-key': 'subscription-read-test-key' },
+      })
+      assert(missingSnapshot.status === 400, 'history later pages must require the first-page snapshot boundary')
+      await db.insertInto('feedgen_ops.subscriber_feed_assignment').values({
+        did: listDids[1], feed_id: 'test-feed-nl-1', active_from: new Date(), active_until: null,
+        source: 'subscription-test', status: 'active',
+      }).execute()
       const secondHistory = await fetch(`${base}/api/admin/subscribers/history?did=${encodeURIComponent(listDids[1])}&limit=1&cursor=${firstHistoryPayload.next_cursor}&through_assignment_id=${firstHistoryPayload.through_assignment_id}`, {
         headers: { 'api-key': 'subscription-read-test-key' },
       })
       const secondHistoryPayload = await secondHistory.json() as any
-      assert(secondHistory.status === 200 && secondHistoryPayload.assignments[0].feed === 'test-be-1', 'history cursor must page within the owner snapshot')
+      assert(secondHistory.status === 200 && secondHistoryPayload.assignments[0].feed === 'test-be-1', 'history cursor must exclude later assignments and page within the owner snapshot')
+      await db.updateTable('feedgen_ops.subscriber_feed_assignment')
+        .set({ active_until: new Date(), status: 'replaced' })
+        .where('did', '=', listDids[1])
+        .where('feed_id', '=', 'test-feed-nl-1')
+        .execute()
       const fullHistory = await fetch(`${base}/api/admin/subscribers/history?did=${encodeURIComponent(listDids[1])}&limit=200&through_assignment_id=${firstHistoryPayload.through_assignment_id}`, {
         headers: { 'api-key': 'subscription-read-test-key' },
       }).then((response) => response.json() as Promise<any>)
