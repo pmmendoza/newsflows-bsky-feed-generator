@@ -550,6 +550,7 @@ async function main() {
         { did: listDids[2], handle: 'list-none.test', access_scope: 'none' },
       ]).execute()
       await db.insertInto('feedgen_ops.subscriber_feed_assignment').values([
+        { did: listDids[1], feed_id: 'test-feed-be-1', active_from: new Date('2026-06-30T00:00:00Z'), active_until: new Date('2026-07-01T00:00:00Z'), source: 'subscription-test', status: 'replaced' },
         { did: listDids[1], feed_id: 'test-feed-be-1', active_from: new Date('2026-07-01T00:00:00Z'), active_until: null, source: 'subscription-test', status: 'active' },
         { did: listDids[1], feed_id: 'test-feed-be-2', active_from: new Date('2026-07-02T00:00:00Z'), active_until: null, source: 'subscription-test', status: 'active' },
       ]).execute()
@@ -579,6 +580,44 @@ async function main() {
         headers: { 'api-key': 'subscription-read-test-key' },
       })
       assert(nonIntegerCursor.status === 400, 'subscriber cursor must reject non-integer values')
+
+      const unauthorizedHistory = await fetch(`${base}/api/admin/subscribers/history?did=${encodeURIComponent(listDids[1])}`)
+      assert(unauthorizedHistory.status === 401, 'subscriber history must require the read key')
+      const firstHistory = await fetch(`${base}/api/admin/subscribers/history?did=${encodeURIComponent(listDids[1])}&limit=1`, {
+        headers: { 'api-key': 'subscription-read-test-key' },
+      })
+      const firstHistoryPayload = await firstHistory.json() as any
+      assert(firstHistory.status === 200, 'read key must authorize DID-keyed subscriber history')
+      assert(firstHistoryPayload.did === listDids[1], 'history must echo the requested canonical DID')
+      assert(firstHistoryPayload.assignments.length === 1 && firstHistoryPayload.assignments[0].feed === 'test-be-2', 'history must order rows by immutable assignment ID descending')
+      assert(Number.isInteger(firstHistoryPayload.next_cursor) && Number.isInteger(firstHistoryPayload.through_assignment_id), 'history must return integer offset and snapshot boundaries')
+      assert(firstHistoryPayload.raw_values_in_output === false, 'history must declare raw-free output')
+      const missingSnapshot = await fetch(`${base}/api/admin/subscribers/history?did=${encodeURIComponent(listDids[1])}&limit=1&cursor=1`, {
+        headers: { 'api-key': 'subscription-read-test-key' },
+      })
+      assert(missingSnapshot.status === 400, 'history later pages must require the first-page snapshot boundary')
+      await db.insertInto('feedgen_ops.subscriber_feed_assignment').values({
+        did: listDids[1], feed_id: 'test-feed-nl-1', active_from: new Date(), active_until: null,
+        source: 'subscription-test', status: 'active',
+      }).execute()
+      const secondHistory = await fetch(`${base}/api/admin/subscribers/history?did=${encodeURIComponent(listDids[1])}&limit=1&cursor=${firstHistoryPayload.next_cursor}&through_assignment_id=${firstHistoryPayload.through_assignment_id}`, {
+        headers: { 'api-key': 'subscription-read-test-key' },
+      })
+      const secondHistoryPayload = await secondHistory.json() as any
+      assert(secondHistory.status === 200 && secondHistoryPayload.assignments[0].feed === 'test-be-1', 'history cursor must exclude later assignments and page within the owner snapshot')
+      await db.updateTable('feedgen_ops.subscriber_feed_assignment')
+        .set({ active_until: new Date(), status: 'replaced' })
+        .where('did', '=', listDids[1])
+        .where('feed_id', '=', 'test-feed-nl-1')
+        .execute()
+      const fullHistory = await fetch(`${base}/api/admin/subscribers/history?did=${encodeURIComponent(listDids[1])}&limit=200&through_assignment_id=${firstHistoryPayload.through_assignment_id}`, {
+        headers: { 'api-key': 'subscription-read-test-key' },
+      }).then((response) => response.json() as Promise<any>)
+      assert(fullHistory.assignments.some((row: any) => row.status === 'replaced' && row.active_until), 'history must retain closed temporal assignment rows')
+      const invalidHistory = await fetch(`${base}/api/admin/subscribers/history?did=not-a-did`, {
+        headers: { 'api-key': 'subscription-read-test-key' },
+      })
+      assert(invalidHistory.status === 400, 'history must reject non-canonical DID input')
 
       const assignedList = await fetch(`${base}/api/admin/subscribers?scope=assigned&limit=100`, {
         headers: { 'api-key': 'subscription-read-test-key' },

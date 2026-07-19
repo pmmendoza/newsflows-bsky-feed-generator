@@ -15,6 +15,7 @@ import { ApiKeyAuthConfig, isApiKeyAuthorized, logUnauthorized } from '../util/a
 
 const adminAuth: ApiKeyAuthConfig = { primaryEnv: ['FEEDGEN_ADMIN_API_KEY'] }
 const readAuth: ApiKeyAuthConfig = { primaryEnv: ['FEEDGEN_READ_API_KEY', 'FEEDGEN_ADMIN_API_KEY'] }
+const DID_RE = /^did:(?:plc|web):[a-zA-Z0-9._:%-]{1,256}$/
 
 type LegacyAdminInput = SubscriptionInput & { action?: 'add' | 'remove' }
 
@@ -159,6 +160,97 @@ export default function registerSubscriberAdminEndpoints(server: Server, ctx: Ap
         subscribed: state.subscribed,
         owner_endpoint: endpoint,
         apply_performed: false,
+      })
+    } catch (error) {
+      return endpointError(res, error)
+    }
+  })
+
+  server.xrpc.router.get('/api/admin/subscribers/history', async (req, res) => {
+    const endpoint = '/api/admin/subscribers/history'
+    if (!isApiKeyAuthorized(req, readAuth)) return unauthorized(res, endpoint)
+    try {
+      const did = req.query?.did
+      if (typeof did !== 'string' || !DID_RE.test(did)) {
+        throw new SubscriptionError(400, 'invalid_did', 'did must be a canonical DID')
+      }
+      const parseInteger = (value: unknown, fallback: number, name: string) => {
+        if (value === undefined) return fallback
+        if (typeof value !== 'string' || !/^\d+$/.test(value)) {
+          throw new SubscriptionError(400, `invalid_${name}`, `${name} must be a non-negative integer`)
+        }
+        const parsed = Number(value)
+        if (!Number.isSafeInteger(parsed)) {
+          throw new SubscriptionError(400, `invalid_${name}`, `${name} must be a non-negative integer`)
+        }
+        return parsed
+      }
+      const cursor = parseInteger(req.query?.cursor, 0, 'cursor')
+      const hasSnapshotBoundary = req.query?.through_assignment_id !== undefined
+      if (cursor > 0 && !hasSnapshotBoundary) {
+        throw new SubscriptionError(
+          400,
+          'history_snapshot_required',
+          'through_assignment_id from the first page is required when cursor is greater than zero',
+        )
+      }
+      const limit = parseInteger(req.query?.limit, 100, 'limit')
+      if (limit < 1 || limit > 200) {
+        throw new SubscriptionError(400, 'invalid_limit', 'limit must be between 1 and 200')
+      }
+      const subscriber = await ctx.db
+        .selectFrom('subscriber')
+        .select(['did', 'handle'])
+        .where('did', '=', did)
+        .executeTakeFirst()
+      if (!subscriber) throw new SubscriptionError(404, 'identity_not_found', 'subscriber DID was not found')
+      const firstPage = !hasSnapshotBoundary
+      const throughAssignmentId = firstPage
+        ? Number((await ctx.db
+          .selectFrom('feedgen_ops.subscriber_feed_assignment as assignment')
+          .select('assignment.assignment_id')
+          .where('assignment.did', '=', did)
+          .orderBy('assignment.assignment_id', 'desc')
+          .executeTakeFirst())?.assignment_id ?? 0)
+        : parseInteger(req.query?.through_assignment_id, 0, 'through_assignment_id')
+      if (!Number.isSafeInteger(throughAssignmentId)) {
+        throw new SubscriptionError(500, 'history_snapshot_unavailable', 'history snapshot is unavailable')
+      }
+      const rows = await ctx.db
+        .selectFrom('feedgen_ops.subscriber_feed_assignment as assignment')
+        .leftJoin('feedgen_ops.feed_catalog as feed', 'feed.feed_id', 'assignment.feed_id')
+        .select([
+          'assignment.assignment_id as assignment_id',
+          'assignment.feed_id as feed_id',
+          'feed.rkey as feed',
+          'assignment.active_from as active_from',
+          'assignment.active_until as active_until',
+          'assignment.status as status',
+        ])
+        .where('assignment.did', '=', did)
+        .where('assignment.assignment_id', '<=', throughAssignmentId)
+        .orderBy('assignment.assignment_id', 'desc')
+        .offset(cursor)
+        .limit(limit + 1)
+        .execute()
+      const page = rows.slice(0, limit)
+      return res.json({
+        schema_version: 1,
+        did: subscriber.did,
+        handle: subscriber.handle,
+        assignments: page.map((row) => ({
+          assignment_id: row.assignment_id,
+          feed: row.feed ?? row.feed_id,
+          active_from: row.active_from,
+          active_until: row.active_until ?? null,
+          status: row.status,
+        })),
+        next_cursor: rows.length > limit ? cursor + limit : null,
+        through_assignment_id: throughAssignmentId,
+        generated_at: new Date().toISOString(),
+        owner_endpoint: endpoint,
+        apply_performed: false,
+        raw_values_in_output: false,
       })
     } catch (error) {
       return endpointError(res, error)
