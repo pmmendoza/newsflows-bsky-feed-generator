@@ -15,6 +15,8 @@
     "db:migrate:status": "ts-node src/scripts/migrate-status.ts",
     "db:migrate:built": "node dist/scripts/migrate.js",
     "db:migrate:status:built": "node dist/scripts/migrate-status.js",
+    "db:link-columns": "ts-node src/scripts/backfill-link-columns.ts",
+    "db:link-columns:built": "node dist/scripts/backfill-link-columns.js",
     "archiveWorker": "ts-node src/archive-worker.ts",
     "build": "tsc",
     "test:feed-catalog-admin": "ts-node scripts/test_feed_catalog_admin.ts",

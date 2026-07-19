@@ -76,6 +76,18 @@ const toErrorText = (error: unknown) => {
 
 const asPayload = (row: ArchiveOutbox): ArchivePayload => row.payload_json as ArchivePayload
 
+export async function archiveHasCanonicalLinkUri(db: Database): Promise<boolean> {
+  const result = await sql<{ present: boolean }>`
+    SELECT EXISTS (
+      SELECT 1 FROM information_schema.columns
+      WHERE table_schema = 'research_archive'
+        AND table_name = 'post_snapshot'
+        AND column_name = 'link_uri'
+    ) AS present
+  `.execute(db)
+  return result.rows[0]?.present === true
+}
+
 // Sprint 8 L1 (TASK-041.01) — research-db dual-write.
 //
 // When env `FEEDGEN_RESEARCH_DB_URL` is set, every successful write
@@ -92,6 +104,7 @@ const asPayload = (row: ArchiveOutbox): ArchivePayload => row.payload_json as Ar
 async function replicateToResearchDb(
   researchDb: Database,
   row: ArchiveOutbox,
+  hasCanonicalLinkUri: boolean,
 ) {
   const payload = asPayload(row)
   const request = payload.request ?? {}
@@ -138,7 +151,7 @@ async function replicateToResearchDb(
         text: post.text,
         root_uri: post.rootUri,
         root_cid: post.rootCid,
-        link_uri: links.link_uri,
+        ...(hasCanonicalLinkUri ? { link_uri: links.link_uri } : {}),
         link_url: links.linkUrl,
         link_title: links.link_title,
         link_description: links.link_description,
@@ -188,6 +201,7 @@ async function replicateToResearchDb(
 async function drainOnce(
   db: Database,
   researchDb: Database | null,
+  researchDbHasCanonicalLinkUri: boolean,
   batchSize: number,
   maxAttempts: number,
 ) {
@@ -203,7 +217,11 @@ async function drainOnce(
       await archiveRow(db, row)
       if (researchDb) {
         try {
-          await replicateToResearchDb(researchDb, row)
+          await replicateToResearchDb(
+            researchDb,
+            row,
+            researchDbHasCanonicalLinkUri,
+          )
         } catch (error) {
           // Best-effort shadow write. Parity probe (Sprint 8 L1
           // cut-over runbook step 4) catches drift; we don't
@@ -399,17 +417,26 @@ async function main() {
   const db = createDb(connectionString())
   const researchDbDsn = maybeStr(process.env.FEEDGEN_RESEARCH_DB_URL)
   const researchDb = researchDbDsn ? createDb(researchDbDsn) : null
+  const researchDbHasCanonicalLinkUri = researchDb
+    ? await archiveHasCanonicalLinkUri(researchDb)
+    : false
   const batchSize = maybeInt(process.env.FEEDGEN_ARCHIVE_WORKER_BATCH_SIZE, 500)
   const idleMs = maybeInt(process.env.FEEDGEN_ARCHIVE_WORKER_IDLE_MS, 1000)
   const maxAttempts = maybeInt(process.env.FEEDGEN_ARCHIVE_WORKER_MAX_ATTEMPTS, 5)
 
   console.log(
-    `[${new Date().toISOString()}] archive worker started batch_size=${batchSize} idle_ms=${idleMs} max_attempts=${maxAttempts} research_db_dual_write=${researchDb ? 'on' : 'off'}`,
+    `[${new Date().toISOString()}] archive worker started batch_size=${batchSize} idle_ms=${idleMs} max_attempts=${maxAttempts} research_db_dual_write=${researchDb ? 'on' : 'off'} research_db_link_uri=${researchDb ? (researchDbHasCanonicalLinkUri ? 'canonical' : 'legacy') : 'n/a'}`,
   )
 
   try {
     while (true) {
-      const drained = await drainOnce(db, researchDb, batchSize, maxAttempts)
+      const drained = await drainOnce(
+        db,
+        researchDb,
+        researchDbHasCanonicalLinkUri,
+        batchSize,
+        maxAttempts,
+      )
       if (drained === 0) {
         await sleep(idleMs)
       }
@@ -420,7 +447,9 @@ async function main() {
   }
 }
 
-main().catch((error) => {
-  console.error('archive worker failed:', error)
-  process.exit(1)
-})
+if (require.main === module) {
+  main().catch((error) => {
+    console.error('archive worker failed:', error)
+    process.exit(1)
+  })
+}

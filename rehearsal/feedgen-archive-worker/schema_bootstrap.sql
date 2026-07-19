@@ -106,8 +106,6 @@ CREATE TABLE IF NOT EXISTS research_archive.post_snapshot (
   first_seen_at timestamptz,
   first_captured_from text NOT NULL,
   captured_at timestamptz NOT NULL DEFAULT now(),
-  CONSTRAINT post_snapshot_link_uri_match_check
-    CHECK (link_uri IS NOT DISTINCT FROM link_url),
   PRIMARY KEY (post_uri, cid)
 );
 

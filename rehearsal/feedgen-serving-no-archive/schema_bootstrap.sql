@@ -80,9 +80,9 @@ CREATE TABLE IF NOT EXISTS public.post (
   text text NOT NULL,
   "rootUri" varchar NOT NULL,
   "rootCid" varchar NOT NULL,
-  link_uri varchar NOT NULL,
-  link_title varchar NOT NULL,
-  link_description varchar NOT NULL,
+  link_uri varchar NOT NULL DEFAULT '',
+  link_title varchar NOT NULL DEFAULT '',
+  link_description varchar NOT NULL DEFAULT '',
   "linkUrl" varchar NOT NULL,
   "linkTitle" varchar NOT NULL,
   "linkDescription" varchar NOT NULL,
@@ -90,12 +90,7 @@ CREATE TABLE IF NOT EXISTS public.post (
   likes_count integer DEFAULT 0,
   repost_count integer DEFAULT 0,
   comments_count integer DEFAULT 0,
-  quote_count integer DEFAULT 0,
-  CONSTRAINT post_link_columns_match_check CHECK (
-    link_uri IS NOT DISTINCT FROM "linkUrl"
-    AND link_title IS NOT DISTINCT FROM "linkTitle"
-    AND link_description IS NOT DISTINCT FROM "linkDescription"
-  )
+  quote_count integer DEFAULT 0
 );
 
 CREATE INDEX IF NOT EXISTS post_author_index ON public.post(author);

@@ -119,6 +119,39 @@ the worker-required `feedgen_ops.archive_outbox` / DLQ tables and
 rows, and proves archive drain without production data, Caddy, bots, ranker, or
 raw secrets.
 
+## Canonical link-column rollout
+
+Migration 005 is an expand-only step: it adds the canonical columns with
+metadata-only defaults and installs compatibility triggers while the old app
+continues to serve. It does not scan or rewrite existing rows.
+
+After applying the migration, backfill in explicit bounded batches and retain
+the reported cursor for resumption:
+
+```bash
+yarn db:link-columns:built --target post --batch-size 10000 --max-batches 10
+yarn db:link-columns:built --target archive --batch-size 10000 --max-batches 10
+```
+
+The archive command applies only to an archive schema in the selected database.
+A separate research database must be expanded and backfilled independently; the
+archive worker detects a legacy-only target and continues writing `link_url`
+until that database has `link_uri`.
+
+Before deploying readers of the canonical columns, run each migrated target's
+zero-mismatch gate from the beginning and require
+`"global_zero_mismatch":true`:
+
+```bash
+yarn db:link-columns:built --target post --batch-size 10000 --verify-only
+yarn db:link-columns:built --target archive --batch-size 10000 --verify-only
+```
+
+The required order is: expand while the old app serves, bounded resumable
+backfill, zero-mismatch verification, then app reader cutover. Final equality
+constraints and any default, trigger, or legacy-column removal belong in a
+later owner-gated contract migration.
+
 ## Central Feed Catalog Ops
 
 The non-secret desired state for publisher accounts, active and

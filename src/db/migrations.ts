@@ -422,43 +422,34 @@ migrations['005_canonical_link_columns'] = {
           RAISE EXCEPTION '005_canonical_link_columns schema mismatch: legacy public.post link columns must be varchar NOT NULL';
         END IF;
 
+        -- PostgreSQL 11+ stores a constant default in the catalog for existing
+        -- rows. On production PostgreSQL 17 this is metadata-only: no table
+        -- rewrite, backfill, NOT NULL scan, or constraint validation occurs.
         ALTER TABLE public.post
-          ADD COLUMN IF NOT EXISTS link_uri varchar,
-          ADD COLUMN IF NOT EXISTS link_title varchar,
-          ADD COLUMN IF NOT EXISTS link_description varchar;
+          ADD COLUMN IF NOT EXISTS link_uri varchar NOT NULL DEFAULT '',
+          ADD COLUMN IF NOT EXISTS link_title varchar NOT NULL DEFAULT '',
+          ADD COLUMN IF NOT EXISTS link_description varchar NOT NULL DEFAULT '';
 
         IF NOT (
           EXISTS (
             SELECT 1 FROM information_schema.columns
             WHERE table_schema = 'public' AND table_name = 'post'
               AND column_name = 'link_uri' AND data_type = 'character varying'
+              AND is_nullable = 'NO' AND column_default IS NOT NULL
           ) AND EXISTS (
             SELECT 1 FROM information_schema.columns
             WHERE table_schema = 'public' AND table_name = 'post'
               AND column_name = 'link_title' AND data_type = 'character varying'
+              AND is_nullable = 'NO' AND column_default IS NOT NULL
           ) AND EXISTS (
             SELECT 1 FROM information_schema.columns
             WHERE table_schema = 'public' AND table_name = 'post'
               AND column_name = 'link_description' AND data_type = 'character varying'
+              AND is_nullable = 'NO' AND column_default IS NOT NULL
           )
         ) THEN
-          RAISE EXCEPTION '005_canonical_link_columns schema mismatch: canonical public.post link columns must be varchar';
+          RAISE EXCEPTION '005_canonical_link_columns schema mismatch: canonical public.post link columns must be varchar NOT NULL with constant defaults';
         END IF;
-
-        IF EXISTS (
-          SELECT 1 FROM public.post
-          WHERE (link_uri IS NOT NULL AND link_uri IS DISTINCT FROM "linkUrl")
-             OR (link_title IS NOT NULL AND link_title IS DISTINCT FROM "linkTitle")
-             OR (link_description IS NOT NULL AND link_description IS DISTINCT FROM "linkDescription")
-        ) THEN
-          RAISE EXCEPTION '005_canonical_link_columns conflict: canonical and legacy public.post values differ';
-        END IF;
-
-        UPDATE public.post
-        SET link_uri = COALESCE(link_uri, "linkUrl"),
-            link_title = COALESCE(link_title, "linkTitle"),
-            link_description = COALESCE(link_description, "linkDescription")
-        WHERE link_uri IS NULL OR link_title IS NULL OR link_description IS NULL;
       END
       $migration$;
     `.execute(db)
@@ -471,25 +462,25 @@ migrations['005_canonical_link_columns'] = {
       LANGUAGE plpgsql
       AS $function$
       BEGIN
-        IF NEW.link_uri IS NULL THEN
+        IF NEW.link_uri = '' AND NEW."linkUrl" <> '' THEN
           NEW.link_uri := NEW."linkUrl";
-        ELSIF NEW."linkUrl" IS NULL THEN
+        ELSIF NEW."linkUrl" = '' AND NEW.link_uri <> '' THEN
           NEW."linkUrl" := NEW.link_uri;
         ELSIF NEW.link_uri IS DISTINCT FROM NEW."linkUrl" THEN
           RAISE EXCEPTION 'conflicting link_uri/linkUrl values for post %', NEW.uri;
         END IF;
 
-        IF NEW.link_title IS NULL THEN
+        IF NEW.link_title = '' AND NEW."linkTitle" <> '' THEN
           NEW.link_title := NEW."linkTitle";
-        ELSIF NEW."linkTitle" IS NULL THEN
+        ELSIF NEW."linkTitle" = '' AND NEW.link_title <> '' THEN
           NEW."linkTitle" := NEW.link_title;
         ELSIF NEW.link_title IS DISTINCT FROM NEW."linkTitle" THEN
           RAISE EXCEPTION 'conflicting link_title/linkTitle values for post %', NEW.uri;
         END IF;
 
-        IF NEW.link_description IS NULL THEN
+        IF NEW.link_description = '' AND NEW."linkDescription" <> '' THEN
           NEW.link_description := NEW."linkDescription";
-        ELSIF NEW."linkDescription" IS NULL THEN
+        ELSIF NEW."linkDescription" = '' AND NEW.link_description <> '' THEN
           NEW."linkDescription" := NEW.link_description;
         ELSIF NEW.link_description IS DISTINCT FROM NEW."linkDescription" THEN
           RAISE EXCEPTION 'conflicting link_description/linkDescription values for post %', NEW.uri;
@@ -526,45 +517,12 @@ migrations['005_canonical_link_columns'] = {
           RAISE EXCEPTION '005_canonical_link_columns schema mismatch: feedgen_sync_post_link_columns_trigger has an unexpected function';
         END IF;
 
-        ALTER TABLE public.post
-          ALTER COLUMN link_uri SET NOT NULL,
-          ALTER COLUMN link_title SET NOT NULL,
-          ALTER COLUMN link_description SET NOT NULL;
-
-        IF NOT EXISTS (
-          SELECT 1 FROM pg_constraint
-          WHERE conrelid = 'public.post'::regclass
-            AND conname = 'post_link_columns_match_check'
-        ) THEN
-          ALTER TABLE public.post
-          ADD CONSTRAINT post_link_columns_match_check CHECK (
-            link_uri IS NOT DISTINCT FROM "linkUrl"
-            AND link_title IS NOT DISTINCT FROM "linkTitle"
-            AND link_description IS NOT DISTINCT FROM "linkDescription"
-          ) NOT VALID;
-        END IF;
-
-        ALTER TABLE public.post
-          VALIDATE CONSTRAINT post_link_columns_match_check;
-
-        IF NOT EXISTS (
-          SELECT 1 FROM pg_constraint
-          WHERE conrelid = 'public.post'::regclass
-            AND conname = 'post_link_columns_match_check'
-            AND contype = 'c' AND convalidated
-            AND pg_get_constraintdef(oid) LIKE '%link_uri%linkUrl%'
-            AND pg_get_constraintdef(oid) LIKE '%link_title%linkTitle%'
-            AND pg_get_constraintdef(oid) LIKE '%link_description%linkDescription%'
-        ) THEN
-          RAISE EXCEPTION '005_canonical_link_columns schema mismatch: post_link_columns_match_check is invalid';
-        END IF;
-
         COMMENT ON COLUMN public.post.link_uri IS
-          'Canonical posted external-card URI; feedgen:migration:005_canonical_link_columns';
+          'Canonical posted external-card URI; expand stage default is empty until bounded owner backfill';
         COMMENT ON COLUMN public.post.link_title IS
-          'Canonical external-card title; feedgen:migration:005_canonical_link_columns';
+          'Canonical external-card title; expand stage default is empty until bounded owner backfill';
         COMMENT ON COLUMN public.post.link_description IS
-          'Canonical external-card description; feedgen:migration:005_canonical_link_columns';
+          'Canonical external-card description; expand stage default is empty until bounded owner backfill';
         COMMENT ON COLUMN public.post."linkUrl" IS
           'Deprecated compatibility mirror of link_uri; remove only at the gated contract stage';
         COMMENT ON COLUMN public.post."linkTitle" IS
@@ -611,17 +569,6 @@ migrations['005_canonical_link_columns'] = {
           RAISE EXCEPTION '005_canonical_link_columns schema mismatch: research_archive.post_snapshot.link_uri must be text';
         END IF;
 
-        IF EXISTS (
-          SELECT 1 FROM research_archive.post_snapshot
-          WHERE link_uri IS NOT NULL AND link_uri IS DISTINCT FROM link_url
-        ) THEN
-          RAISE EXCEPTION '005_canonical_link_columns conflict: research_archive post_snapshot link_uri/link_url values differ';
-        END IF;
-
-        UPDATE research_archive.post_snapshot
-        SET link_uri = link_url
-        WHERE link_uri IS NULL AND link_url IS NOT NULL;
-
         EXECUTE $function$
           CREATE OR REPLACE FUNCTION research_archive.feedgen_sync_post_snapshot_link_uri()
           RETURNS trigger
@@ -661,31 +608,8 @@ migrations['005_canonical_link_columns'] = {
           RAISE EXCEPTION '005_canonical_link_columns schema mismatch: feedgen_sync_post_snapshot_link_uri_trigger has an unexpected function';
         END IF;
 
-        IF NOT EXISTS (
-          SELECT 1 FROM pg_constraint
-          WHERE conrelid = 'research_archive.post_snapshot'::regclass
-            AND conname = 'post_snapshot_link_uri_match_check'
-        ) THEN
-          ALTER TABLE research_archive.post_snapshot
-          ADD CONSTRAINT post_snapshot_link_uri_match_check
-          CHECK (link_uri IS NOT DISTINCT FROM link_url) NOT VALID;
-        END IF;
-
-        ALTER TABLE research_archive.post_snapshot
-          VALIDATE CONSTRAINT post_snapshot_link_uri_match_check;
-
-        IF NOT EXISTS (
-          SELECT 1 FROM pg_constraint
-          WHERE conrelid = 'research_archive.post_snapshot'::regclass
-            AND conname = 'post_snapshot_link_uri_match_check'
-            AND contype = 'c' AND convalidated
-            AND pg_get_constraintdef(oid) LIKE '%link_uri%link_url%'
-        ) THEN
-          RAISE EXCEPTION '005_canonical_link_columns schema mismatch: post_snapshot_link_uri_match_check is invalid';
-        END IF;
-
         COMMENT ON COLUMN research_archive.post_snapshot.link_uri IS
-          'Canonical posted external-card URI; feedgen:migration:005_canonical_link_columns';
+          'Canonical posted external-card URI; expand stage remains nullable until bounded owner backfill';
         COMMENT ON COLUMN research_archive.post_snapshot.link_url IS
           'Deprecated compatibility mirror of link_uri; remove only at the gated contract stage';
       END
