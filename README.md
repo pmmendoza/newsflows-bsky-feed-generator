@@ -92,6 +92,12 @@ curl -X POST "$FEEDGEN_BASE_URL/api/subscribe" \
 `limit` (1–500), a non-negative integer offset `cursor`, and optional `scope`
 or `feed` filters. Results are ordered by DID and include stored handles, scope,
 active assignments with their `active_from` timestamps, and `scope_since: null`
+
+`GET /api/admin/subscribers/history?did=<canonical-DID>` is the bounded,
+read-key-protected owner readback for one participant's temporal feed-membership
+rows. Its integer cursor is paired with the first response's
+`through_assignment_id`, so later pages remain stable while live assignments
+change.
 because the current schema cannot truthfully reconstruct scope-change time.
 Feed filtering applies the same catalog, assignment, and `study-only` lifecycle
 rules as feed retrieval. Use `FEEDGEN_READ_API_KEY`; the administrator key is
