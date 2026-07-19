@@ -89,7 +89,7 @@ export async function resolveDynamicHandler(
   try {
     const row = await db
       .selectFrom('feedgen_ops.feed_catalog')
-      .select(['publisher_did', 'algo_policy_id', 'enabled'])
+      .select(['feed_id', 'publisher_did', 'algo_policy_id', 'enabled'])
       .where('rkey', '=', rkey)
       .executeTakeFirst()
 
@@ -116,7 +116,12 @@ export async function resolveDynamicHandler(
           `[${new Date().toISOString()}] - catalog-dispatch: publisher_did empty for rkey=${rkey}; will return zero publisher posts`,
         )
       }
-      const { buildPublisher, buildFollows } = pickPolicy(policy, publisherDid, rkey)
+      const { buildPublisher, buildFollows } = pickPolicy(
+        policy,
+        publisherDid,
+        rkey,
+        String(row.feed_id),
+      )
       handler = async (
         ctx: AppContext,
         params: QueryParams,

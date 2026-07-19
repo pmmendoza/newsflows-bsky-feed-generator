@@ -18,6 +18,7 @@ export function publisherQueryRankerPriority(
   limit: number,
   publisherDid: string,
   shortname: string,
+  feedId = shortname,
 ) {
   const base = db
     .selectFrom('post')
@@ -26,7 +27,7 @@ export function publisherQueryRankerPriority(
     .where('post.indexedAt', '>=', timeLimit)
   return applyPriorityOrderForFeed(
     applyPoliticianFilterIfEnabled(base, shortname),
-    shortname,
+    feedId,
   ).offset(cursorOffset).limit(limit)
 }
 
@@ -38,6 +39,7 @@ export function followsQueryRankerPriority(
   limit: number,
   publisherDid: string,
   shortname: string,
+  feedId = shortname,
 ) {
   const base = db
     .selectFrom('post')
@@ -47,6 +49,6 @@ export function followsQueryRankerPriority(
     .where((eb) => eb('author', 'in', requesterFollows))
   return applyPriorityOrderForFeed(
     applyPoliticianFilterIfEnabled(base, shortname),
-    shortname,
+    feedId,
   ).offset(cursorOffset).limit(limit)
 }
