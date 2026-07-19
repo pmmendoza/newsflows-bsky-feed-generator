@@ -123,10 +123,20 @@ raw secrets.
 
 Migration 005 is an expand-only step: it adds the canonical columns with
 metadata-only defaults and installs compatibility triggers while the old app
-continues to serve. It does not scan or rewrite existing rows.
+continues to serve. It does not scan or rewrite existing rows. Its transaction
+uses a two-second local lock timeout, so lock contention aborts and rolls back
+the attempt instead of waiting behind production traffic; investigate and
+retry rather than increasing the timeout in place.
 
-After applying the migration, backfill in explicit bounded batches and retain
-the reported cursor for resumption:
+Build or pull the new feedgen image, but do not replace the running app
+container. Use that staged image in a one-off, `--rm`/`--no-deps` container to
+run `yarn db:migrate:built`; the old image must remain the serving app throughout
+the expand and backfill stages. Use the production deploy runbook's explicit
+env-file, network, image-digest, and target-confirmation controls for every
+one-off invocation.
+
+Still using one-off containers from the staged new image, backfill in explicit
+bounded batches and retain the reported cursor for resumption:
 
 ```bash
 yarn db:link-columns:built --target post --batch-size 10000 --max-batches 10
@@ -147,10 +157,12 @@ yarn db:link-columns:built --target post --batch-size 10000 --verify-only
 yarn db:link-columns:built --target archive --batch-size 10000 --verify-only
 ```
 
-The required order is: expand while the old app serves, bounded resumable
-backfill, zero-mismatch verification, then app reader cutover. Final equality
-constraints and any default, trigger, or legacy-column removal belong in a
-later owner-gated contract migration.
+The required order is: stage the new image without switching the app, run the
+expand migration from a one-off new-image container while the old app serves,
+run bounded resumable backfill and full zero-mismatch verification from one-off
+new-image containers, then switch the serving app to that verified image. Final
+equality constraints and any default, trigger, or legacy-column removal belong
+in a later owner-gated contract migration.
 
 ## Central Feed Catalog Ops
 

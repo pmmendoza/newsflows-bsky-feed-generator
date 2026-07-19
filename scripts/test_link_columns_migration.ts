@@ -67,6 +67,16 @@ async function main() {
         ('at://archive-2', 'cid-2', 'https://example.com/archive-2', '', '')
     `.execute(db)
     assert.equal(await archiveHasCanonicalLinkUri(db), false)
+    await sql`
+      ALTER TABLE research_archive.post_snapshot ADD COLUMN link_uri integer
+    `.execute(db)
+    await assert.rejects(
+      archiveHasCanonicalLinkUri(db),
+      /post_snapshot\.link_uri schema mismatch: expected text/,
+    )
+    await sql`
+      ALTER TABLE research_archive.post_snapshot DROP COLUMN link_uri
+    `.execute(db)
 
     const migrationSource = fs.readFileSync(
       path.join(__dirname, '../src/db/migrations.ts'),
@@ -77,9 +87,60 @@ async function main() {
     assert(!migrationSource.includes('UPDATE research_archive.post_snapshot'))
     assert(!migrationSource.includes('VALIDATE CONSTRAINT'))
     assert(!migrationSource.includes('ALTER COLUMN link_uri SET NOT NULL'))
+    assert(migrationSource.includes("SET LOCAL lock_timeout = '2s'"))
 
-    await migrations['005_canonical_link_columns'].up(db)
-    await migrations['005_canonical_link_columns'].up(db) // idempotency
+    const runMigration005 = () => db.transaction().execute(
+      (trx) => migrations['005_canonical_link_columns'].up(trx),
+    )
+
+    // A reader holding ACCESS SHARE blocks ALTER TABLE's ACCESS EXCLUSIVE lock.
+    // The transaction-local timeout must fail quickly, roll back every partial
+    // object, and leave the same pooled connection's setting unchanged.
+    const lockerPool = new Pool({ connectionString: dsn, max: 1 })
+    const locker = await lockerPool.connect()
+    try {
+      await locker.query('BEGIN')
+      await locker.query('LOCK TABLE public.post IN ACCESS SHARE MODE')
+      const startedAt = Date.now()
+      await db.connection().execute(async (connectionDb) => {
+        const before = await sql<{ lock_timeout: string }>`SHOW lock_timeout`
+          .execute(connectionDb)
+        await assert.rejects(
+          connectionDb.transaction().execute(
+            (trx) => migrations['005_canonical_link_columns'].up(trx),
+          ),
+          /canceling statement due to lock timeout/,
+        )
+        const elapsedMs = Date.now() - startedAt
+        assert(elapsedMs >= 1_500, `lock timeout fired too early: ${elapsedMs}ms`)
+        assert(elapsedMs < 5_000, `lock timeout was not bounded: ${elapsedMs}ms`)
+        const after = await sql<{ lock_timeout: string }>`SHOW lock_timeout`
+          .execute(connectionDb)
+        assert.equal(after.rows[0].lock_timeout, before.rows[0].lock_timeout)
+      })
+
+      const partial = await sql<{ columns: string; trigger_function: string | null }>`
+        SELECT
+          count(*) FILTER (
+            WHERE column_name IN ('link_uri', 'link_title', 'link_description')
+          )::text AS columns,
+          to_regprocedure('public.feedgen_sync_post_link_columns()')::text
+            AS trigger_function
+        FROM information_schema.columns
+        WHERE table_schema = 'public' AND table_name = 'post'
+      `.execute(db)
+      assert.deepEqual(partial.rows[0], {
+        columns: '0',
+        trigger_function: null,
+      })
+    } finally {
+      await locker.query('ROLLBACK')
+      locker.release()
+      await lockerPool.end()
+    }
+
+    await runMigration005()
+    await runMigration005() // idempotency
     assert.equal(await archiveHasCanonicalLinkUri(db), true)
 
     // Existing heap rows expose the catalog default without being updated.

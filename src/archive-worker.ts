@@ -77,15 +77,20 @@ const toErrorText = (error: unknown) => {
 const asPayload = (row: ArchiveOutbox): ArchivePayload => row.payload_json as ArchivePayload
 
 export async function archiveHasCanonicalLinkUri(db: Database): Promise<boolean> {
-  const result = await sql<{ present: boolean }>`
-    SELECT EXISTS (
-      SELECT 1 FROM information_schema.columns
-      WHERE table_schema = 'research_archive'
-        AND table_name = 'post_snapshot'
-        AND column_name = 'link_uri'
-    ) AS present
+  const result = await sql<{ data_type: string }>`
+    SELECT data_type
+    FROM information_schema.columns
+    WHERE table_schema = 'research_archive'
+      AND table_name = 'post_snapshot'
+      AND column_name = 'link_uri'
   `.execute(db)
-  return result.rows[0]?.present === true
+  const dataType = result.rows[0]?.data_type
+  if (dataType && dataType !== 'text') {
+    throw new Error(
+      'research_archive.post_snapshot.link_uri schema mismatch: expected text',
+    )
+  }
+  return dataType === 'text'
 }
 
 // Sprint 8 L1 (TASK-041.01) — research-db dual-write.

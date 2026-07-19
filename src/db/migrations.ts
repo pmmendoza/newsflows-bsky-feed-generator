@@ -394,6 +394,11 @@ migrations['004_exact_feed_subscriptions'] = {
 
 migrations['005_canonical_link_columns'] = {
   async up(db: Kysely<unknown>) {
+    // Kysely runs migrations in a transaction. Keep this transaction-local so
+    // a busy table fails quickly and the pooled session reverts automatically.
+    // This covers both ALTER TABLE and the later CREATE TRIGGER statements.
+    await sql`SET LOCAL lock_timeout = '2s'`.execute(db)
+
     await sql`
       DO $migration$
       BEGIN
