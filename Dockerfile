@@ -28,6 +28,8 @@ ENV NODE_ENV=production \
 COPY --from=prod-deps /app/node_modules ./node_modules
 COPY --from=prod-deps /app/THIRD_PARTY_NOTICES.md ./THIRD_PARTY_NOTICES.md
 COPY --from=build /app/dist ./dist
+RUN test -f ./dist/scripts/migrate.js \
+  && test -f ./dist/scripts/migrate-status.js
 COPY package.json yarn.lock ./
 COPY LICENSE ./LICENSE
 
