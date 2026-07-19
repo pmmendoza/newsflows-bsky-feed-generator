@@ -26,6 +26,12 @@ async function rollbackThroughSubscriptionMigration(db: ReturnType<typeof create
   `.execute(db)).rows.length) {
     const down = await migrator.migrateDown()
     if (down.error) throw down.error
+    const irreversible = down.results?.find((result) => result.status === 'NotExecuted')
+    if (irreversible) {
+      // The disposable schema keeps the idempotent expand migration's columns;
+      // remove only its migration record so this test can exercise migration 004.
+      await sql`DELETE FROM kysely_migration WHERE name = ${irreversible.migrationName}`.execute(db)
+    }
   }
 }
 
