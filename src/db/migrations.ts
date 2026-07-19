@@ -619,6 +619,10 @@ migrations['005_canonical_link_columns'] = {
           'Deprecated compatibility mirror of link_uri; remove only at the gated contract stage';
       END
       $migration$;
+    `.execute(db)
+  },
+}
+
 // BE-VLG condition IDs are intentionally semantic inside the estate while
 // their Bluesky-facing rkeys remain neutral.  This migration is the sole
 // primary-key rename path; routine catalog administration cannot edit feed_id.
@@ -644,7 +648,7 @@ migrations['006_semantic_be_feed_ids'] = {
         IF old_count = 0 THEN
           RETURN;
         ELSIF old_count <> 2 OR new_count <> 0 THEN
-          RAISE EXCEPTION '005_semantic_be_feed_ids requires exactly the two legacy BE rows and no semantic replacements';
+          RAISE EXCEPTION '006_semantic_be_feed_ids requires exactly the two legacy BE rows and no semantic replacements';
         END IF;
 
         IF to_regclass('ranker_prod.feed_current_priority') IS NOT NULL THEN
@@ -693,7 +697,7 @@ migrations['006_semantic_be_feed_ids'] = {
         IF new_count = 0 THEN
           RETURN;
         ELSIF new_count <> 2 OR old_count <> 0 THEN
-          RAISE EXCEPTION '005_semantic_be_feed_ids rollback requires exactly the two semantic BE rows and no legacy replacements';
+          RAISE EXCEPTION '006_semantic_be_feed_ids rollback requires exactly the two semantic BE rows and no legacy replacements';
         END IF;
 
         IF to_regclass('ranker_prod.feed_current_priority') IS NOT NULL THEN
