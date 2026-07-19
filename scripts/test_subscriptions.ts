@@ -18,11 +18,26 @@ function assert(condition: unknown, message: string): asserts condition {
   if (!condition) throw new Error(message)
 }
 
+async function rollbackThroughSubscriptionMigration(db: ReturnType<typeof createDb>) {
+  const migrator = new Migrator({ db, provider: migrationProvider })
+  while ((await sql`
+    SELECT 1 FROM kysely_migration
+    WHERE name = '004_exact_feed_subscriptions'
+  `.execute(db)).rows.length) {
+    const down = await migrator.migrateDown()
+    if (down.error) throw down.error
+    const irreversible = down.results?.find((result) => result.status === 'NotExecuted')
+    if (irreversible) {
+      // The disposable schema keeps the idempotent expand migration's columns;
+      // remove only its migration record so this test can exercise migration 004.
+      await sql`DELETE FROM kysely_migration WHERE name = ${irreversible.migrationName}`.execute(db)
+    }
+  }
+}
+
 async function testMalformedOwnerSchemaIsRejected(db: ReturnType<typeof createDb>) {
   await migrateToLatest(db)
-  const migrator = new Migrator({ db, provider: migrationProvider })
-  const down = await migrator.migrateDown()
-  if (down.error) throw down.error
+  await rollbackThroughSubscriptionMigration(db)
 
   await sql`
     ALTER TABLE subscriber ADD COLUMN access_scope varchar;
@@ -133,9 +148,7 @@ async function testValidOwnerSchemaSurvivesRollback(db: ReturnType<typeof create
   `.execute(db)
 
   await migrateToLatest(db)
-  const migrator = new Migrator({ db, provider: migrationProvider })
-  const down = await migrator.migrateDown()
-  if (down.error) throw down.error
+  await rollbackThroughSubscriptionMigration(db)
 
   const objects = await sql<{ table_exists: boolean; column_exists: boolean }>`
     SELECT
@@ -203,9 +216,7 @@ async function main() {
       .execute()
     await db.deleteFrom('subscriber').where('did', '=', did).execute()
 
-    const migrator = new Migrator({ db, provider: migrationProvider })
-    const down = await migrator.migrateDown()
-    if (down.error) throw down.error
+    await rollbackThroughSubscriptionMigration(db)
     await db.insertInto('subscriber').values({ handle: identity.handle, did }).execute()
     await migrateToLatest(db)
     const backfill = await db

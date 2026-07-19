@@ -65,6 +65,7 @@ export function pickPolicy(
   policy: Policy,
   publisherDid: string,
   shortname: string,
+  feedId = shortname,
 ): { buildPublisher: QueryBuilder; buildFollows: QueryBuilder } {
   switch (policy) {
     case 'chronological':
@@ -77,9 +78,9 @@ export function pickPolicy(
     case 'ranker-priority':
       return {
         buildPublisher: (db, t, f, c, l) =>
-          publisherQueryRankerPriority(db, t, f, c, l, publisherDid, shortname),
+          publisherQueryRankerPriority(db, t, f, c, l, publisherDid, shortname, feedId),
         buildFollows: (db, t, f, c, l) =>
-          followsQueryRankerPriority(db, t, f, c, l, publisherDid, shortname),
+          followsQueryRankerPriority(db, t, f, c, l, publisherDid, shortname, feedId),
       }
     case 'engagement-sorted':
       return {

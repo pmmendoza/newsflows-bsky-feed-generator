@@ -622,3 +622,107 @@ migrations['005_canonical_link_columns'] = {
     `.execute(db)
   },
 }
+
+// BE-VLG condition IDs are intentionally semantic inside the estate while
+// their Bluesky-facing rkeys remain neutral.  This migration is the sole
+// primary-key rename path; routine catalog administration cannot edit feed_id.
+migrations['006_semantic_be_feed_ids'] = {
+  async up(db: Kysely<unknown>) {
+    await sql`
+      DO $$
+      DECLARE
+        old_count integer;
+        new_count integer;
+      BEGIN
+        IF to_regclass('feedgen_ops.feed_catalog') IS NULL THEN
+          RETURN;
+        END IF;
+
+        SELECT count(*) INTO old_count
+        FROM feedgen_ops.feed_catalog
+        WHERE feed_id IN ('newsflow-be-k', 'newsflow-be-m');
+        SELECT count(*) INTO new_count
+        FROM feedgen_ops.feed_catalog
+        WHERE feed_id IN ('be-k-conventional', 'be-m-party-diversity');
+
+        IF old_count = 0 THEN
+          RETURN;
+        ELSIF old_count <> 2 OR new_count <> 0 THEN
+          RAISE EXCEPTION '006_semantic_be_feed_ids requires exactly the two legacy BE rows and no semantic replacements';
+        END IF;
+
+        IF to_regclass('ranker_prod.feed_current_priority') IS NOT NULL THEN
+          UPDATE ranker_prod.feed_current_priority
+          SET feed_id = CASE feed_id
+            WHEN 'newsflow-be-k' THEN 'be-k-conventional'
+            WHEN 'newsflow-be-m' THEN 'be-m-party-diversity'
+          END
+          WHERE feed_id IN ('newsflow-be-k', 'newsflow-be-m');
+        END IF;
+
+        UPDATE feedgen_ops.subscriber_feed_assignment
+        SET feed_id = CASE feed_id
+          WHEN 'newsflow-be-k' THEN 'be-k-conventional'
+          WHEN 'newsflow-be-m' THEN 'be-m-party-diversity'
+        END
+        WHERE feed_id IN ('newsflow-be-k', 'newsflow-be-m');
+
+        UPDATE feedgen_ops.feed_catalog
+        SET feed_id = CASE feed_id
+          WHEN 'newsflow-be-k' THEN 'be-k-conventional'
+          WHEN 'newsflow-be-m' THEN 'be-m-party-diversity'
+        END
+        WHERE feed_id IN ('newsflow-be-k', 'newsflow-be-m');
+      END $$;
+    `.execute(db)
+  },
+  async down(db: Kysely<unknown>) {
+    await sql`
+      DO $$
+      DECLARE
+        old_count integer;
+        new_count integer;
+      BEGIN
+        IF to_regclass('feedgen_ops.feed_catalog') IS NULL THEN
+          RETURN;
+        END IF;
+
+        SELECT count(*) INTO old_count
+        FROM feedgen_ops.feed_catalog
+        WHERE feed_id IN ('newsflow-be-k', 'newsflow-be-m');
+        SELECT count(*) INTO new_count
+        FROM feedgen_ops.feed_catalog
+        WHERE feed_id IN ('be-k-conventional', 'be-m-party-diversity');
+
+        IF new_count = 0 THEN
+          RETURN;
+        ELSIF new_count <> 2 OR old_count <> 0 THEN
+          RAISE EXCEPTION '006_semantic_be_feed_ids rollback requires exactly the two semantic BE rows and no legacy replacements';
+        END IF;
+
+        IF to_regclass('ranker_prod.feed_current_priority') IS NOT NULL THEN
+          UPDATE ranker_prod.feed_current_priority
+          SET feed_id = CASE feed_id
+            WHEN 'be-k-conventional' THEN 'newsflow-be-k'
+            WHEN 'be-m-party-diversity' THEN 'newsflow-be-m'
+          END
+          WHERE feed_id IN ('be-k-conventional', 'be-m-party-diversity');
+        END IF;
+
+        UPDATE feedgen_ops.subscriber_feed_assignment
+        SET feed_id = CASE feed_id
+          WHEN 'be-k-conventional' THEN 'newsflow-be-k'
+          WHEN 'be-m-party-diversity' THEN 'newsflow-be-m'
+        END
+        WHERE feed_id IN ('be-k-conventional', 'be-m-party-diversity');
+
+        UPDATE feedgen_ops.feed_catalog
+        SET feed_id = CASE feed_id
+          WHEN 'be-k-conventional' THEN 'newsflow-be-k'
+          WHEN 'be-m-party-diversity' THEN 'newsflow-be-m'
+        END
+        WHERE feed_id IN ('be-k-conventional', 'be-m-party-diversity');
+      END $$;
+    `.execute(db)
+  },
+}
