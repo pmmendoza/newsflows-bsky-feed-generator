@@ -18,6 +18,7 @@
     "archiveWorker": "ts-node src/archive-worker.ts",
     "build": "tsc",
     "test:feed-catalog-admin": "ts-node scripts/test_feed_catalog_admin.ts",
+    "test:link-columns": "ts-node scripts/test_link_fields.ts && ts-node scripts/test_link_columns_migration.ts",
     "test:politician-filter": "ts-node scripts/test_politician_filter.ts",
     "test:politician-filter-execute": "ts-node scripts/test_politician_filter_execute.ts",
     "test:subscriptions": "ts-node scripts/test_subscription_state_unit.ts && ts-node scripts/test_access_policy.ts && ts-node scripts/test_subscriptions.ts && ts-node scripts/test_subscription_state_integration.ts",

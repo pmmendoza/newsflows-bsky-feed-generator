@@ -2,6 +2,17 @@ import dotenv from 'dotenv'
 import { sql } from 'kysely'
 import { createDb, Database } from './db'
 import { ArchiveOutbox, Post } from './db/schema'
+import { dualWriteLinkFields } from './util/link-fields'
+
+type LinkFieldName =
+  | 'link_uri'
+  | 'link_title'
+  | 'link_description'
+  | 'linkUrl'
+  | 'linkTitle'
+  | 'linkDescription'
+
+type ArchivePost = Omit<Post, LinkFieldName> & Partial<Pick<Post, LinkFieldName>>
 
 type ArchivePayload = {
   schema_version?: number
@@ -21,7 +32,7 @@ type ArchivePayload = {
     algo_policy_id?: string | null
     ranker_run_id?: string | null
   }
-  post?: Post
+  post?: ArchivePost
 }
 
 
@@ -112,6 +123,7 @@ async function replicateToResearchDb(
 
     const createdAt = parseDate(post.createdAt)
     const indexedAt = parseDate(post.indexedAt)
+    const links = dualWriteLinkFields(post)
 
     await trx
       .insertInto('research_archive.post_snapshot')
@@ -126,9 +138,10 @@ async function replicateToResearchDb(
         text: post.text,
         root_uri: post.rootUri,
         root_cid: post.rootCid,
-        link_url: post.linkUrl,
-        link_title: post.linkTitle,
-        link_description: post.linkDescription,
+        link_uri: links.link_uri,
+        link_url: links.linkUrl,
+        link_title: links.link_title,
+        link_description: links.link_description,
         raw_record_json: payload,
         first_seen_at: indexedAt,
         first_captured_from: payload.captured_from ?? 'served',
@@ -260,6 +273,7 @@ async function archiveRow(db: Database, row: ArchiveOutbox) {
 
     const createdAt = parseDate(post.createdAt)
     const indexedAt = parseDate(post.indexedAt)
+    const links = dualWriteLinkFields(post)
 
     await trx
       .insertInto('research_archive.post_snapshot')
@@ -274,9 +288,10 @@ async function archiveRow(db: Database, row: ArchiveOutbox) {
         text: post.text,
         root_uri: post.rootUri,
         root_cid: post.rootCid,
-        link_url: post.linkUrl,
-        link_title: post.linkTitle,
-        link_description: post.linkDescription,
+        link_uri: links.link_uri,
+        link_url: links.linkUrl,
+        link_title: links.link_title,
+        link_description: links.link_description,
         raw_record_json: payload,
         first_seen_at: indexedAt,
         first_captured_from: payload.captured_from ?? 'served',

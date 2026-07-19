@@ -30,6 +30,10 @@ export type Post = {
   text: string
   rootUri: string
   rootCid: string
+  link_uri: string
+  link_title: string
+  link_description: string
+  // Deprecated compatibility columns; remove only in the gated contract stage.
   linkUrl: string
   linkTitle: string
   linkDescription: string
@@ -133,6 +137,8 @@ export type PostSnapshot = {
   text?: string | null
   root_uri?: string | null
   root_cid?: string | null
+  link_uri?: string | null
+  // Deprecated compatibility column; remove only in the gated contract stage.
   link_url?: string | null
   link_title?: string | null
   link_description?: string | null

@@ -1,5 +1,6 @@
 import dotenv from 'dotenv'
 import { createDb } from '../db'
+import { dualWriteLinkFields } from '../util/link-fields'
 
 type AppViewPost = {
   uri?: string
@@ -30,6 +31,9 @@ export type BackfillPostRow = {
   text: string
   rootUri: string
   rootCid: string
+  link_uri: string
+  link_title: string
+  link_description: string
   linkUrl: string
   linkTitle: string
   linkDescription: string
@@ -115,9 +119,11 @@ export function normalizeAppViewPost(
     text: sanitizeForPostgres(record.text),
     rootUri: record.reply?.root?.uri || '',
     rootCid: record.reply?.root?.cid || '',
-    linkUrl: embed?.uri || '',
-    linkTitle: sanitizeForPostgres(embed?.title),
-    linkDescription: sanitizeForPostgres(embed?.description),
+    ...dualWriteLinkFields({
+      link_uri: embed?.uri || '',
+      link_title: sanitizeForPostgres(embed?.title),
+      link_description: sanitizeForPostgres(embed?.description),
+    }),
   }
 }
 

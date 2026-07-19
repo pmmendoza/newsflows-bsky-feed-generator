@@ -3,6 +3,7 @@ import { QueryParams, OutputSchema as AlgoOutput } from '../lexicon/types/app/bs
 import { DatabaseSchema, Post } from '../db/schema'
 import { AppContext } from '../config'
 import { SkeletonFeedPost } from '../lexicon/types/app/bsky/feed/defs'
+import { dualWriteLinkFields } from '../util/link-fields'
 
 // Type definition for FeedGenerator handler
 export type FeedGenerator = (ctx: AppContext, params: QueryParams, requesterDid: string) => Promise<AlgoOutput>
@@ -296,9 +297,14 @@ function buildArchivePayload({
       text: post.text,
       rootUri: post.rootUri,
       rootCid: post.rootCid,
-      linkUrl: post.linkUrl,
-      linkTitle: post.linkTitle,
-      linkDescription: post.linkDescription,
+      ...dualWriteLinkFields({
+        link_uri: post.link_uri,
+        link_title: post.link_title,
+        link_description: post.link_description,
+        linkUrl: post.linkUrl,
+        linkTitle: post.linkTitle,
+        linkDescription: post.linkDescription,
+      }),
       likes_count: post.likes_count ?? null,
       repost_count: post.repost_count ?? null,
       comments_count: post.comments_count ?? null,

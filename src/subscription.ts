@@ -10,6 +10,7 @@ import {
   trackSubscriberActivityEnabled,
   restrictPublisherEngagementToSubscribersEnabled,
 } from './util/ingestion-scope'
+import { dualWriteLinkFields } from './util/link-fields'
 
 // for saving embedded preview cards
 function isExternalEmbed(embed: any): embed is { external: { uri: string, title: string, description: string } } {
@@ -159,6 +160,9 @@ export class FirehoseSubscription extends FirehoseSubscriptionBase {
       .filter(shouldStorePost)
       .map((create) => {
         const postIndexedAt = new Date().toISOString()
+        const external = create.record.embed && isExternalEmbed(create.record.embed)
+          ? create.record.embed.external
+          : null
         return {
           uri: create.uri,
           cid: create.cid,
@@ -169,13 +173,11 @@ export class FirehoseSubscription extends FirehoseSubscriptionBase {
           rootUri: create.record.reply?.root?.uri || "",
           rootCid: create.record.reply?.root?.cid || "",
           // extract preview card info if present
-          linkUrl: create.record.embed && isExternalEmbed(create.record.embed) ? create.record.embed.external.uri : "",
-          linkTitle: sanitizeForPostgres(
-            create.record.embed && isExternalEmbed(create.record.embed) ? create.record.embed.external.title : ""
-          ),
-          linkDescription: sanitizeForPostgres(
-            create.record.embed && isExternalEmbed(create.record.embed) ? create.record.embed.external.description : ""
-          ),
+          ...dualWriteLinkFields({
+            link_uri: external?.uri ?? '',
+            link_title: sanitizeForPostgres(external?.title),
+            link_description: sanitizeForPostgres(external?.description),
+          }),
         }
       })
 
