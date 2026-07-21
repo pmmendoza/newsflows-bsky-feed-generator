@@ -30,7 +30,11 @@ async function main() {
     `.execute(db)
 
     const migrator = new Migrator({ db, provider: migrationProvider })
-    const down = await migrator.migrateDown()
+    // Target the migration immediately before 006 explicitly (not a bare
+    // migrateDown(), which only undoes the single most-recently-applied
+    // migration — 007_subscriber_state_and_kind now sits after 006 in the
+    // chain, so a single migrateDown() would undo 007, not 006).
+    const down = await migrator.migrateTo('005_canonical_link_columns')
     if (down.error) throw down.error
 
     await db.deleteFrom('feedgen_ops.subscriber_feed_assignment').where('did', '=', 'did:plc:semantic-feed-id-test').execute()
@@ -66,7 +70,7 @@ async function main() {
     assert.equal((await db.selectFrom('ranker_prod.feed_current_priority').select('feed_id').where('run_id', '=', 'semantic-test').executeTakeFirstOrThrow()).feed_id, 'be-m-party-diversity')
 
     await migrateToLatest(db) // applied migrations are a replay-safe no-op
-    const rollback = await migrator.migrateDown()
+    const rollback = await migrator.migrateTo('005_canonical_link_columns')
     if (rollback.error) throw rollback.error
     assert.equal((await db.selectFrom('feedgen_ops.feed_catalog').select('feed_id').where('rkey', '=', 'newsflow-be-k').executeTakeFirstOrThrow()).feed_id, 'newsflow-be-k')
   } finally {

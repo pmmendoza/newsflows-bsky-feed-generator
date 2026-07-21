@@ -4,6 +4,7 @@ export type DatabaseSchema = {
   follows: Follows
   sub_state: SubState
   subscriber: Subscriber
+  subscriber_handle_history: SubscriberHandleHistory
   request_log: RequestLog
   request_posts: RequestPosts
   'feedgen_ops.archive_outbox': ArchiveOutbox
@@ -64,10 +65,27 @@ export type SubState = {
   cursor: bigint
 }
 
+export type SubscriberKind = 'participant' | 'publisher' | 'testing' | 'researcher'
+
 export type Subscriber = {
   handle: string
   did: string
   access_scope?: 'omni' | 'assigned' | 'none'
+  // Additive INFRA-WEB-024/030 columns (migration 007). No column DEFAULT on
+  // the two timestamps (RT-2) — stamped explicitly by exact-subscription.ts.
+  first_subscribed_at?: string | Date | null
+  scope_changed_at?: string | Date | null
+  kind?: SubscriberKind
+}
+
+// Append-only handle-rename transition log (INFRA-WEB-032, migration 007).
+export type SubscriberHandleHistory = {
+  id?: number | string
+  did: string
+  old_handle: string
+  new_handle: string
+  observed_at?: string | Date
+  source?: string | null
 }
 
 export type RequestLog = {

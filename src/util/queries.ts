@@ -167,6 +167,21 @@ interface ProfileResponse {
 }
 
 
+// RT-8: the exact-feed mutation write-path resolves identity via this
+// function exactly once, at apply time. Bound the fetch so a slow/hanging
+// AppView never stalls a mutation (or a batch of them) indefinitely.
+const PROFILE_FETCH_TIMEOUT_MS = 5000;
+
+async function fetchWithTimeout(url: string, timeoutMs: number): Promise<Response> {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+        return await fetch(url, { signal: controller.signal });
+    } finally {
+        clearTimeout(timer);
+    }
+}
+
 // Query API for user profile
 export async function getProfile(actor: string): Promise<ProfileResponse | null> {
     const baseUrl = 'https://public.api.bsky.app/xrpc/app.bsky.actor.getProfile';
@@ -181,8 +196,8 @@ export async function getProfile(actor: string): Promise<ProfileResponse | null>
         try {
             const url = new URL(baseUrl);
             url.searchParams.append('actor', actor);
-            
-            const response = await fetch(url.toString());
+
+            const response = await fetchWithTimeout(url.toString(), PROFILE_FETCH_TIMEOUT_MS);
 
             if (!response.ok) {
                 if (response.status === 400) {

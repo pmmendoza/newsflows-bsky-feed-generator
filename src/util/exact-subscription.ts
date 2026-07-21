@@ -94,6 +94,65 @@ export async function resolveSubscriptionIdentity(input: SubscriptionInput): Pro
   }
 }
 
+// RT-8: read-only mutation paths (inspect/preview/plan/readback) must not
+// each spend an AppView lookup — a 100-row batch must trigger <=100
+// resolutions total, not ~300 (preview + apply + readback per account).
+// Known subscribers (the common batch case) resolve from the stored DB row;
+// only a genuinely new identity (never subscribed, e.g. an "Add subscribers"
+// preview) falls through to the single AppView lookup. The apply path always
+// calls resolveSubscriptionIdentity directly (exactly one lookup, at apply
+// time) so handle-change detection compares against a value fetched in the
+// same call, never a stale DB-only guess.
+export async function resolveSubscriptionIdentityDbFirst(db: Db, input: SubscriptionInput): Promise<ResolvedIdentity> {
+  const identifiers = values(input, ['identifier', 'did', 'handle'])
+  if (identifiers.length !== 1) {
+    throw new SubscriptionError(400, 'invalid_identity', 'provide exactly one of identifier, did, or handle')
+  }
+  const actor = identifiers[0]
+  const column = actor.startsWith('did:') ? 'did' : 'handle'
+  const row = await db
+    .selectFrom('subscriber')
+    .select(['did', 'handle'])
+    .where(column, '=', actor)
+    .executeTakeFirst()
+  if (row) {
+    return { input: actor, handle: row.handle, did: row.did }
+  }
+  return resolveSubscriptionIdentity(input)
+}
+
+// RT-1: researcher accounts are locked to omni — no mutation may change their
+// scope/assignments, in either mutation path or the preview/plan paths.
+function assertNotResearcher(kind: string | null | undefined, did: string): void {
+  if (kind === 'researcher') {
+    throw new SubscriptionError(409, 'researcher_locked', `subscriber is a researcher account locked to omni: ${did}`)
+  }
+}
+
+async function assertSubscriberNotResearcher(db: Db, did: string): Promise<void> {
+  const row = await db.selectFrom('subscriber').select('kind').where('did', '=', did).executeTakeFirst()
+  assertNotResearcher(row?.kind, did)
+}
+
+// RT-8: called once per apply, after the row is locked, comparing the
+// AppView-resolved handle (from the single apply-time resolution) against
+// the handle already stored on the locked row. A rename updates the row and
+// appends an explicit old->new transition to the append-only history table.
+async function recordHandleChangeIfNeeded(
+  trx: Transaction<DatabaseSchema>,
+  did: string,
+  storedHandle: string | null | undefined,
+  resolvedHandle: string,
+  source: string,
+): Promise<void> {
+  if (!storedHandle || storedHandle === resolvedHandle) return
+  await trx.updateTable('subscriber').set({ handle: resolvedHandle }).where('did', '=', did).execute()
+  await trx
+    .insertInto('subscriber_handle_history')
+    .values({ did, old_handle: storedHandle, new_handle: resolvedHandle, source })
+    .execute()
+}
+
 export async function resolveSubscriptionFeed(db: Db, input: SubscriptionInput): Promise<FeedCatalog> {
   const feeds = values(input, ['feed', 'rkey'])
   if (feeds.length !== 1) {
@@ -222,8 +281,8 @@ async function applyProjectedState(
   source: string,
   before: AssignmentView[],
   next: { scope: AccessScope; assignments: AssignmentView[] },
+  now: Date,
 ): Promise<void> {
-  const now = new Date()
   const nextIds = new Set(next.assignments.map((row) => row.feed_id))
   const closeIds = before.filter((row) => !nextIds.has(row.feed_id)).map((row) => row.feed_id)
   if (closeIds.length) {
@@ -256,9 +315,12 @@ async function applyProjectedState(
       .execute()
   }
 
+  // Handle rename is written separately by recordHandleChangeIfNeeded (once
+  // per apply, alongside its history row); this UPDATE stamps scope_changed_at
+  // only when a real scope/assignment change is being applied (INFRA-WEB-024).
   const update = await trx
     .updateTable('subscriber')
-    .set({ handle: identity.handle, access_scope: next.scope })
+    .set({ access_scope: next.scope, scope_changed_at: now })
     .where('did', '=', identity.did)
     .executeTakeFirst()
   if (mode === 'remove' && Number(update.numUpdatedRows) === 0) {
@@ -274,7 +336,11 @@ export async function executeSubscription(
   boundDid?: string,
 ): Promise<SubscriptionResult> {
   const mode = parseSubscriptionMode(input.mode)
-  const identity = await resolveSubscriptionIdentity(input)
+  // RT-8: apply resolves via AppView (exactly once, at apply time); preview
+  // resolves DB-first so a batch's preview/plan calls spend no AppView budget.
+  const identity = apply
+    ? await resolveSubscriptionIdentity(input)
+    : await resolveSubscriptionIdentityDbFirst(ctx.db, input)
   if (boundDid && boundDid !== identity.did) {
     throw new SubscriptionError(403, 'identity_mismatch', 'subscription identity does not match token subject')
   }
@@ -284,6 +350,10 @@ export async function executeSubscription(
   }
   const feed = mode === 'omni' ? null : await resolveSubscriptionFeed(ctx.db, input)
   const source = input.source?.trim() || 'feedgen-subscription-api'
+
+  // RT-1: reject researcher-account mutation in the preview/plan path too,
+  // not only inside the apply transaction.
+  await assertSubscriberNotResearcher(ctx.db, identity.did)
 
   const beforeState = await inspectSubscription(ctx.db, identity)
   const next = project(beforeState.access_scope, beforeState.assignments, feed, mode)
@@ -297,21 +367,27 @@ export async function executeSubscription(
 
   if (apply) {
     didChange = await ctx.db.transaction().execute(async (trx) => {
+      const now = new Date()
       const inserted = mode === 'remove'
         ? undefined
         : await trx
           .insertInto('subscriber')
-          .values({ handle: identity.handle, did: identity.did, access_scope: 'omni' })
+          .values({ handle: identity.handle, did: identity.did, access_scope: 'omni', first_subscribed_at: now })
           .onConflict((oc) => oc.column('did').doNothing())
           .returning('did')
           .executeTakeFirst()
       const locked = await trx
         .selectFrom('subscriber')
-        .select('did')
+        .select(['did', 'kind', 'handle'])
         .where('did', '=', identity.did)
         .forUpdate()
         .executeTakeFirst()
       if (mode === 'remove' && !locked) return false
+      // RT-1: authoritative, race-safe check on the row just locked FOR UPDATE.
+      assertNotResearcher(locked?.kind, identity.did)
+      // RT-8: identity.handle was already resolved once (via AppView, above);
+      // no second lookup here — just compare to the locked row's stored value.
+      await recordHandleChangeIfNeeded(trx, identity.did, locked?.handle, identity.handle, source)
       const current = await inspectSubscription(trx, identity)
       const effectiveScope = inserted ? 'none' : current.access_scope
       const projected = project(effectiveScope, current.assignments, feed, mode)
@@ -329,6 +405,7 @@ export async function executeSubscription(
         source,
         current.assignments,
         projected,
+        now,
       )
       return true
     })
@@ -503,7 +580,11 @@ export async function setSubscription(
   updateFollows = true,
   boundDid?: string,
 ): Promise<SubscriptionResult> {
-  const identity = await resolveSubscriptionIdentity(input)
+  // RT-8: apply resolves via AppView (exactly once, at apply time); preview
+  // resolves DB-first so a batch's preview/plan calls spend no AppView budget.
+  const identity = apply
+    ? await resolveSubscriptionIdentity(input)
+    : await resolveSubscriptionIdentityDbFirst(ctx.db, input)
   if (boundDid && boundDid !== identity.did) {
     throw new SubscriptionError(403, 'identity_mismatch', 'subscription identity does not match token subject')
   }
@@ -511,6 +592,10 @@ export async function setSubscription(
   const source = input.source?.trim() || 'feedgen-subscription-api'
   const expected =
     input.expected !== undefined && input.expected !== null ? parseExpectedState(input.expected) : null
+
+  // RT-1: reject researcher-account mutation in the preview/plan path too,
+  // not only inside the apply transaction.
+  await assertSubscriberNotResearcher(ctx.db, identity.did)
 
   const beforeState = await inspectSubscription(ctx.db, identity)
 
@@ -551,13 +636,24 @@ export async function setSubscription(
   // Apply: one locked transaction. It returns the state it committed (its
   // linearization point) so the response never reflects a concurrent writer.
   const result = await ctx.db.transaction().execute(async (trx) => {
+    const now = new Date()
     const inserted = await trx
       .insertInto('subscriber')
-      .values({ handle: identity.handle, did: identity.did, access_scope: 'omni' })
+      .values({ handle: identity.handle, did: identity.did, access_scope: 'omni', first_subscribed_at: now })
       .onConflict((oc) => oc.column('did').doNothing())
       .returning('did')
       .executeTakeFirst()
-    await trx.selectFrom('subscriber').select('did').where('did', '=', identity.did).forUpdate().executeTakeFirst()
+    const locked = await trx
+      .selectFrom('subscriber')
+      .select(['did', 'kind', 'handle'])
+      .where('did', '=', identity.did)
+      .forUpdate()
+      .executeTakeFirst()
+    // RT-1: authoritative, race-safe check on the row just locked FOR UPDATE.
+    assertNotResearcher(locked?.kind, identity.did)
+    // RT-8: identity.handle was already resolved once (via AppView, above);
+    // no second lookup here — just compare to the locked row's stored value.
+    await recordHandleChangeIfNeeded(trx, identity.did, locked?.handle, identity.handle, source)
     // Two views of "before":
     //  - PHYSICAL: what the row actually holds now, incl. the bootstrap omni
     //    row a fresh insert just created. Drives whether we must write, so a
@@ -583,10 +679,16 @@ export async function setSubscription(
       desired.scope === 'assigned' ? await resolveDesiredAssignments(trx, desired.feeds, true) : []
     const next = { scope: desired.scope, assignments: nextAssignments }
     const physChanged = changed(physScope, physAssignments, next.scope, next.assignments)
-    if (physChanged) {
-      await applyProjectedState(trx, identity, closeMode(next.scope), source, physAssignments, next)
-    }
     const logicalChanged = changed(logicalScope, logicalAssignments, next.scope, next.assignments)
+    if (physChanged) {
+      await applyProjectedState(trx, identity, closeMode(next.scope), source, physAssignments, next, now)
+    } else if (inserted && logicalChanged) {
+      // A brand-new subscriber whose first desired state is 'omni' matches
+      // the bootstrap INSERT's default (physScope was already 'omni') —
+      // nothing to physically write, but it is still the participant's
+      // first real scope decision (INFRA-WEB-024: stamp scope_changed_at).
+      await trx.updateTable('subscriber').set({ scope_changed_at: now }).where('did', '=', identity.did).execute()
+    }
     return { changed: physChanged || logicalChanged, followsRelevant: logicalChanged, scope: next.scope, assignments: next.assignments }
   })
 

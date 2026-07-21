@@ -98,6 +98,10 @@ export async function importSubscribersFromCSV(
                 for (const subscriber of subscribersToInsert) {
                     await trx
                         .insertInto('subscriber')
+                        // ponytail: first_subscribed_at/scope_changed_at intentionally
+                        // omitted (RT-2) — the columns have no DB default, so a CSV
+                        // backfill row stays honestly NULL instead of stamping a false
+                        // "subscribed today".
                         .values(subscriber)
                         .onConflict((oc) => oc.doNothing())
                         .execute();

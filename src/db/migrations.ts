@@ -726,3 +726,163 @@ migrations['006_semantic_be_feed_ids'] = {
     `.execute(db)
   },
 }
+
+// WebUI subscriber-state foundation (INFRA-WEB-024/026/030/032). Ten known
+// special-group DIDs, seeded then hard-asserted (RT-6): a drifted production
+// roster must fail the migration loudly rather than silently mis-seed.
+const PUBLISHER_DIDS = [
+  'did:plc:toz4no26o2x4vsbum7cp4bxp',
+  'did:plc:kzmukwaf72iwepygposicgt3',
+  'did:plc:cegiy4pfghh4rjs7ks7pbnkm',
+  'did:plc:vzmnljt7otfbbgrmachtefxh',
+  'did:plc:tlmi333azel2jcornp2qeolm',
+]
+const TESTING_DIDS = [
+  'did:plc:weksrderzzdyxdh26pu5jyqo',
+  'did:plc:u7d6u2a5wu7dbjp6wruttlrv',
+]
+const RESEARCHER_DIDS = [
+  'did:plc:3vomhawgkjhtvw4euuxbll3r',
+  'did:plc:df5sxbescomzxz7fwovti4vd',
+  'did:plc:upgwmkhteysqu2n7mar2w4rk',
+]
+
+migrations['007_subscriber_state_and_kind'] = {
+  async up(db: Kysely<unknown>) {
+    // --- first_subscribed_at / scope_changed_at (additive, nullable, NO
+    // column DEFAULT — RT-2. Stamped explicitly by the mutation write-path in
+    // exact-subscription.ts, never by a DB default, so CSV/backfill writers
+    // that don't set them stay honestly NULL.) ---
+    await sql`
+      ALTER TABLE subscriber
+      ADD COLUMN IF NOT EXISTS first_subscribed_at timestamptz,
+      ADD COLUMN IF NOT EXISTS scope_changed_at timestamptz
+    `.execute(db)
+    await sql`
+      COMMENT ON COLUMN subscriber.first_subscribed_at IS 'feedgen:migration:007_subscriber_state_and_kind';
+      COMMENT ON COLUMN subscriber.scope_changed_at IS 'feedgen:migration:007_subscriber_state_and_kind';
+    `.execute(db)
+
+    // Backfill from feedgen_ops.subscriber_feed_assignment where rows exist;
+    // subscribers with no assignment rows (the omni majority) stay NULL —
+    // do not stamp them with the migration time.
+    await sql`
+      DO $$
+      BEGIN
+        IF to_regclass('feedgen_ops.subscriber_feed_assignment') IS NOT NULL THEN
+          UPDATE subscriber s
+          SET first_subscribed_at = agg.first_at,
+              scope_changed_at = agg.last_at
+          FROM (
+            SELECT did,
+                   MIN(active_from) AS first_at,
+                   GREATEST(MAX(active_from), MAX(active_until)) AS last_at
+            FROM feedgen_ops.subscriber_feed_assignment
+            GROUP BY did
+          ) agg
+          WHERE s.did = agg.did;
+        END IF;
+      END $$;
+    `.execute(db)
+
+    // --- kind (special-group membership; owner-owned runtime state) ---
+    await sql`
+      ALTER TABLE subscriber
+      ADD COLUMN IF NOT EXISTS kind varchar NOT NULL DEFAULT 'participant'
+    `.execute(db)
+    await sql`
+      DO $$
+      BEGIN
+        IF NOT EXISTS (
+          SELECT 1 FROM pg_constraint
+          WHERE conrelid = 'subscriber'::regclass AND conname = 'subscriber_kind_check'
+        ) THEN
+          ALTER TABLE subscriber ADD CONSTRAINT subscriber_kind_check
+            CHECK (kind IN ('participant', 'publisher', 'testing', 'researcher'));
+        END IF;
+      END $$;
+    `.execute(db)
+    await sql`COMMENT ON COLUMN subscriber.kind IS 'feedgen:migration:007_subscriber_state_and_kind'`.execute(db)
+
+    // Seed the known special-group DIDs, then hard-fail if the production
+    // roster drifted (RT-6): exactly 10 rows must be updated across the three
+    // groups, and all 10 must already be access_scope='omni'. A totally
+    // absent roster (0 updated — every fresh/dev/test DB, which never has
+    // these production subscriber rows) is a clean skip, matching the
+    // skip-if-absent idiom migration 006 already uses in this file: only a
+    // PARTIAL match (>0 and <10) or a non-omni seeded row is drift worth
+    // failing loudly for. Production always has all 10 rows before this
+    // migration runs.
+    const publisherResult = await sql`
+      UPDATE subscriber SET kind = 'publisher' WHERE did IN (${sql.join(PUBLISHER_DIDS)})
+    `.execute(db)
+    const testingResult = await sql`
+      UPDATE subscriber SET kind = 'testing' WHERE did IN (${sql.join(TESTING_DIDS)})
+    `.execute(db)
+    const researcherResult = await sql`
+      UPDATE subscriber SET kind = 'researcher' WHERE did IN (${sql.join(RESEARCHER_DIDS)})
+    `.execute(db)
+    const publisherCount = Number(publisherResult.numAffectedRows ?? 0)
+    const testingCount = Number(testingResult.numAffectedRows ?? 0)
+    const researcherCount = Number(researcherResult.numAffectedRows ?? 0)
+    const totalSeeded = publisherCount + testingCount + researcherCount
+    if (totalSeeded !== 0) {
+      if (totalSeeded !== 10) {
+        throw new Error(
+          '007_subscriber_state_and_kind seed mismatch: expected exactly 10 subscriber rows updated ' +
+          `(publisher=${publisherCount}, testing=${testingCount}, researcher=${researcherCount}), got ${totalSeeded}`,
+        )
+      }
+      const allSeededDids = [...PUBLISHER_DIDS, ...TESTING_DIDS, ...RESEARCHER_DIDS]
+      const omniCheck = await sql<{ count: string }>`
+        SELECT count(*) AS count FROM subscriber
+        WHERE did IN (${sql.join(allSeededDids)}) AND access_scope = 'omni'
+      `.execute(db)
+      const omniCount = Number(omniCheck.rows[0]?.count ?? 0)
+      if (omniCount !== 10) {
+        throw new Error(
+          '007_subscriber_state_and_kind seed mismatch: expected all 10 seeded kind DIDs to be ' +
+          `access_scope='omni', got ${omniCount}`,
+        )
+      }
+    }
+
+    // --- subscriber_handle_history (append-only rename transition log) ---
+    await sql`
+      CREATE TABLE IF NOT EXISTS subscriber_handle_history (
+        id bigserial PRIMARY KEY,
+        did varchar NOT NULL REFERENCES subscriber(did) ON DELETE CASCADE,
+        old_handle varchar NOT NULL,
+        new_handle varchar NOT NULL,
+        observed_at timestamptz NOT NULL DEFAULT now(),
+        source varchar
+      )
+    `.execute(db)
+    await sql`
+      CREATE INDEX IF NOT EXISTS subscriber_handle_history_did_idx
+      ON subscriber_handle_history (did, observed_at DESC)
+    `.execute(db)
+    await sql`
+      COMMENT ON TABLE subscriber_handle_history IS 'feedgen:migration:007_subscriber_state_and_kind'
+    `.execute(db)
+  },
+  async down(db: Kysely<unknown>) {
+    await sql`
+      DO $$
+      BEGIN
+        IF to_regclass('subscriber_handle_history') IS NOT NULL
+          AND obj_description('subscriber_handle_history'::regclass, 'pg_class')
+            = 'feedgen:migration:007_subscriber_state_and_kind'
+        THEN
+          DROP TABLE subscriber_handle_history;
+        END IF;
+      END $$;
+    `.execute(db)
+    await sql`
+      ALTER TABLE subscriber
+      DROP COLUMN IF EXISTS kind,
+      DROP COLUMN IF EXISTS first_subscribed_at,
+      DROP COLUMN IF EXISTS scope_changed_at
+    `.execute(db)
+  },
+}
