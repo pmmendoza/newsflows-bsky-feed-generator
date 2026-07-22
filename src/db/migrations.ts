@@ -793,3 +793,38 @@ migrations['007_subscriber_state_and_kind'] = {
     `.execute(db)
   },
 }
+
+migrations['008_feed_catalog_ranker_score_source'] = {
+  // D1.2 (TARGET_STATE DEC-MOD-051 / ontology T-D score-storage decoupling).
+  // Add the feedgen-owned RUNTIME column recording which ranker profile a feed
+  // currently serves. NULL => serve by the feed's own rkey (self), preserving
+  // today's behavior (the `?? rkey` opt-in the read path adopts in D1.4). This
+  // migration ONLY adds the nullable column; the serving read path is unchanged
+  // here (still joins ranker_prod.feed_current_priority on feed_id).
+  async up(db: Kysely<unknown>) {
+    await sql`
+      DO $$
+      BEGIN
+        IF to_regclass('feedgen_ops.feed_catalog') IS NULL THEN
+          RAISE EXCEPTION '008_feed_catalog_ranker_score_source: feedgen_ops.feed_catalog is missing';
+        END IF;
+        IF NOT EXISTS (
+          SELECT 1 FROM information_schema.columns
+          WHERE table_schema = 'feedgen_ops' AND table_name = 'feed_catalog'
+            AND column_name = 'ranker_score_source'
+        ) THEN
+          ALTER TABLE feedgen_ops.feed_catalog
+            ADD COLUMN ranker_score_source text DEFAULT NULL;
+          COMMENT ON COLUMN feedgen_ops.feed_catalog.ranker_score_source IS
+            'feedgen:migration:008_feed_catalog_ranker_score_source';
+        END IF;
+      END $$
+    `.execute(db)
+  },
+  async down(db: Kysely<unknown>) {
+    await sql`
+      ALTER TABLE feedgen_ops.feed_catalog
+      DROP COLUMN IF EXISTS ranker_score_source
+    `.execute(db)
+  },
+}
