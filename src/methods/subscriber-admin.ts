@@ -135,8 +135,12 @@ async function buildQPredicate(ctx: AppContext, q: string): Promise<{ predicate:
     return { predicate: regexPredicate }
   } catch (err: any) {
     if (err?.code === '2201B') {
-      const literal = `%${q}%`
-      return { predicate: sql<boolean>`(subscriber.handle ILIKE ${literal} OR subscriber.did ILIKE ${literal})` }
+      // Escape ILIKE's own metacharacters (\, %, _) so the fallback is a TRUE
+      // literal substring match — otherwise a % or _ in the (invalid-regex)
+      // search term would still act as a SQL wildcard and over-match.
+      const escaped = q.replace(/[\\%_]/g, '\\$&')
+      const literal = `%${escaped}%`
+      return { predicate: sql<boolean>`(subscriber.handle ILIKE ${literal} ESCAPE '\\' OR subscriber.did ILIKE ${literal} ESCAPE '\\')` }
     }
     throw err
   }
@@ -216,7 +220,11 @@ export default function registerSubscriberAdminEndpoints(server: Server, ctx: Ap
       const dir = parseDir(req.query?.dir)
       const q = parseQ(req.query?.q)
 
-      const rawFeed = req.query?.feed
+      // Back-compat: an empty singular `feed=` meant "no filter" (falsy) on
+      // origin/main; treat it as absent so a WebUI "all feeds" control that
+      // submits feed="" gets the unfiltered list, not a 400 (feed[] arrays and
+      // non-empty values are unaffected).
+      const rawFeed = req.query?.feed === '' ? undefined : req.query?.feed
       const usingNewParams = sort !== 'did' || dir !== 'asc' || q !== undefined || Array.isArray(rawFeed)
       let legacyFeed: Awaited<ReturnType<typeof resolveSubscriptionFeed>> | null = null
       let andFeedIds: string[] | null = null

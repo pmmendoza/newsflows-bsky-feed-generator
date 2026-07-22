@@ -322,6 +322,17 @@ async function main() {
     assert(validRegexQ.subscribers.some((s: any) => s.did === jgruber.did), '4c: a valid regex must match by handle')
     const brokenRegexQ = await fetch(`${base}/api/admin/subscribers?q=${encodeURIComponent('foo(')}`, { headers: readHeaders })
     assert(brokenRegexQ.status === 200, '4c: an invalid regex must fall back to a literal match, not 500')
+    // 4c-escape: the 2201B ILIKE fallback must escape %/_ so it is a TRUE literal
+    // substring match, never a wildcard over-match (regression for `%${q}%`).
+    // `a%b(` is an invalid regex (unbalanced paren) -> fallback, and contains `%`.
+    await db.insertInto('subscriber').values([
+      { did: 'did:plc:esc-wild', handle: 'aXb(wild.test', access_scope: 'omni' },
+      { did: 'did:plc:esc-lit', handle: 'a%b(lit.test', access_scope: 'omni' },
+    ]).execute()
+    const escFallback = await fetch(`${base}/api/admin/subscribers?q=${encodeURIComponent('a%b(')}&limit=500`, { headers: readHeaders })
+      .then((r) => r.json() as Promise<any>)
+    assert(escFallback.subscribers.some((s: any) => s.did === 'did:plc:esc-lit'), '4c-escape: fallback must match the literal "a%b(" handle')
+    assert(!escFallback.subscribers.some((s: any) => s.did === 'did:plc:esc-wild'), '4c-escape: fallback must NOT wildcard-match "aXb(" — the % must be escaped')
 
     // 4d. feed[] AND-predicate + omni-in-all + fail-closed on unknown rkey.
     await setSubscription(ctx, { did: ruben.did, state: { scope: 'assigned', feeds: ['webui-a', 'webui-b'] } }, true, false)
@@ -342,6 +353,12 @@ async function main() {
     assert(unknownFeedAnd.status === 400, '4d: an unknown rkey in feed[] must fail closed, not silently drop')
     const legacyFeedCombinedWithQ = await fetch(`${base}/api/admin/subscribers?feed=webui-a&q=x`, { headers: readHeaders })
     assert(legacyFeedCombinedWithQ.status === 400, '4d: legacy scalar feed= must reject combination with q/sort/feed[]')
+    // 4d-empty: an empty singular feed= means "no filter" (back-compat with
+    // origin/main), not 400 — a WebUI "all feeds" control may submit feed="".
+    const emptyFeed = await fetch(`${base}/api/admin/subscribers?feed=&limit=500`, { headers: readHeaders })
+    assert(emptyFeed.status === 200, '4d-empty: empty singular feed= must return 200 (no filter), not 400')
+    const emptyFeedBody = (await emptyFeed.json()) as any
+    assert(emptyFeedBody.subscribers.some((s: any) => s.did === jgruber.did), '4d-empty: empty feed= must return the unfiltered list')
 
     // 4e. handle-history endpoint.
     const handleHistoryResp = await fetch(`${base}/api/admin/subscribers/handle-history?did=${encodeURIComponent(jgruber.did)}`, { headers: readHeaders })
