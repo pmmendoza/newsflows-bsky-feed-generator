@@ -33,6 +33,7 @@ import { Server } from '../lexicon'
 import { AppContext } from '../config'
 import { FeedCatalog, FeedCatalogHistory, DatabaseSchema } from '../db/schema'
 import type { Transaction } from 'kysely'
+import { sql } from 'kysely'
 import {
   ApiKeyAuthConfig,
   isApiKeyAuthorized,
@@ -698,9 +699,12 @@ async function appendFeedCatalogHistory(
       revision,
       actor: identity.actor,
       source: identity.source,
-      before_row: before,
-      after_row: after,
-      changed_fields: changedFields,
+      // jsonb columns need an explicit JSON serialization + ::jsonb cast: node-postgres
+      // renders a JS array (changed_fields) as a Postgres array literal, not JSON, which
+      // fails as 'invalid input syntax for type json' and would roll back the apply.
+      before_row: before == null ? null : sql`${JSON.stringify(before)}::jsonb`,
+      after_row: sql`${JSON.stringify(after)}::jsonb`,
+      changed_fields: sql`${JSON.stringify(changedFields)}::jsonb`,
       feed_code_hash_before: previous
         ? previous.feed_code_hash_after ?? null
         : feedCodeHashAfter,
