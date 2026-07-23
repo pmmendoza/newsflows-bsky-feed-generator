@@ -17,6 +17,7 @@
 
 import { Kysely, SqlBool, sql } from 'kysely'
 import { DatabaseSchema } from '../db/schema'
+import { getScoreSource } from '../util/score-source-cache'
 
 /**
  * Normalise a feed rkey to the env-name suffix.
@@ -89,13 +90,17 @@ export function applyRankerPriorityOrder(
   const cutoffIso = new Date(
     Date.now() - freshnessHours() * 60 * 60 * 1000,
   ).toISOString()
+  // D1.4 read-path cutover: serve scores by the feed's configured profile.
+  // ranker_score_source is NULL for every feed today, so profileId === rkey
+  // and the join is identical to the pre-cutover `fcp.feed_id = rkey`.
+  const profileId = getScoreSource(rkey) ?? rkey
   return (query as any)
     .leftJoin(
       'ranker_prod.feed_current_priority as fcp',
       (join: any) =>
         join
           .onRef('fcp.post_uri', '=', 'post.uri')
-          .on('fcp.feed_id', '=', rkey)
+          .on('fcp.profile_id', '=', profileId)
           .on('fcp.updated_at', '>=', cutoffIso),
     )
     // Migration 024: `score` is the sole canonical numeric ranking column.
