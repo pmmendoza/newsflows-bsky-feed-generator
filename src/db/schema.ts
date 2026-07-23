@@ -10,6 +10,7 @@ export type DatabaseSchema = {
   'feedgen_ops.archive_outbox': ArchiveOutbox
   'feedgen_ops.archive_outbox_dlq': ArchiveOutboxDlq
   'feedgen_ops.feed_catalog': FeedCatalog
+  'feedgen_ops.feed_catalog_history': FeedCatalogHistory
   'feedgen_ops.study_catalog': StudyCatalog
   'feedgen_ops.study_registry': StudyRegistry
   'feedgen_ops.subscriber_feed_assignment': SubscriberFeedAssignment
@@ -212,6 +213,26 @@ export type FeedCatalog = {
   enabled: boolean
   created_at?: string | Date
   retired_at?: string | Date | null
+}
+
+export interface FeedCatalogHistory {
+  feed_id: string
+  rkey: string
+  revision: number
+  changed_at?: string | Date
+  actor: string
+  source: string
+  before_row: FeedCatalog | null
+  after_row: FeedCatalog
+  changed_fields: Array<{
+    field: string
+    current: boolean | string | null
+    proposed: boolean | string | null
+  }>
+  feed_code_hash_before: string | null
+  feed_code_hash_after: string | null
+  ranker_code_hash_before: string | null
+  ranker_code_hash_after: string | null
 }
 
 export type StudyCatalog = {

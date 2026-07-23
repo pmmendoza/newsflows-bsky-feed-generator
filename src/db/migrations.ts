@@ -828,3 +828,57 @@ migrations['008_feed_catalog_ranker_score_source'] = {
     `.execute(db)
   },
 }
+
+migrations['009_feed_catalog_history'] = {
+  async up(db: Kysely<unknown>) {
+    await sql`
+      CREATE TABLE feedgen_ops.feed_catalog_history (
+        feed_id text NOT NULL,
+        rkey text NOT NULL,
+        revision integer NOT NULL,
+        changed_at timestamptz NOT NULL DEFAULT now(),
+        actor text NOT NULL,
+        source text NOT NULL,
+        before_row jsonb,
+        after_row jsonb NOT NULL,
+        changed_fields jsonb NOT NULL,
+        feed_code_hash_before text,
+        feed_code_hash_after text,
+        ranker_code_hash_before text,
+        ranker_code_hash_after text,
+        PRIMARY KEY (feed_id, revision)
+      )
+    `.execute(db)
+    await sql`
+      CREATE INDEX feed_catalog_history_feed_changed_at_idx
+      ON feedgen_ops.feed_catalog_history (feed_id, changed_at DESC)
+    `.execute(db)
+    await sql`
+      REVOKE UPDATE, DELETE ON feedgen_ops.feed_catalog_history FROM PUBLIC
+    `.execute(db)
+    await sql`
+      CREATE FUNCTION feedgen_ops.reject_feed_catalog_history_mutation()
+      RETURNS trigger
+      LANGUAGE plpgsql
+      AS $$
+      BEGIN
+        RAISE EXCEPTION 'feedgen_ops.feed_catalog_history is append-only';
+      END
+      $$
+    `.execute(db)
+    await sql`
+      CREATE TRIGGER feed_catalog_history_append_only
+      BEFORE UPDATE OR DELETE ON feedgen_ops.feed_catalog_history
+      FOR EACH ROW
+      EXECUTE FUNCTION feedgen_ops.reject_feed_catalog_history_mutation()
+    `.execute(db)
+  },
+  async down(db: Kysely<unknown>) {
+    await sql`
+      DROP TABLE feedgen_ops.feed_catalog_history
+    `.execute(db)
+    await sql`
+      DROP FUNCTION feedgen_ops.reject_feed_catalog_history_mutation()
+    `.execute(db)
+  },
+}

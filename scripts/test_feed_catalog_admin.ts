@@ -17,9 +17,12 @@ import {
   feedCatalogShowPayload,
   parseSubscribableFilter,
   readCatalogRowFromDb,
+  default as registerFeedCatalogAdminEndpoint,
   validateUpdate,
 } from '../src/methods/feed-catalog-admin'
-import { FeedCatalog } from '../src/db/schema'
+import { FeedCatalog, FeedCatalogHistory } from '../src/db/schema'
+import express from 'express'
+import http from 'http'
 
 function assert(condition: unknown, message: string): asserts condition {
   if (!condition) {
@@ -31,6 +34,10 @@ function assertEqual<T>(actual: T, expected: T, message: string) {
   if (actual !== expected) {
     throw new Error(`${message}: expected ${JSON.stringify(expected)}, got ${JSON.stringify(actual)}`)
   }
+}
+
+function assertJsonEqual(actual: unknown, expected: unknown, message: string) {
+  assertEqual(JSON.stringify(actual), JSON.stringify(expected), message)
 }
 
 function validUpdate(body: Record<string, unknown>) {
@@ -443,7 +450,325 @@ async function testUpdatePathLocksRowGetPathDoesNot() {
   assertEqual(unlocked.calls.forUpdate, 0, 'GET/dry-run read must NOT lock the row')
 }
 
+function fakeHistoryDb(
+  initialFeed: FeedCatalog,
+  initialHistory: FeedCatalogHistory[] = [],
+) {
+  let feed = { ...initialFeed }
+  const history = [...initialHistory]
+
+  function selectFrom(table: string) {
+    let whereColumn = ''
+    let whereValue: unknown
+    let limitValue: number | undefined
+    let offsetValue = 0
+    const order: Array<{ column: string; direction: string }> = []
+    const query: any = {
+      select: () => query,
+      selectAll: () => query,
+      where: (column: string, _operator: string, value: unknown) => {
+        whereColumn = column
+        whereValue = value
+        return query
+      },
+      orderBy: (column: string, direction: string) => {
+        order.push({ column, direction })
+        return query
+      },
+      limit: (value: number) => {
+        limitValue = value
+        return query
+      },
+      offset: (value: number) => {
+        offsetValue = value
+        return query
+      },
+      forUpdate: () => query,
+      executeTakeFirst: async () => {
+        if (table === 'feedgen_ops.feed_catalog') {
+          return whereColumn !== 'rkey' || whereValue === feed.rkey
+            ? { ...feed }
+            : undefined
+        }
+        if (table === 'feedgen_ops.feed_catalog_history') {
+          const rows = history
+            .filter((row) => whereColumn !== 'feed_id' || row.feed_id === whereValue)
+            .sort((a, b) => b.revision - a.revision)
+          const row = rows[0]
+          return row
+            ? {
+              revision: row.revision,
+              feed_code_hash_after: row.feed_code_hash_after,
+            }
+            : undefined
+        }
+        return undefined
+      },
+      execute: async () => {
+        if (table !== 'feedgen_ops.feed_catalog_history') return []
+        const rows = history
+          .filter((row) => whereColumn !== 'feed_id' || row.feed_id === whereValue)
+          .sort((a, b) => {
+            for (const item of order) {
+              const aValue = a[item.column as keyof FeedCatalogHistory]
+              const bValue = b[item.column as keyof FeedCatalogHistory]
+              if (aValue === bValue) continue
+              const comparison = String(aValue) < String(bValue) ? -1 : 1
+              return item.direction === 'desc' ? -comparison : comparison
+            }
+            return 0
+          })
+        return rows.slice(offsetValue, limitValue === undefined ? undefined : offsetValue + limitValue)
+      },
+    }
+    return query
+  }
+
+  function insertInto(table: string) {
+    let values: any
+    const query: any = {
+      values: (next: any) => {
+        values = next
+        return query
+      },
+      execute: async () => {
+        if (table === 'feedgen_ops.feed_catalog_history') {
+          history.push({
+            ...values,
+            changed_at: `2026-07-23T00:00:${String(values.revision).padStart(2, '0')}Z`,
+          })
+        } else if (table === 'feedgen_ops.feed_catalog') {
+          feed = { ...values }
+        }
+        return []
+      },
+    }
+    return query
+  }
+
+  function updateTable(table: string) {
+    let patch: Partial<FeedCatalog> = {}
+    const query: any = {
+      set: (next: Partial<FeedCatalog>) => {
+        patch = next
+        return query
+      },
+      where: () => query,
+      executeTakeFirst: async () => {
+        if (table === 'feedgen_ops.feed_catalog') feed = { ...feed, ...patch }
+        return { numUpdatedRows: 1 }
+      },
+    }
+    return query
+  }
+
+  const db: any = {
+    selectFrom,
+    insertInto,
+    updateTable,
+    transaction: () => ({
+      execute: async (callback: (trx: any) => Promise<unknown>) => callback(db),
+    }),
+  }
+  return { db, history }
+}
+
+type JsonResponse = {
+  status: number
+  body: any
+}
+
+async function requestJson(
+  server: http.Server,
+  path: string,
+  method: 'GET' | 'POST',
+  headers: Record<string, string> = {},
+  body?: unknown,
+): Promise<JsonResponse> {
+  const address = server.address()
+  assert(address && typeof address === 'object', 'server must listen on a port')
+  const payload = body === undefined ? undefined : JSON.stringify(body)
+
+  return new Promise((resolve, reject) => {
+    const req = http.request({
+      hostname: '127.0.0.1',
+      port: address.port,
+      path,
+      method,
+      headers: {
+        ...headers,
+        ...(payload === undefined
+          ? {}
+          : {
+            'content-type': 'application/json',
+            'content-length': Buffer.byteLength(payload).toString(),
+          }),
+      },
+    }, (res) => {
+      let data = ''
+      res.setEncoding('utf8')
+      res.on('data', (chunk) => {
+        data += chunk
+      })
+      res.on('end', () => {
+        resolve({
+          status: res.statusCode ?? 0,
+          body: data ? JSON.parse(data) : null,
+        })
+      })
+    })
+    req.on('error', reject)
+    if (payload !== undefined) req.write(payload)
+    req.end()
+  })
+}
+
+async function withFeedCatalogServer(
+  db: any,
+  callback: (server: http.Server) => Promise<void>,
+) {
+  const app = express()
+  app.use(express.json())
+  registerFeedCatalogAdminEndpoint(
+    { xrpc: { router: app } } as any,
+    { db } as any,
+  )
+  const server = app.listen(0, '127.0.0.1')
+  await new Promise<void>((resolve) => server.once('listening', resolve))
+  try {
+    await callback(server)
+  } finally {
+    await new Promise<void>((resolve, reject) =>
+      server.close((err) => (err ? reject(err) : resolve())),
+    )
+  }
+}
+
+async function testAdminUpdateWritesOneHistoryRowPerRevision() {
+  const testFeed: FeedCatalog = {
+    ...baseFeed,
+    study_id: null,
+    access_policy_id: 'subscriber-default',
+  }
+  const fake = fakeHistoryDb(testFeed)
+  process.env.FEEDGEN_ADMIN_API_KEY = 'history-admin-key'
+  process.env.FEEDGEN_FEED_CODE_HASH = 'feed-code-a'
+
+  await withFeedCatalogServer(fake.db, async (server) => {
+    const first = await requestJson(
+      server,
+      '/api/admin/feed_catalog',
+      'POST',
+      {
+        'api-key': 'history-admin-key',
+        'x-feedgen-actor': 'operator@example.test',
+        'x-feedgen-source': 'console',
+      },
+      {
+        op: 'update',
+        rkey: testFeed.rkey,
+        display_name: 'Newsflow NL One',
+      },
+    )
+    assertEqual(first.status, 200, 'first update status')
+    assertEqual(fake.history.length, 1, 'first update writes exactly one history row')
+    assertEqual(fake.history[0].revision, 1, 'first history revision')
+    assertEqual(fake.history[0].actor, 'operator@example.test', 'history actor')
+    assertEqual(fake.history[0].source, 'console', 'history source')
+    assertEqual(fake.history[0].before_row?.display_name, testFeed.display_name, 'history before row')
+    assertEqual(fake.history[0].after_row.display_name, 'Newsflow NL One', 'history after row')
+    assertJsonEqual(fake.history[0].changed_fields, [{
+      field: 'display_name',
+      current: testFeed.display_name,
+      proposed: 'Newsflow NL One',
+    }], 'history changed_fields')
+    assertEqual(fake.history[0].feed_code_hash_before, 'feed-code-a', 'first feed hash before')
+    assertEqual(fake.history[0].feed_code_hash_after, 'feed-code-a', 'first feed hash after')
+    assertEqual(fake.history[0].ranker_code_hash_before, null, 'ranker hash before placeholder')
+    assertEqual(fake.history[0].ranker_code_hash_after, null, 'ranker hash after placeholder')
+
+    process.env.FEEDGEN_FEED_CODE_HASH = 'feed-code-b'
+    const second = await requestJson(
+      server,
+      '/api/admin/feed_catalog',
+      'POST',
+      { 'api-key': 'history-admin-key' },
+      {
+        op: 'update',
+        rkey: testFeed.rkey,
+        enabled: false,
+      },
+    )
+    assertEqual(second.status, 200, 'second update status')
+    assertEqual(fake.history.length, 2, 'second update writes exactly one more history row')
+    assertEqual(fake.history[1].revision, 2, 'history revision is monotonic')
+    assertEqual(fake.history[1].before_row?.enabled, true, 'second history before row')
+    assertEqual(fake.history[1].after_row.enabled, false, 'second history after row')
+    assertEqual(fake.history[1].actor, 'api-key', 'default history actor')
+    assertEqual(fake.history[1].source, 'direct-api', 'default history source')
+    assertEqual(fake.history[1].feed_code_hash_before, 'feed-code-a', 'prior after hash becomes before')
+    assertEqual(fake.history[1].feed_code_hash_after, 'feed-code-b', 'new feed hash after')
+  })
+}
+
+async function testHistoryReadEndpointAuthPaginationAndNewestFirst() {
+  const history = [1, 2, 3].map((revision): FeedCatalogHistory => ({
+    feed_id: baseFeed.feed_id,
+    rkey: baseFeed.rkey,
+    revision,
+    changed_at: `2026-07-23T00:00:0${revision}Z`,
+    actor: 'api-key',
+    source: 'direct-api',
+    before_row: revision === 1 ? null : baseFeed,
+    after_row: baseFeed,
+    changed_fields: [],
+    feed_code_hash_before: null,
+    feed_code_hash_after: null,
+    ranker_code_hash_before: null,
+    ranker_code_hash_after: null,
+  }))
+  const fake = fakeHistoryDb(baseFeed, history)
+  process.env.FEEDGEN_READ_API_KEY = 'history-read-key'
+
+  await withFeedCatalogServer(fake.db, async (server) => {
+    const unauthorized = await requestJson(
+      server,
+      `/api/admin/feed_catalog/${baseFeed.rkey}/history`,
+      'GET',
+    )
+    assertEqual(unauthorized.status, 401, 'history endpoint requires auth')
+
+    const firstPage = await requestJson(
+      server,
+      `/api/admin/feed_catalog/${baseFeed.rkey}/history?limit=2&offset=0`,
+      'GET',
+      { 'api-key': 'history-read-key' },
+    )
+    assertEqual(firstPage.status, 200, 'history first page status')
+    assertEqual(firstPage.body.raw_values_in_output, false, 'history raw-free marker')
+    assertJsonEqual(
+      firstPage.body.history.map((row: FeedCatalogHistory) => row.revision),
+      [3, 2],
+      'history is newest-first',
+    )
+
+    const secondPage = await requestJson(
+      server,
+      `/api/admin/feed_catalog/${baseFeed.rkey}/history?limit=2&offset=2`,
+      'GET',
+      { 'api-key': 'history-read-key' },
+    )
+    assertJsonEqual(
+      secondPage.body.history.map((row: FeedCatalogHistory) => row.revision),
+      [1],
+      'history offset pagination',
+    )
+  })
+}
+
 const tests = [
+  testAdminUpdateWritesOneHistoryRowPerRevision,
+  testHistoryReadEndpointAuthPaginationAndNewestFirst,
   testUpdatePathLocksRowGetPathDoesNot,
   testListPayload,
   testSubscribableListPayload,

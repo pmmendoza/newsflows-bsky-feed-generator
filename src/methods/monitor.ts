@@ -748,6 +748,7 @@ export default function registerMonitorEndpoints(server: Server, ctx: AppContext
       const retention = getRetentionConfig()
       const version = getPackageVersion()
       const buildSha = process.env.FEEDGEN_BUILD_SHA || undefined
+      const feedCodeHash = process.env.FEEDGEN_FEED_CODE_HASH || undefined
 
       const subscriberCountRow = await ctx.db
         .selectFrom('subscriber')
@@ -781,6 +782,7 @@ export default function registerMonitorEndpoints(server: Server, ctx: AppContext
         hostname: ctx.cfg.hostname,
         version: version ?? null,
         build_sha: buildSha ?? null,
+        feed_code_hash: feedCodeHash ?? null,
         ingestion: {
           scoped_ingestion_enabled: scopedIngestionEnabled(),
           track_subscriber_activity: trackSubscriberActivityEnabled(),

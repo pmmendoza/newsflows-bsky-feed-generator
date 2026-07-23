@@ -19,7 +19,8 @@ approved mutation.
 
 ## Auth
 
-- Header: `api-key: $FEEDGEN_ADMIN_API_KEY`
+- Reads: `api-key: $FEEDGEN_READ_API_KEY` or `$FEEDGEN_ADMIN_API_KEY`
+- Writes: `api-key: $FEEDGEN_ADMIN_API_KEY`
 - Raw secrets are never returned.
 
 ## Read Current Catalog
@@ -43,6 +44,21 @@ should require the marker rather than assuming an older server applied it.
 `GET /api/admin/feed_catalog/:rkey`
 
 Returns one catalog row or `404` with `{"error":"rkey=<rkey> not found"}`.
+
+## Read Feed Change History
+
+`GET /api/admin/feed_catalog/:rkey/history`
+
+Returns append-only history rows newest-first. Pagination uses `limit` (default
+50, capped at 200) and `offset` (default 0). The response contains
+`schema_version`, `feed_id`, `rkey`, `returned_count`, `limit`, `offset`,
+`history`, and `raw_values_in_output:false`.
+
+Each history row contains the per-feed `revision`, `changed_at`, `before_row`,
+`after_row`, `changed_fields`, and feed/ranker code hashes. `actor` and `source`
+come from optional `x-feedgen-actor` and `x-feedgen-source` write headers.
+They are self-reported audit labels, not cryptographically verified identities.
+When omitted they default to `api-key` and `direct-api`.
 
 ## Dry-Run Existing Feed Update
 
@@ -80,6 +96,10 @@ nonexistent `study_id` when feedgen can verify `study_catalog`.
 `POST /api/admin/feed_catalog` still supports insert and update. For
 `op:"update"`, it now returns apply-grade evidence rather than only
 `{ok:true}`.
+
+The optional `x-feedgen-actor` and `x-feedgen-source` request headers are stored
+with the history record. These labels are self-reported and are not a stronger
+identity mechanism than the admin API-key authorization gate.
 
 Recommended `bskyops` update request:
 

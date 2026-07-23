@@ -31,7 +31,8 @@
 
 import { Server } from '../lexicon'
 import { AppContext } from '../config'
-import { FeedCatalog } from '../db/schema'
+import { FeedCatalog, FeedCatalogHistory, DatabaseSchema } from '../db/schema'
+import type { Transaction } from 'kysely'
 import {
   ApiKeyAuthConfig,
   isApiKeyAuthorized,
@@ -45,6 +46,9 @@ const adminWriteAuth: ApiKeyAuthConfig = {
 const readAuth: ApiKeyAuthConfig = {
   primaryEnv: ['FEEDGEN_READ_API_KEY', 'FEEDGEN_ADMIN_API_KEY'],
 }
+
+const HISTORY_DEFAULT_LIMIT = 50
+const HISTORY_MAX_LIMIT = 200
 
 export const ALLOWED_ACCESS_POLICIES = new Set([
   'subscriber-default',
@@ -133,12 +137,58 @@ type FeedCatalogDryRunMessage = {
   [key: string]: unknown
 }
 
+type FeedCatalogHistoryIdentity = {
+  actor: string
+  source: string
+}
+
 function isString(v: unknown): v is string {
   return typeof v === 'string' && v.length > 0
 }
 
 function nullableString(v: unknown): v is string | null {
   return v === null || typeof v === 'string'
+}
+
+function selfReportedHeader(value: unknown, fallback: string): string {
+  const first = Array.isArray(value) ? value[0] : value
+  return typeof first === 'string' && first.trim() ? first.trim() : fallback
+}
+
+function historyIdentity(headers: Record<string, unknown>): FeedCatalogHistoryIdentity {
+  // These labels are caller-supplied audit context, not cryptographically
+  // verified identities. The API-key gate remains the authorization boundary.
+  return {
+    actor: selfReportedHeader(headers['x-feedgen-actor'], 'api-key'),
+    source: selfReportedHeader(headers['x-feedgen-source'], 'direct-api'),
+  }
+}
+
+function parseIntegerQuery(
+  value: unknown,
+  name: string,
+  defaultValue: number,
+  minimum: number,
+): number {
+  if (value === undefined) return defaultValue
+  if (typeof value !== 'string' || !/^\d+$/.test(value)) {
+    throw new Error(`${name} must be a non-negative integer`)
+  }
+  const parsed = Number(value)
+  if (!Number.isSafeInteger(parsed) || parsed < minimum) {
+    throw new Error(`${name} must be ${minimum === 0 ? 'a non-negative' : 'a positive'} integer`)
+  }
+  return parsed
+}
+
+function parseHistoryPagination(limit: unknown, offset: unknown) {
+  return {
+    limit: Math.min(
+      parseIntegerQuery(limit, 'limit', HISTORY_DEFAULT_LIMIT, 1),
+      HISTORY_MAX_LIMIT,
+    ),
+    offset: parseIntegerQuery(offset, 'offset', 0, 0),
+  }
 }
 
 function isUpdateField(field: string): field is UpdateField {
@@ -160,6 +210,20 @@ function currentFieldValues(row: Pick<FeedCatalog, UpdateField>) {
 function proposedFieldValues(row: Pick<FeedCatalog, UpdateField>, patch: CatalogUpdatePatch) {
   const proposed = { ...row, ...patch }
   return currentFieldValues(proposed)
+}
+
+function feedCatalogChanges(
+  current: Record<UpdateField, boolean | string | null>,
+  proposed: Record<UpdateField, boolean | string | null>,
+  fields: readonly UpdateField[],
+) {
+  return fields
+    .filter((field) => current[field] !== proposed[field])
+    .map((field) => ({
+      field,
+      current: current[field],
+      proposed: proposed[field],
+    }))
 }
 
 function validateCurrentValues(
@@ -404,14 +468,12 @@ export function buildFeedCatalogDryRun(
     ...current,
     ...update.patch,
   }
-  const changes = UPDATE_FIELDS
-    .filter((field) => Object.prototype.hasOwnProperty.call(update.patch, field))
-    .filter((field) => currentValues[field] !== proposedValues[field])
-    .map((field) => ({
-      field,
-      current: currentValues[field],
-      proposed: proposedValues[field],
-    }))
+  const changes = feedCatalogChanges(
+    currentValues,
+    proposedValues,
+    UPDATE_FIELDS.filter((field) =>
+      Object.prototype.hasOwnProperty.call(update.patch, field)),
+  )
   const blockers: FeedCatalogDryRunMessage[] = []
   const warnings: FeedCatalogDryRunMessage[] = []
   if (proposed.access_policy_id === 'study-only' && !proposed.study_id) {
@@ -609,6 +671,48 @@ export async function readCatalogRowFromDb(
   return (await query.executeTakeFirst()) as FeedCatalog | undefined
 }
 
+async function appendFeedCatalogHistory(
+  db: Transaction<DatabaseSchema>,
+  before: FeedCatalog | null,
+  after: FeedCatalog,
+  changedFields: FeedCatalogHistory['changed_fields'],
+  identity: FeedCatalogHistoryIdentity,
+): Promise<number> {
+  // The feed_catalog row lock in the update transaction serializes writers for
+  // this feed, so the latest revision remains current until this insert.
+  const previous = await db
+    .selectFrom('feedgen_ops.feed_catalog_history')
+    .select(['revision', 'feed_code_hash_after'])
+    .where('feed_id', '=', after.feed_id)
+    .orderBy('revision', 'desc')
+    .limit(1)
+    .executeTakeFirst()
+  const revision = Number(previous?.revision ?? 0) + 1
+  const feedCodeHashAfter = process.env.FEEDGEN_FEED_CODE_HASH || null
+
+  await db
+    .insertInto('feedgen_ops.feed_catalog_history')
+    .values({
+      feed_id: after.feed_id,
+      rkey: after.rkey,
+      revision,
+      actor: identity.actor,
+      source: identity.source,
+      before_row: before,
+      after_row: after,
+      changed_fields: changedFields,
+      feed_code_hash_before: previous
+        ? previous.feed_code_hash_after ?? null
+        : feedCodeHashAfter,
+      feed_code_hash_after: feedCodeHashAfter,
+      ranker_code_hash_before: null,
+      ranker_code_hash_after: null,
+    })
+    .execute()
+
+  return revision
+}
+
 async function readCatalogRow(ctx: AppContext, rkey: string): Promise<FeedCatalog | undefined> {
   return readCatalogRowFromDb(ctx.db, rkey)
 }
@@ -649,6 +753,52 @@ export default function registerFeedCatalogAdminEndpoint(
     } catch (err) {
       console.error(
         `[${new Date().toISOString()}] - feed_catalog-admin: read error. ${err instanceof Error ? err.message : String(err)}`,
+      )
+      return res.status(500).json({ error: 'InternalServerError' })
+    }
+  })
+
+  server.xrpc.router.get('/api/admin/feed_catalog/:rkey/history', async (req, res) => {
+    if (!isApiKeyAuthorized(req, readAuth)) {
+      logUnauthorized('/api/admin/feed_catalog/:rkey/history')
+      return res.status(401).json({ error: 'Unauthorized: Invalid API key' })
+    }
+
+    let pagination: ReturnType<typeof parseHistoryPagination>
+    try {
+      pagination = parseHistoryPagination(req.query?.limit, req.query?.offset)
+    } catch (err) {
+      return res.status(400).json({
+        error: err instanceof Error ? err.message : 'invalid pagination',
+      })
+    }
+
+    const rkey = String(req.params.rkey || '')
+    try {
+      const feed = await readCatalogRow(ctx, rkey)
+      if (!feed) return res.status(404).json(feedCatalogNotFoundPayload(rkey))
+      const history = await ctx.db
+        .selectFrom('feedgen_ops.feed_catalog_history')
+        .selectAll()
+        .where('feed_id', '=', feed.feed_id)
+        .orderBy('changed_at', 'desc')
+        .orderBy('revision', 'desc')
+        .limit(pagination.limit)
+        .offset(pagination.offset)
+        .execute()
+      return res.json({
+        schema_version: 1,
+        feed_id: feed.feed_id,
+        rkey,
+        returned_count: history.length,
+        limit: pagination.limit,
+        offset: pagination.offset,
+        history,
+        raw_values_in_output: false,
+      })
+    } catch (err) {
+      console.error(
+        `[${new Date().toISOString()}] - feed_catalog-admin: history read error. ${err instanceof Error ? err.message : String(err)}`,
       )
       return res.status(500).json({ error: 'InternalServerError' })
     }
@@ -714,26 +864,41 @@ export default function registerFeedCatalogAdminEndpoint(
     if (!body || typeof body !== 'object') {
       return res.status(400).json({ error: 'JSON body required' })
     }
+    const identity = historyIdentity(req.headers)
 
     try {
       if (body.op === 'insert') {
         const v = validateInsert(body)
         if (!v.ok) return res.status(400).json({ error: v.error })
-        await ctx.db
-          .insertInto('feedgen_ops.feed_catalog')
-          .values({
-            feed_id: v.row.feed_id,
-            rkey: v.row.rkey,
-            display_name: v.row.display_name,
-            algo_policy_id: v.row.algo_policy_id,
-            access_policy_id: v.row.access_policy_id,
-            country: v.row.country,
-            study_id: v.row.study_id,
-            publisher_did: v.row.publisher_did,
-            ranker_policy_id: v.row.ranker_policy_id,
-            enabled: v.row.enabled,
-          } as any)
-          .execute()
+        await ctx.db.transaction().execute(async (trx) => {
+          await trx
+            .insertInto('feedgen_ops.feed_catalog')
+            .values({
+              feed_id: v.row.feed_id,
+              rkey: v.row.rkey,
+              display_name: v.row.display_name,
+              algo_policy_id: v.row.algo_policy_id,
+              access_policy_id: v.row.access_policy_id,
+              country: v.row.country,
+              study_id: v.row.study_id,
+              publisher_did: v.row.publisher_did,
+              ranker_policy_id: v.row.ranker_policy_id,
+              enabled: v.row.enabled,
+            } as any)
+            .execute()
+          const after = await readCatalogRowFromDb(trx, v.row.rkey)
+          if (!after) throw new Error('inserted row could not be read back')
+          const emptyValues = Object.fromEntries(
+            UPDATE_FIELDS.map((field) => [field, null]),
+          ) as Record<UpdateField, null>
+          await appendFeedCatalogHistory(
+            trx,
+            null,
+            after,
+            feedCatalogChanges(emptyValues, currentFieldValues(after), UPDATE_FIELDS),
+            identity,
+          )
+        })
         console.log(
           `[${new Date().toISOString()}] - feed_catalog-admin: INSERT rkey=${v.row.rkey} feed_id=${v.row.feed_id} algo=${v.row.algo_policy_id} access=${v.row.access_policy_id}`,
         )
@@ -809,6 +974,13 @@ export default function registerFeedCatalogAdminEndpoint(
               applied: false,
             }
           }
+          await appendFeedCatalogHistory(
+            trx,
+            current,
+            after,
+            dryRun.changes,
+            identity,
+          )
           return {
             httpStatus: 200,
             payload: buildFeedCatalogApplyResult(current, after, dryRun, true),
