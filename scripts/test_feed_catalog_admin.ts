@@ -16,6 +16,7 @@ import {
   feedCatalogNotFoundPayload,
   feedCatalogShowPayload,
   parseSubscribableFilter,
+  readCatalogRowFromDb,
   validateUpdate,
 } from '../src/methods/feed-catalog-admin'
 import { FeedCatalog } from '../src/db/schema'
@@ -413,7 +414,37 @@ function testApplyBlockedPayload() {
   )
 }
 
+// Records whether the query issued a FOR UPDATE lock. Any builder method
+// returns the same stub so the chain works regardless of call order.
+function fakeCatalogDb(row: FeedCatalog | undefined) {
+  const calls = { forUpdate: 0 }
+  const qb: any = {
+    selectFrom: () => qb,
+    select: () => qb,
+    where: () => qb,
+    forUpdate: () => {
+      calls.forUpdate += 1
+      return qb
+    },
+    executeTakeFirst: async () => row,
+  }
+  return { db: qb, calls }
+}
+
+async function testUpdatePathLocksRowGetPathDoesNot() {
+  // The update transaction's CAS read must lock the row (FOR UPDATE) so two
+  // concurrent switches serialize; the GET/dry-run read must stay unlocked.
+  const locked = fakeCatalogDb(baseFeed)
+  await readCatalogRowFromDb(locked.db, 'newsflow-nl-1', true)
+  assertEqual(locked.calls.forUpdate, 1, 'update-path read must lock the row (FOR UPDATE)')
+
+  const unlocked = fakeCatalogDb(baseFeed)
+  await readCatalogRowFromDb(unlocked.db, 'newsflow-nl-1')
+  assertEqual(unlocked.calls.forUpdate, 0, 'GET/dry-run read must NOT lock the row')
+}
+
 const tests = [
+  testUpdatePathLocksRowGetPathDoesNot,
   testListPayload,
   testSubscribableListPayload,
   testSubscribableFilterParsing,
@@ -438,9 +469,13 @@ const tests = [
   testApplyBlockedPayload,
 ]
 
-for (const test of tests) {
-  test()
-  console.log(`✓ ${test.name}`)
-}
-
-console.log(`feed catalog admin helper tests passed (${tests.length})`)
+;(async () => {
+  for (const test of tests) {
+    await test()
+    console.log(`✓ ${test.name}`)
+  }
+  console.log(`feed catalog admin helper tests passed (${tests.length})`)
+})().catch((err) => {
+  console.error(err)
+  process.exit(1)
+})
