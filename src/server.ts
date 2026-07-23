@@ -17,7 +17,7 @@ import { createDb, Database, migrateToLatest, getPendingMigrations } from './db'
 import { FirehoseSubscription } from './subscription'
 import { AppContext, Config } from './config'
 import wellKnown from './well-known'
-import { setupFollowsUpdateScheduler, setupEngagmentUpdateScheduler, setupDailyFullSyncScheduler, setupRetentionScheduler, stopAllSchedulers } from './util/scheduled-updater'
+import { setupFollowsUpdateScheduler, setupEngagmentUpdateScheduler, setupDailyFullSyncScheduler, setupRetentionScheduler, setupScoreSourceCacheScheduler, stopAllSchedulers } from './util/scheduled-updater'
 import { startFeedCatalogListener, stopFeedCatalogListener } from './util/catalog-listener'
 
 export class FeedGenerator {
@@ -157,6 +157,9 @@ export class FeedGenerator {
     console.log(`[${new Date().toISOString()}] - Setting up follows updater to run every ${updateInterval / 1000} seconds`)
     this.followsUpdateTimer = setupFollowsUpdateScheduler(this.db, updateInterval)
     this.engagementUpdateTimer = setupEngagmentUpdateScheduler(this.db, updateInterval)
+
+    // D1.4: keep the ranker score-source map warm for the sync read-path lookup.
+    setupScoreSourceCacheScheduler(this.db)
 
     // Set up daily full sync at 4:00 AM to remove unfollowed accounts
     setupDailyFullSyncScheduler(this.db)

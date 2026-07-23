@@ -28,6 +28,14 @@ import {
   rkeyToEnvSuffix,
   useRankerPriority,
 } from '../src/algos/ranker-priority-helper'
+import { refreshScoreSourceCache } from '../src/util/score-source-cache'
+
+// Minimal fake Database exposing the selectFrom(...).select(...).execute()
+// chain refreshScoreSourceCache uses. Lets us seed the score-source map
+// without a real Postgres.
+const fakeDbReturning = (rows: any[]): any => ({
+  selectFrom: () => ({ select: () => ({ execute: async () => rows }) }),
+})
 
 const db = new Kysely<any>({
   dialect: {
@@ -225,6 +233,74 @@ console.log('Wrapper — applyPriorityOrderForFeed routes via env')
   )
 }
 
-console.log()
-console.log(`Summary: ${passed} passed, ${failed} failed`)
-if (failed > 0) process.exit(1)
+// D1.4 read-path cutover: join on fcp.profile_id resolved from the
+// score-source cache, falling back to the rkey when the source is NULL.
+async function scoreSourceCutoverTests() {
+  console.log('D1.4 — join column is fcp.profile_id')
+  {
+    const c = applyRankerPriorityOrder(basePostQuery(), 'newsflow-nl-2').compile()
+    assert(
+      /"fcp"\."profile_id"\s*=/i.test(c.sql),
+      'JOIN filters on fcp.profile_id (not fcp.feed_id)',
+      c.sql,
+    )
+    assert(
+      !/"fcp"\."feed_id"\s*=/i.test(c.sql),
+      'JOIN must NOT filter on fcp.feed_id anymore',
+      c.sql,
+    )
+  }
+
+  console.log('D1.4 — NULL score source ⇒ profile_id falls back to rkey (identical to pre-cutover)')
+  {
+    // Empty / unloaded cache returns null for every feed.
+    await refreshScoreSourceCache(fakeDbReturning([]))
+    const c = applyRankerPriorityOrder(basePostQuery(), 'newsflow-nl-2').compile()
+    assert(
+      c.parameters.includes('newsflow-nl-2'),
+      'profile_id bound to the rkey when ranker_score_source is NULL',
+      JSON.stringify(c.parameters),
+    )
+  }
+
+  console.log('D1.4 — non-null score source ⇒ profile_id is the configured source')
+  {
+    await refreshScoreSourceCache(
+      fakeDbReturning([
+        { rkey: 'newsflow-nl-2', feed_id: 'newsflow-nl-2', ranker_score_source: 'science-nl-a' },
+      ]),
+    )
+    const c = applyRankerPriorityOrder(basePostQuery(), 'newsflow-nl-2').compile()
+    assert(
+      c.parameters.includes('science-nl-a'),
+      'profile_id bound to the configured ranker_score_source',
+      JSON.stringify(c.parameters),
+    )
+    assert(
+      !c.parameters.includes('newsflow-nl-2'),
+      'rkey no longer bound once a source is configured',
+      JSON.stringify(c.parameters),
+    )
+    // A feed with no cache entry still falls back to its own rkey.
+    const other = applyRankerPriorityOrder(basePostQuery(), 'newsflow-fr-2').compile()
+    assert(
+      other.parameters.includes('newsflow-fr-2'),
+      'unconfigured feed falls back to its rkey',
+      JSON.stringify(other.parameters),
+    )
+  }
+
+  // Reset the shared map so nothing leaks to other test files/runs.
+  await refreshScoreSourceCache(fakeDbReturning([]))
+}
+
+scoreSourceCutoverTests()
+  .then(() => {
+    console.log()
+    console.log(`Summary: ${passed} passed, ${failed} failed`)
+    if (failed > 0) process.exit(1)
+  })
+  .catch((err) => {
+    console.error('test harness error:', err)
+    process.exit(2)
+  })

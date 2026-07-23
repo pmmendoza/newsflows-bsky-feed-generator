@@ -206,6 +206,9 @@ export type FeedCatalog = {
   algo_policy_id: string
   ranker_policy_id?: string | null
   access_policy_id: string
+  // Migration 008: the profile a feed currently serves scores from.
+  // NULL ⇒ serve its own rkey (see score-source-cache / D1.4).
+  ranker_score_source?: string | null
   enabled: boolean
   created_at?: string | Date
   retired_at?: string | Date | null
@@ -248,6 +251,9 @@ export type SubscriberFeedAssignment = {
 // handlers join this table and order by score.
 export type FeedCurrentPriority = {
   feed_id: string
+  // Score-storage decoupling (T-D): the profile these scores belong to.
+  // Backfilled to equal feed_id in production; the D1.4 read path joins on it.
+  profile_id?: string | null
   post_uri: string
   score?: number | null
   run_id: string

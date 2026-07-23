@@ -3,6 +3,7 @@ import { getFollowsApi } from './queries';
 import { updateEngagement } from './engagement-updater';
 import { runRetentionOnce } from './retention';
 import { resolvePublisherDids } from './publisher-dids';
+import { refreshScoreSourceCache, scoreSourceRefreshMs } from './score-source-cache';
 
 // Track active timers
 let activeTimers: NodeJS.Timeout[] = [];
@@ -111,6 +112,32 @@ export function setupEngagmentUpdateScheduler(
   }, intervalMs);
 
   // Add to active timers list
+  activeTimers.push(timerId);
+  return timerId;
+}
+
+/**
+ * D1.4: keep the score-source map warm so the synchronous per-request
+ * `getScoreSource` lookup is current. Primes once, then refreshes on an
+ * interval (default 60s, `FEEDGEN_SCORE_SOURCE_REFRESH_MS`).
+ */
+export function setupScoreSourceCacheScheduler(
+  db: Database,
+  intervalMs: number = scoreSourceRefreshMs(),
+  runImmediately: boolean = true,
+): NodeJS.Timeout {
+  if (runImmediately) {
+    refreshScoreSourceCache(db).catch(err => {
+      console.error('Error in initial score-source cache refresh:', err);
+    });
+  }
+
+  const timerId = setInterval(() => {
+    refreshScoreSourceCache(db).catch(err => {
+      console.error('Error in scheduled score-source cache refresh:', err);
+    });
+  }, intervalMs);
+
   activeTimers.push(timerId);
   return timerId;
 }
