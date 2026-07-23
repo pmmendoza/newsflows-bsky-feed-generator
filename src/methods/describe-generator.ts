@@ -44,7 +44,10 @@ export type DescribeCatalogRow = {
 
 let parityWarningLogged = false
 
-function staticRkeys(): string[] {
+// Exported for the config-activation manifest (src/util/config-manifest.ts),
+// which calls shouldUseCatalogForDescribe(staticRkeys()) — the exact same
+// shared resolver call the describe handler below uses.
+export function staticRkeys(): string[] {
   return Object.keys(algos)
 }
 

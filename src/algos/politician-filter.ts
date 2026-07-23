@@ -12,7 +12,9 @@ const BE_FILTER_RKEY = /^newsflow-be-(k|m|[123])$/
 // degraded state — BE feeds then serve UNFILTERED). Default (unset) is enabled.
 const KILL_SWITCH_OFF = ['false', '0', 'no', 'off']
 
-function killSwitchDisabled(): boolean {
+// Exported for the config-activation manifest (src/util/config-manifest.ts) —
+// the shared resolver, not a re-parse of FEEDGEN_BE_POLITICIAN_FILTER.
+export function killSwitchDisabled(): boolean {
   return KILL_SWITCH_OFF.includes(
     String(process.env.FEEDGEN_BE_POLITICIAN_FILTER ?? '').trim().toLowerCase(),
   )

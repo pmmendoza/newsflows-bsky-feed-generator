@@ -32,6 +32,12 @@ type ListenerHandle = {
 let activeHandle: ListenerHandle | null = null
 let stopRequested = false
 
+// Exported for the config-activation manifest (src/util/config-manifest.ts) —
+// the shared resolver, not a re-parse of FEEDGEN_CATALOG_LISTEN_NOTIFY.
+export function catalogListenNotifyEnabled(): boolean {
+  return process.env.FEEDGEN_CATALOG_LISTEN_NOTIFY === 'true'
+}
+
 /**
  * Start the LISTEN/NOTIFY loop. Idempotent — if already running,
  * returns the existing handle.
@@ -42,7 +48,7 @@ export async function startFeedCatalogListener(
   if (activeHandle) {
     return
   }
-  if (process.env.FEEDGEN_CATALOG_LISTEN_NOTIFY !== 'true') {
+  if (!catalogListenNotifyEnabled()) {
     console.log(
       `[${new Date().toISOString()}] - catalog-listener: disabled (FEEDGEN_CATALOG_LISTEN_NOTIFY != 'true'); 5-min TTL remains in effect`,
     )

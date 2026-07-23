@@ -17,8 +17,11 @@ import { createDb, Database, migrateToLatest, getPendingMigrations } from './db'
 import { FirehoseSubscription } from './subscription'
 import { AppContext, Config } from './config'
 import wellKnown from './well-known'
-import { setupFollowsUpdateScheduler, setupEngagmentUpdateScheduler, setupDailyFullSyncScheduler, setupRetentionScheduler, setupScoreSourceCacheScheduler, stopAllSchedulers } from './util/scheduled-updater'
+import { setupFollowsUpdateScheduler, setupEngagmentUpdateScheduler, setupDailyFullSyncScheduler, setupRetentionScheduler, setupScoreSourceCacheScheduler, stopAllSchedulers, followsUpdateIntervalMs, retentionIntervalMs } from './util/scheduled-updater'
 import { startFeedCatalogListener, stopFeedCatalogListener } from './util/catalog-listener'
+import { isRetentionSchedulerEnabledStrict } from './util/retention'
+import { recordConfigActivation as persistConfigActivation } from './util/config-activation'
+import registerConfigActivationAdminEndpoint from './methods/config-activation-admin'
 
 export class FeedGenerator {
   public app: express.Application
@@ -110,6 +113,7 @@ export class FeedGenerator {
     registerStudyEndpoints(server, ctx)
     registerFeedCatalogAdminEndpoint(server, ctx)
     registerSubscriberAdminEndpoints(server, ctx)
+    registerConfigActivationAdminEndpoint(server, ctx)
 
     return new FeedGenerator(app, db, legacyDb, firehose, cfg)
   }
@@ -153,7 +157,7 @@ export class FeedGenerator {
 
     // Set up the scheduler to update follows
     // Run once every hour by default (or override with env var) for incremental updates
-    const updateInterval = parseInt(process.env.FOLLOWS_UPDATE_INTERVAL_MS || '', 10) || 60 * 60 * 1000
+    const updateInterval = followsUpdateIntervalMs()
     console.log(`[${new Date().toISOString()}] - Setting up follows updater to run every ${updateInterval / 1000} seconds`)
     this.followsUpdateTimer = setupFollowsUpdateScheduler(this.db, updateInterval)
     this.engagementUpdateTimer = setupEngagmentUpdateScheduler(this.db, updateInterval)
@@ -165,10 +169,10 @@ export class FeedGenerator {
     setupDailyFullSyncScheduler(this.db)
 
     // Optional retention (TTL deletes) to bound storage growth
-    if (process.env.FEEDGEN_RETENTION_ENABLED === 'true') {
-      const retentionIntervalMs = parseInt(process.env.FEEDGEN_RETENTION_INTERVAL_MS || '', 10) || 6 * 60 * 60 * 1000
-      console.log(`[${new Date().toISOString()}] - Retention enabled; running every ${Math.round(retentionIntervalMs / 1000 / 60)} minutes`)
-      setupRetentionScheduler(this.db, retentionIntervalMs)
+    if (isRetentionSchedulerEnabledStrict()) {
+      const retentionInterval = retentionIntervalMs()
+      console.log(`[${new Date().toISOString()}] - Retention enabled; running every ${Math.round(retentionInterval / 1000 / 60)} minutes`)
+      setupRetentionScheduler(this.db, retentionInterval)
     }
 
     // Catalog cache invalidation via Postgres LISTEN/NOTIFY (Q4 #6).
@@ -185,6 +189,18 @@ export class FeedGenerator {
     })
 
     return this.server
+  }
+
+  /**
+   * Record this process's resolved behavior config as a
+   * `feedgen_ops.config_activation` row. Called from index.ts AFTER
+   * `await server.start()` so it never delays serving; `ctx` is not
+   * returned from `create()`, so this reaches the DB/cfg it needs via
+   * `this.db` / `this.cfg` (both already assigned by the constructor).
+   * Fail-open: never throws — see util/config-activation.ts.
+   */
+  async recordConfigActivation(): Promise<void> {
+    await persistConfigActivation(this.db, this.cfg)
   }
 
   async stop(): Promise<void> {

@@ -65,7 +65,10 @@ function parseIntOrUndefined(raw: string | undefined): number | undefined {
   return Number.isFinite(parsed) ? parsed : undefined
 }
 
-function getComplianceSummaryRateLimitConfig(): RateLimitConfig | null {
+// Exported so the config-activation manifest (src/util/config-manifest.ts)
+// can record the exact resolved value serving uses, via the same function —
+// not a re-parse of STUDY_COMPLIANCE_RATE_LIMIT_MAX/_WINDOW_SECONDS.
+export function getComplianceSummaryRateLimitConfig(): RateLimitConfig | null {
   // Defaults: 60 requests per 60 seconds per DID
   const maxRaw = parseIntOrUndefined(process.env.STUDY_COMPLIANCE_RATE_LIMIT_MAX)
   if (maxRaw === 0) return null
@@ -139,7 +142,9 @@ function normalizeCount(value: unknown): number {
   return 0
 }
 
-function parseTtlSeconds(): number {
+// Exported (as studyJwtTtlSeconds) for the config-activation manifest —
+// the shared resolver, not a re-parse of STUDY_JWT_TTL_SECONDS.
+export function parseTtlSeconds(): number {
   const raw = process.env.STUDY_JWT_TTL_SECONDS
   if (!raw) return 60 * 60 * 24 * 4 // 4 days
   const parsed = parseInt(raw, 10)

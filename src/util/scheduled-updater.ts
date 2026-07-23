@@ -8,6 +8,17 @@ import { refreshScoreSourceCache, scoreSourceRefreshMs } from './score-source-ca
 // Track active timers
 let activeTimers: NodeJS.Timeout[] = [];
 
+// Shared resolvers — exact copies of server.ts's pre-existing inline parses,
+// extracted so server.ts and the config-activation manifest
+// (src/util/config-manifest.ts) read the identical resolved value.
+export function followsUpdateIntervalMs(): number {
+  return parseInt(process.env.FOLLOWS_UPDATE_INTERVAL_MS || '', 10) || 60 * 60 * 1000
+}
+
+export function retentionIntervalMs(): number {
+  return parseInt(process.env.FEEDGEN_RETENTION_INTERVAL_MS || '', 10) || 6 * 60 * 60 * 1000
+}
+
 /**
  * Updates follows data for all subscribers in the database
  * This runs as a scheduled task to keep follow data fresh

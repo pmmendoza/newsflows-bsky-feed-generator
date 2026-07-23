@@ -14,6 +14,8 @@ import {
 import { resolvePublisherDidInfo, resolvePublisherDids } from '../util/publisher-dids'
 import { getRetentionConfig } from '../util/retention'
 import { ApiKeyAuthConfig, isApiKeyAuthorized, logUnauthorized } from '../util/api-auth'
+import { resolveEngagementTimeHours } from '../algos/feed-builder'
+import { isConfigActivationDegraded } from '../util/config-activation'
 
 type EngagementExportType = 'like' | 'repost' | 'comment' | 'quote'
 type EngagementExportScope = 'union' | 'publisher' | 'subscriber' | 'subscriber_on_publisher'
@@ -85,7 +87,9 @@ type ActivityEngagementResponseRow = ActivityEngagementRow & {
 
 let cachedPackageVersion: string | null | undefined
 
-const monitorReadAuth: ApiKeyAuthConfig = {
+// Exported so the config_activation admin read endpoint
+// (src/methods/config-activation-admin.ts) uses the identical auth gate.
+export const monitorReadAuth: ApiKeyAuthConfig = {
   primaryEnv: [
     'FEEDGEN_MONITOR_API_KEY',
     'FEEDGEN_READ_API_KEY',
@@ -109,6 +113,12 @@ function getPackageVersion(): string | undefined {
   return cachedPackageVersion ?? undefined
 }
 
+// Display-only for the /api/config `engagement.time_hours` field: normalizes
+// an invalid ENGAGEMENT_TIME_HOURS to 72 for a readable response. This is
+// DELIBERATELY DIFFERENT from resolveEngagementTimeHours() (algos/feed-builder.ts),
+// which is the raw-parseInt value serving actually uses (can be NaN on
+// invalid input) and is what the config-activation manifest records — not
+// this normalized value. Do not use this function as a manifest resolver.
 function getEngagementTimeHours(): number {
   const raw = process.env.ENGAGEMENT_TIME_HOURS
   if (!raw) return 72
@@ -740,30 +750,58 @@ export default function registerMonitorEndpoints(server: Server, ctx: AppContext
       return res.status(401).json({ error: 'Unauthorized' })
     }
 
+    // Pure in-memory, computed before any DB access below and independent of
+    // it: this flag exists to report exactly the DB outage that would
+    // otherwise make the calls below throw, so it must never be reachable
+    // only through a code path that also depends on the DB being up
+    // (config-activation design Fresh-C2).
+    const configActivationDegraded = isConfigActivationDegraded()
+
     try {
       res.header('Cache-Control', 'no-store')
 
-      const publisherDidInfo = await resolvePublisherDidInfo(ctx.db)
-      const publisherDids = [...publisherDidInfo.dids].sort()
+      // Each DB-dependent piece is independently guarded so a DB outage
+      // degrades that piece to null/empty instead of 500ing the whole
+      // response — config_activation_degraded must still come through.
+      let publisherDids: string[] = []
+      let publisherDidSource: string | null = null
+      const warnings: string[] = []
+      try {
+        const publisherDidInfo = await resolvePublisherDidInfo(ctx.db)
+        publisherDids = [...publisherDidInfo.dids].sort()
+        publisherDidSource = publisherDidInfo.source
+      } catch (error) {
+        warnings.push('publisher_dids_unavailable')
+      }
+
+      let subscriberCount: number | null = null
+      try {
+        const subscriberCountRow = await ctx.db
+          .selectFrom('subscriber')
+          .select(sql<number>`count(*)`.as('count'))
+          .executeTakeFirst()
+        subscriberCount = normalizeCount(subscriberCountRow?.count)
+      } catch (error) {
+        warnings.push('subscriber_count_unavailable')
+      }
+
+      let followsCount: number | null = null
+      try {
+        const followsCountRow = await ctx.db
+          .selectFrom('follows')
+          .select(sql<number>`count(*)`.as('count'))
+          .executeTakeFirst()
+        followsCount = normalizeCount(followsCountRow?.count)
+      } catch (error) {
+        warnings.push('follows_count_unavailable')
+      }
+
       const retention = getRetentionConfig()
       const version = getPackageVersion()
       const buildSha = process.env.FEEDGEN_BUILD_SHA || undefined
       const feedCodeHash = process.env.FEEDGEN_FEED_CODE_HASH || undefined
       const rankerCodeHash = process.env.FEEDGEN_RANKER_CODE_HASH || undefined
 
-      const subscriberCountRow = await ctx.db
-        .selectFrom('subscriber')
-        .select(sql<number>`count(*)`.as('count'))
-        .executeTakeFirst()
-      const followsCountRow = await ctx.db
-        .selectFrom('follows')
-        .select(sql<number>`count(*)`.as('count'))
-        .executeTakeFirst()
-
-      const subscriberCount = normalizeCount(subscriberCountRow?.count)
-      const followsCount = normalizeCount(followsCountRow?.count)
-
-      const warnings: string[] = []
       if (publisherDids.length === 0) {
         warnings.push('no_publisher_dids_configured')
       }
@@ -785,12 +823,13 @@ export default function registerMonitorEndpoints(server: Server, ctx: AppContext
         build_sha: buildSha ?? null,
         feed_code_hash: feedCodeHash ?? null,
         ranker_code_hash: rankerCodeHash ?? null,
+        config_activation_degraded: configActivationDegraded,
         ingestion: {
           scoped_ingestion_enabled: scopedIngestionEnabled(),
           track_subscriber_activity: trackSubscriberActivityEnabled(),
           publisher_engagement_subscriber_only: restrictPublisherEngagementToSubscribersEnabled(),
           allowlist_refresh_ms: allowlistRefreshMs(),
-          publisher_did_source: publisherDidInfo.source,
+          publisher_did_source: publisherDidSource,
         },
         retention: {
           enabled: retention.enabled,
@@ -811,10 +850,12 @@ export default function registerMonitorEndpoints(server: Server, ctx: AppContext
         warnings,
       })
     } catch (error) {
+      // Even an unexpected failure here must not swallow the degraded flag —
+      // it is the one thing this endpoint exists to report during an outage.
       console.error('Error retrieving config:', error)
-      return res.status(500).json({
-        error: 'InternalServerError',
-        message: 'An unexpected error occurred',
+      return res.status(200).json({
+        config_activation_degraded: configActivationDegraded,
+        error: 'partial_config_unavailable',
       })
     }
   })
@@ -1501,9 +1542,9 @@ export default function registerMonitorEndpoints(server: Server, ctx: AppContext
       const limit = 100;
       const offset = pageNum * limit;
 
-      // Get engagement time window from environment
-      const engagementTimeHours = process.env.ENGAGEMENT_TIME_HOURS ?
-        parseInt(process.env.ENGAGEMENT_TIME_HOURS, 10) : 72;
+      // Get engagement time window from environment (shared resolver — same
+      // raw parseInt feed-builder.ts uses; see resolveEngagementTimeHours()).
+      const engagementTimeHours = resolveEngagementTimeHours();
       const timeLimit = new Date(Date.now() - engagementTimeHours * 60 * 60 * 1000).toISOString();
 
       let posts: any[];

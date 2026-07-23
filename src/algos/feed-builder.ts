@@ -17,6 +17,23 @@ export type QueryBuilder = (
   limit: number
 ) => any
 
+// Shared resolvers — the config-activation manifest (src/util/config-manifest.ts)
+// calls these SAME functions so it records exactly what serving uses, not a
+// separate re-parse. Deliberately a raw parseInt (NaN on invalid input,
+// e.g. `ENGAGEMENT_TIME_HOURS=abc`), matching the pre-existing behavior here
+// byte-for-byte — do NOT normalize invalid input to 72 (that's a different,
+// display-only resolver: methods/monitor.ts's getEngagementTimeHours(), used
+// only for the /api/config `engagement.time_hours` presentational field).
+export function resolveEngagementTimeHours(): number {
+  return process.env.ENGAGEMENT_TIME_HOURS
+    ? parseInt(process.env.ENGAGEMENT_TIME_HOURS, 10)
+    : 72
+}
+
+export function archiveOutboxEnabled(): boolean {
+  return process.env.FEEDGEN_ARCHIVE_OUTBOX_ENABLED === 'true'
+}
+
 // Interface for the feed generator options
 export interface FeedGeneratorOptions {
   shortname: string
@@ -48,8 +65,7 @@ export async function buildFeed({
   const requesterFollows = await getFollows(requesterDid, ctx.db)
   
   // don't consider posts older than time limit hours
-  const engagementTimeHours = process.env.ENGAGEMENT_TIME_HOURS ?
-    parseInt(process.env.ENGAGEMENT_TIME_HOURS, 10) : 72;
+  const engagementTimeHours = resolveEngagementTimeHours();
   const timeLimit = new Date(Date.now() - engagementTimeHours * 60 * 60 * 1000).toISOString();
 
   // Parse cursor if provided
@@ -118,7 +134,7 @@ export async function buildFeed({
     cursor = (cursorOffset + followsLimit).toString();
   }
 
-  const archiveOutboxEnabled = process.env.FEEDGEN_ARCHIVE_OUTBOX_ENABLED === 'true';
+  const archiveOutboxIsEnabled = archiveOutboxEnabled();
   const requestLogInput = {
     shortname,
     requesterDid,
@@ -129,7 +145,7 @@ export async function buildFeed({
     servedPosts,
   };
 
-  if (archiveOutboxEnabled) {
+  if (archiveOutboxIsEnabled) {
     await logRequest(ctx, requestLogInput, true);
   } else {
     // Preserve the current non-blocking behavior until the archive cut-over flag is enabled.

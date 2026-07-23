@@ -76,7 +76,7 @@ type AnySelect = any
  * Default: 24 h (one ranker push window). Override per environment via
  * `FEEDGEN_RANKER_PROD_FRESHNESS_HOURS` env var.
  */
-function freshnessHours(): number {
+export function freshnessHours(): number {
   const raw = process.env.FEEDGEN_RANKER_PROD_FRESHNESS_HOURS
   const parsed = raw ? Number(raw) : 24
   if (!Number.isFinite(parsed) || parsed <= 0) return 24

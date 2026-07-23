@@ -1,6 +1,7 @@
 import { Database } from '../db';
 import { sql } from 'kysely';
 import { resolvePublisherDids } from './publisher-dids';
+import { resolveEngagementTimeHours } from '../algos/feed-builder';
 
 const ENGAGEMENT_TYPE_REPOST = 1
 const ENGAGEMENT_TYPE_LIKE = 2
@@ -12,9 +13,10 @@ const ENGAGEMENT_TYPE_QUOTE = 3
  * For other posts, counts all engagement
  */
 export async function updateEngagement(db: Database): Promise<void> {
-  // Use the same time limit as the feed builder
-  const engagementTimeHours = process.env.ENGAGEMENT_TIME_HOURS ?
-    parseInt(process.env.ENGAGEMENT_TIME_HOURS, 10) : 72;
+  // Use the same time limit as the feed builder (shared resolver — see
+  // resolveEngagementTimeHours() for why this is a raw parseInt, not the
+  // normalized display-only value in methods/monitor.ts).
+  const engagementTimeHours = resolveEngagementTimeHours();
   const timeLimit = new Date(Date.now() - engagementTimeHours * 60 * 60 * 1000).toISOString();
   try {
     // Postgres supports at most 65535 bind params. Kysely binds one param per array element for `IN (...)`.

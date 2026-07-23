@@ -21,6 +21,21 @@ const getIntEnv = (key: string, defaultValue: number): number => {
   return Number.isFinite(n) ? n : defaultValue
 }
 
+// Exact copy of server.ts's pre-existing scheduler-setup gate
+// (`process.env.FEEDGEN_RETENTION_ENABLED === 'true'`, case-SENSITIVE),
+// extracted to a shared name so server.ts and the config-activation
+// manifest read the identical resolved value. Deliberately NOT unified with
+// getRetentionConfig().enabled below, which is case-INSENSITIVE
+// (`.toLowerCase() === 'true'`) and gates runRetentionOnce()'s own delete
+// behavior — that is a pre-existing divergence between "is the scheduler
+// even started" and "would a retention pass delete rows", not something
+// this refactor may change (serving behavior must stay byte-for-byte
+// identical). Both resolved values are recorded in the manifest under
+// distinct keys so the divergence is visible, not silently unified away.
+export const isRetentionSchedulerEnabledStrict = (): boolean => {
+  return process.env.FEEDGEN_RETENTION_ENABLED === 'true'
+}
+
 export const getRetentionConfig = (): RetentionConfig => {
   return {
     enabled: getBoolEnv('FEEDGEN_RETENTION_ENABLED', false),

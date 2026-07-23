@@ -24,7 +24,9 @@ type SubscriptionTokenPayload = {
   scope: 'subscription:write'
 }
 
-function ttlSeconds(): number {
+// Exported (as subscriptionTokenTtlSeconds) for the config-activation
+// manifest — the shared resolver, not a re-parse of SUBSCRIPTION_TOKEN_TTL_SECONDS.
+export function ttlSeconds(): number {
   const value = Number(process.env.SUBSCRIPTION_TOKEN_TTL_SECONDS || 600)
   return Number.isInteger(value) && value > 0 && value <= 3600 ? value : 600
 }

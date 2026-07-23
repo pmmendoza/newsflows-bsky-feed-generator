@@ -11,6 +11,7 @@ export type DatabaseSchema = {
   'feedgen_ops.archive_outbox_dlq': ArchiveOutboxDlq
   'feedgen_ops.feed_catalog': FeedCatalog
   'feedgen_ops.feed_catalog_history': FeedCatalogHistory
+  'feedgen_ops.config_activation': ConfigActivation
   'feedgen_ops.study_catalog': StudyCatalog
   'feedgen_ops.study_registry': StudyRegistry
   'feedgen_ops.subscriber_feed_assignment': SubscriberFeedAssignment
@@ -233,6 +234,24 @@ export interface FeedCatalogHistory {
   feed_code_hash_after: string | null
   ranker_code_hash_before: string | null
   ranker_code_hash_after: string | null
+}
+
+// feedgen_ops.config_activation (migration 010). `config` is the
+// canonical-JSON behavior manifest (src/util/config-manifest.ts), written as
+// `sql\`${JSON.stringify(manifest)}::jsonb\`` (see feed-catalog-admin.ts's
+// jsonb-write pattern — node-postgres renders a plain JS value as a Postgres
+// array/text literal, not JSON, without the explicit cast).
+export interface ConfigActivation {
+  activation_id?: number | string
+  activated_at: string | Date
+  build_sha: string | null
+  image_id: string | null
+  feed_code_hash: string | null
+  ranker_code_hash: string | null
+  config: unknown
+  config_hash: string
+  prev_config_hash: string | null
+  reason?: string
 }
 
 export type StudyCatalog = {

@@ -882,3 +882,67 @@ migrations['009_feed_catalog_history'] = {
     `.execute(db)
   },
 }
+
+migrations['010_config_activation'] = {
+  // Append-only under normal roles, mirroring + hardening migration 009
+  // (feed_catalog_history): same REVOKE + BEFORE UPDATE OR DELETE reject
+  // trigger, PLUS a BEFORE TRUNCATE FOR EACH STATEMENT reject trigger (009
+  // did not close the TRUNCATE gap; this migration does). Both triggers
+  // share one function since it unconditionally RAISE EXCEPTIONs regardless
+  // of TG_OP. This is normal-role integrity only — a superuser can still
+  // DISABLE TRIGGER / DROP; that is accepted (superuser tamper-evidence is
+  // explicitly out of scope per the design doc).
+  async up(db: Kysely<unknown>) {
+    await sql`
+      CREATE TABLE feedgen_ops.config_activation (
+        activation_id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        activated_at timestamptz NOT NULL DEFAULT now(),
+        build_sha text,
+        image_id text,
+        feed_code_hash text,
+        ranker_code_hash text,
+        config jsonb NOT NULL,
+        config_hash text NOT NULL,
+        prev_config_hash text,
+        reason text NOT NULL DEFAULT 'process_start'
+      )
+    `.execute(db)
+    await sql`
+      CREATE INDEX config_activation_activated_at_idx
+      ON feedgen_ops.config_activation (activated_at DESC, activation_id DESC)
+    `.execute(db)
+    await sql`
+      REVOKE UPDATE, DELETE, TRUNCATE ON feedgen_ops.config_activation FROM PUBLIC
+    `.execute(db)
+    await sql`
+      CREATE FUNCTION feedgen_ops.reject_config_activation_mutation()
+      RETURNS trigger
+      LANGUAGE plpgsql
+      AS $$
+      BEGIN
+        RAISE EXCEPTION 'feedgen_ops.config_activation is append-only';
+      END
+      $$
+    `.execute(db)
+    await sql`
+      CREATE TRIGGER config_activation_append_only
+      BEFORE UPDATE OR DELETE ON feedgen_ops.config_activation
+      FOR EACH ROW
+      EXECUTE FUNCTION feedgen_ops.reject_config_activation_mutation()
+    `.execute(db)
+    await sql`
+      CREATE TRIGGER config_activation_reject_truncate
+      BEFORE TRUNCATE ON feedgen_ops.config_activation
+      FOR EACH STATEMENT
+      EXECUTE FUNCTION feedgen_ops.reject_config_activation_mutation()
+    `.execute(db)
+  },
+  async down(db: Kysely<unknown>) {
+    await sql`
+      DROP TABLE feedgen_ops.config_activation
+    `.execute(db)
+    await sql`
+      DROP FUNCTION feedgen_ops.reject_config_activation_mutation()
+    `.execute(db)
+  },
+}

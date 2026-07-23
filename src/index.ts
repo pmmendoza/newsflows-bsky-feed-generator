@@ -38,6 +38,10 @@ const run = async () => {
     serviceDid,
   })
   await server.start()
+  // After start, never blocking/delaying it further: records this process's
+  // resolved behavior config as a config_activation row (fail-open — see
+  // src/util/config-activation.ts for the retry/degraded-flag contract).
+  await server.recordConfigActivation()
   console.log(
     `[${new Date().toISOString()}] - 🤖 running feed generator at http://${server.cfg.listenhost}:${server.cfg.port}`,
   )
