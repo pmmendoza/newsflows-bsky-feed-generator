@@ -577,8 +577,12 @@ async function readCatalogRows(ctx: AppContext): Promise<FeedCatalog[]> {
     .execute()) as FeedCatalog[]
 }
 
-async function readCatalogRowFromDb(db: any, rkey: string): Promise<FeedCatalog | undefined> {
-  return (await db
+export async function readCatalogRowFromDb(
+  db: any,
+  rkey: string,
+  forUpdate = false,
+): Promise<FeedCatalog | undefined> {
+  let query = db
     .selectFrom('feedgen_ops.feed_catalog')
     .select([
       'feed_id',
@@ -596,7 +600,13 @@ async function readCatalogRowFromDb(db: any, rkey: string): Promise<FeedCatalog 
       'retired_at',
     ])
     .where('rkey', '=', rkey)
-    .executeTakeFirst()) as FeedCatalog | undefined
+  // forUpdate is passed ONLY by the update transaction: it locks the row so a
+  // concurrent update blocks until we commit, then re-reads the now-current
+  // value and its if_current CAS check correctly rejects (409). Two switches
+  // with the same if_current can't both pass the check and clobber each other.
+  // GET readback and dry-run reads leave forUpdate=false (unlocked, unchanged).
+  if (forUpdate) query = query.forUpdate()
+  return (await query.executeTakeFirst()) as FeedCatalog | undefined
 }
 
 async function readCatalogRow(ctx: AppContext, rkey: string): Promise<FeedCatalog | undefined> {
@@ -733,7 +743,9 @@ export default function registerFeedCatalogAdminEndpoint(
         const v = validateUpdate(body)
         if (!v.ok) return res.status(400).json({ error: v.error })
         const apply = await ctx.db.transaction().execute(async (trx) => {
-          const current = await readCatalogRowFromDb(trx, v.row.rkey)
+          // Lock the row before the CAS check so concurrent updates serialize:
+          // the loser re-reads post-commit and its if_current check 409s.
+          const current = await readCatalogRowFromDb(trx, v.row.rkey, true)
           if (!current) {
             return {
               httpStatus: 404,
