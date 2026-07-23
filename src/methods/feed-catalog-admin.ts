@@ -63,6 +63,7 @@ const UPDATE_FIELDS = [
   'publisher_did',
   'algo_policy_id',
   'ranker_policy_id',
+  'ranker_score_source',
   'enabled',
   'access_policy_id',
   'study_id',
@@ -92,6 +93,7 @@ type CatalogUpdateBody = {
   publisher_did?: string | null
   algo_policy_id?: string
   ranker_policy_id?: string | null
+  ranker_score_source?: string | null
   enabled?: boolean
   access_policy_id?: string
   study_id?: string | null
@@ -111,6 +113,7 @@ type CatalogUpdatePatch = Partial<Pick<
   | 'publisher_did'
   | 'algo_policy_id'
   | 'ranker_policy_id'
+  | 'ranker_score_source'
   | 'enabled'
   | 'access_policy_id'
   | 'study_id'
@@ -189,6 +192,9 @@ function validateCurrentValues(
     if (field === 'ranker_policy_id' && !nullableString(fieldValue)) {
       return { ok: false, error: 'if_current.ranker_policy_id must be string or null' }
     }
+    if (field === 'ranker_score_source' && !nullableString(fieldValue)) {
+      return { ok: false, error: 'if_current.ranker_score_source must be string or null' }
+    }
     if (
       field === 'access_policy_id' &&
       (typeof fieldValue !== 'string' || !ALLOWED_ACCESS_POLICIES.has(fieldValue))
@@ -246,6 +252,7 @@ export function feedCatalogItemPayload(row: FeedCatalog) {
     study_id: row.study_id ?? null,
     algo_policy_id: row.algo_policy_id,
     ranker_policy_id: row.ranker_policy_id ?? null,
+    ranker_score_source: row.ranker_score_source ?? null,
     access_policy_id: row.access_policy_id,
     enabled: row.enabled,
     created_at: row.created_at ?? null,
@@ -341,6 +348,9 @@ export function validateUpdate(body: any): { ok: true; row: ValidatedCatalogUpda
   if (body.ranker_policy_id !== undefined && !nullableString(body.ranker_policy_id)) {
     return { ok: false, error: 'ranker_policy_id must be string or null' }
   }
+  if (body.ranker_score_source !== undefined && !nullableString(body.ranker_score_source)) {
+    return { ok: false, error: 'ranker_score_source must be string or null' }
+  }
   const policy = validatePolicyPair(body.algo_policy_id, body.ranker_policy_id)
   if (!policy.ok) return policy
   if (body.enabled !== undefined && typeof body.enabled !== 'boolean') {
@@ -363,6 +373,7 @@ export function validateUpdate(body: any): { ok: true; row: ValidatedCatalogUpda
     publisher_did: body.publisher_did,
     algo_policy_id: body.algo_policy_id,
     ranker_policy_id: body.ranker_policy_id,
+    ranker_score_source: body.ranker_score_source,
     enabled: body.enabled,
     access_policy_id: body.access_policy_id,
     study_id: body.study_id,
@@ -556,6 +567,7 @@ async function readCatalogRows(ctx: AppContext): Promise<FeedCatalog[]> {
       'study_id',
       'algo_policy_id',
       'ranker_policy_id',
+      'ranker_score_source',
       'access_policy_id',
       'enabled',
       'created_at',
@@ -577,6 +589,7 @@ async function readCatalogRowFromDb(db: any, rkey: string): Promise<FeedCatalog 
       'study_id',
       'algo_policy_id',
       'ranker_policy_id',
+      'ranker_score_source',
       'access_policy_id',
       'enabled',
       'created_at',

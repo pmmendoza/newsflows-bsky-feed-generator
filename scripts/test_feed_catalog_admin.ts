@@ -198,6 +198,72 @@ function testNonRankerPolicyRequiresNullRankerPolicy() {
   )
 }
 
+function testRankerScoreSourceUpdate() {
+  // (a) set to a string and to null are both accepted + applied.
+  const toProfile = validUpdate({ rkey: 'newsflow-nl-1', ranker_score_source: 'nl-shared' })
+  assertEqual(toProfile.patch.ranker_score_source, 'nl-shared', 'patch ranker_score_source string')
+  const toNull = validUpdate({
+    rkey: 'newsflow-nl-1',
+    ranker_score_source: null,
+    if_current: { ranker_score_source: 'nl-shared' },
+  })
+  assertEqual(toNull.patch.ranker_score_source, null, 'patch ranker_score_source null')
+
+  const servingSelf: FeedCatalog = { ...baseFeed, ranker_score_source: null }
+  const dryRun = buildFeedCatalogDryRun(
+    servingSelf,
+    validUpdate({ rkey: 'newsflow-nl-1', ranker_score_source: 'nl-shared' }),
+    { studyExists: true },
+  )
+  assertEqual(dryRun.status, 'dry-run', 'score-source diff status')
+  assertEqual(dryRun.current.ranker_score_source, null, 'score-source diff current')
+  assertEqual(dryRun.proposed.ranker_score_source, 'nl-shared', 'score-source diff proposed')
+  assertEqual(dryRun.rollback.fields.ranker_score_source, null, 'score-source diff rollback')
+  const after = { ...servingSelf, ranker_score_source: 'nl-shared' }
+  const applied = buildFeedCatalogApplyResult(servingSelf, after, dryRun, true)
+  assertEqual(applied.after.ranker_score_source, 'nl-shared', 'score-source apply after')
+  assertEqual(applied.readback.ranker_score_source, 'nl-shared', 'score-source apply readback')
+}
+
+function testRankerScoreSourceCas() {
+  // (b) CAS: an if_current.ranker_score_source that doesn't match the live
+  // value rejects the switch; a match passes.
+  const live: FeedCatalog = { ...baseFeed, ranker_score_source: 'nl-shared' }
+  const update = validUpdate({
+    rkey: 'newsflow-nl-1',
+    ranker_score_source: 'nl-ideology',
+    if_current: { ranker_score_source: 'nl-shared' },
+  })
+  assert(
+    currentValueMismatches(live, update.ifCurrent).length === 0,
+    'matching if_current.ranker_score_source should pass CAS',
+  )
+  const drifted: FeedCatalog = { ...baseFeed, ranker_score_source: 'nl-other' }
+  const mismatches = currentValueMismatches(drifted, update.ifCurrent)
+  assertEqual(mismatches.length, 1, 'mismatched if_current.ranker_score_source should reject CAS')
+  assertEqual(mismatches[0].field, 'ranker_score_source', 'CAS mismatch field')
+  assertEqual(mismatches[0].expected, 'nl-shared', 'CAS mismatch expected')
+  assertEqual(mismatches[0].actual, 'nl-other', 'CAS mismatch actual')
+}
+
+function testRankerScoreSourceRejectsNonString() {
+  // (c) non-string / non-null values are rejected in patch and if_current.
+  const badPatch = validateUpdate({ rkey: 'newsflow-nl-1', ranker_score_source: 42 })
+  assert(!badPatch.ok, 'numeric ranker_score_source should fail')
+  assertEqual(badPatch.error, 'ranker_score_source must be string or null', 'ranker_score_source patch error')
+  const badIfCurrent = validateUpdate({
+    rkey: 'newsflow-nl-1',
+    enabled: false,
+    if_current: { ranker_score_source: 42 },
+  })
+  assert(!badIfCurrent.ok, 'numeric if_current.ranker_score_source should fail')
+  assertEqual(
+    badIfCurrent.error,
+    'if_current.ranker_score_source must be string or null',
+    'ranker_score_source if_current error',
+  )
+}
+
 function testInvalidIfCurrentField() {
   const result = validateUpdate({
     rkey: 'newsflow-nl-1',
@@ -359,6 +425,9 @@ const tests = [
   testValidPolicyFieldUpdate,
   testRankerPriorityRequiresRankerPolicy,
   testNonRankerPolicyRequiresNullRankerPolicy,
+  testRankerScoreSourceUpdate,
+  testRankerScoreSourceCas,
+  testRankerScoreSourceRejectsNonString,
   testInvalidIfCurrentField,
   testNoOpDryRun,
   testRealDiffDryRun,
