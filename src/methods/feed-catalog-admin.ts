@@ -683,13 +683,14 @@ async function appendFeedCatalogHistory(
   // this feed, so the latest revision remains current until this insert.
   const previous = await db
     .selectFrom('feedgen_ops.feed_catalog_history')
-    .select(['revision', 'feed_code_hash_after'])
+    .select(['revision', 'feed_code_hash_after', 'ranker_code_hash_after'])
     .where('feed_id', '=', after.feed_id)
     .orderBy('revision', 'desc')
     .limit(1)
     .executeTakeFirst()
   const revision = Number(previous?.revision ?? 0) + 1
   const feedCodeHashAfter = process.env.FEEDGEN_FEED_CODE_HASH || null
+  const rankerCodeHashAfter = process.env.FEEDGEN_RANKER_CODE_HASH || null
 
   await db
     .insertInto('feedgen_ops.feed_catalog_history')
@@ -709,8 +710,10 @@ async function appendFeedCatalogHistory(
         ? previous.feed_code_hash_after ?? null
         : feedCodeHashAfter,
       feed_code_hash_after: feedCodeHashAfter,
-      ranker_code_hash_before: null,
-      ranker_code_hash_after: null,
+      ranker_code_hash_before: previous
+        ? previous.ranker_code_hash_after ?? null
+        : rankerCodeHashAfter,
+      ranker_code_hash_after: rankerCodeHashAfter,
     })
     .execute()
 
