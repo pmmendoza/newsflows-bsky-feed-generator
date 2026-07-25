@@ -3,10 +3,11 @@ import { sql } from 'kysely'
 type AnySelect = any
 
 // Feeds routed through the BE politician-or-party eligibility filter: the K/M
-// study feeds plus the legacy BE-1/2/3 during overlap. Matching a disabled
-// feed is inert by design (mission D6), so `[123]` stays in the pattern after
-// retirement and needs no redeploy to remove.
-const BE_FILTER_RKEY = /^newsflow-be-(k|m|[123])$/
+// study feeds only. newsflow-be-1/2/3 are fully decommissioned (PRD.md D2,
+// 2026-07-25) — they no longer route through this filter and, once their
+// catalog rows are removed, fall through to feedgen's standard unknown/
+// disabled-feed handling like any other unregistered rkey.
+const BE_FILTER_RKEY = /^newsflow-be-(k|m)$/
 
 // Kill-switch: an explicit falsy value disables the filter entirely (declared
 // degraded state — BE feeds then serve UNFILTERED). Default (unset) is enabled.
@@ -34,8 +35,8 @@ export function isPoliticianFilterEnabled(rkey: string): boolean {
 /** One-line startup summary of the filter state (logged by index.ts at boot). */
 export function politicianFilterStartupSummary(): string {
   return killSwitchDisabled()
-    ? 'politician-filter: DISABLED via FEEDGEN_BE_POLITICIAN_FILTER kill-switch — BE feeds (newsflow-be-{k,m,1,2,3}) serve UNFILTERED (declared degraded)'
-    : 'politician-filter: ENABLED — BE feeds (newsflow-be-{k,m,1,2,3}) apply politician-or-party eligibility (ranker_prod.post_political_eligibility)'
+    ? 'politician-filter: DISABLED via FEEDGEN_BE_POLITICIAN_FILTER kill-switch — BE feeds (newsflow-be-{k,m}) serve UNFILTERED (declared degraded)'
+    : 'politician-filter: ENABLED — BE feeds (newsflow-be-{k,m}) apply politician-or-party eligibility (ranker_prod.post_political_eligibility)'
 }
 
 // ponytail: 5-min per-process throttle so the degraded state is visible on

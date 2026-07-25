@@ -54,12 +54,12 @@ function withEnv<T>(env: Record<string, string | undefined>, fn: () => T): T {
   }
 }
 
-// --- routing (regex): be-(k|m|[123]) routed; be-4 and non-BE untouched --------
+// --- routing (regex): only be-(k|m) routed; be-1/2/3 decommissioned (PRD.md D2) ---
 console.log('BE politician-or-party filter routing')
-for (const rkey of ['newsflow-be-k', 'newsflow-be-m', 'newsflow-be-1', 'newsflow-be-2', 'newsflow-be-3']) {
+for (const rkey of ['newsflow-be-k', 'newsflow-be-m']) {
   assert(isPoliticianFilterRouted(rkey) === true, `${rkey} routed`)
 }
-for (const rkey of ['newsflow-be-4', 'newsflow-nl-1', 'newsflow-fr-2', 'newsflow-cz-3', 'newsflow-ir-5', 'newsflow-be-t2', '']) {
+for (const rkey of ['newsflow-be-1', 'newsflow-be-2', 'newsflow-be-3', 'newsflow-be-4', 'newsflow-nl-1', 'newsflow-fr-2', 'newsflow-cz-3', 'newsflow-ir-5', 'newsflow-be-t2', '']) {
   assert(isPoliticianFilterRouted(rkey) === false, `${rkey || '(empty)'} not routed`)
 }
 
@@ -74,7 +74,7 @@ withEnv({ FEEDGEN_BE_POLITICIAN_FILTER: 'true' }, () => {
 })
 for (const off of ['false', '0', 'no', 'off', 'FALSE', ' Off ']) {
   withEnv({ FEEDGEN_BE_POLITICIAN_FILTER: off }, () => {
-    assert(isPoliticianFilterEnabled('newsflow-be-1') === false, `kill-switch '${off}' disables filter`)
+    assert(isPoliticianFilterEnabled('newsflow-be-k') === false, `kill-switch '${off}' disables filter`)
   })
 }
 
