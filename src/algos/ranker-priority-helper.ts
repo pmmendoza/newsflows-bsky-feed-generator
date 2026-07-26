@@ -51,6 +51,53 @@ export function useRankerPriority(_rkey: string): boolean {
  */
 type AnySelect = any
 
+export type RankerPriorityServingStatus = {
+  feed_rkey: string
+  profile_id: string
+  serving_ordering: 'ranked' | 'unranked_recency'
+  observed_at: string
+}
+
+const servingStatusByFeed = new Map<string, RankerPriorityServingStatus>()
+
+export function recordRankerPriorityResult(feedRkey: string, rows: any[]): void {
+  const row = rows[0]
+  if (
+    !row ||
+    typeof row.__ranker_profile_id !== 'string'
+  ) return
+
+  const serving_ordering = rows.some(
+    (candidate) => candidate.__ranker_score !== null &&
+      candidate.__ranker_score !== undefined,
+  )
+    ? 'ranked'
+    : 'unranked_recency'
+  const status: RankerPriorityServingStatus = {
+    feed_rkey: feedRkey,
+    profile_id: row.__ranker_profile_id,
+    serving_ordering,
+    observed_at: new Date().toISOString(),
+  }
+  servingStatusByFeed.set(status.feed_rkey, status)
+
+  if (serving_ordering === 'unranked_recency') {
+    console.warn(JSON.stringify({
+      event: 'ranker_priority_unranked_recency',
+      feed_rkey: status.feed_rkey,
+      profile_id: status.profile_id,
+      served_ordering: serving_ordering,
+      reason: 'zero_fresh_scores',
+    }))
+  }
+}
+
+export function getRankerPriorityServingStatus(): RankerPriorityServingStatus[] {
+  return [...servingStatusByFeed.values()].sort((a, b) =>
+    a.feed_rkey.localeCompare(b.feed_rkey),
+  )
+}
+
 /**
  * Apply the ranker-prod score ORDER BY to a base query that
  * already has `selectFrom('post')` and the time-window predicates
@@ -103,6 +150,13 @@ export function applyRankerPriorityOrder(
           .on('fcp.profile_id', '=', profileId)
           .on('fcp.updated_at', '>=', cutoffIso),
     )
+    // D-3: keep serving recency when joined scores are all null, but carry
+    // request-level metadata in the existing result rows so the fallback is
+    // logged and exposed through /api/config rather than remaining silent.
+    .select([
+      sql<number | null>`fcp.score`.as('__ranker_score'),
+      sql<string>`${profileId}`.as('__ranker_profile_id'),
+    ])
     // Migration 024: `score` is the sole canonical numeric ranking column.
     // Do not fall back to `fcp.priority`; keeping such a fallback would keep
     // the integer priority column alive.

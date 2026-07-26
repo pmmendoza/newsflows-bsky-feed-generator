@@ -61,7 +61,7 @@ require one feed rkey; `omni` rejects a feed:
 curl -X POST "$FEEDGEN_BASE_URL/api/subscribe" \
   -H "api-key: $FEEDGEN_ADMIN_API_KEY" \
   -H "content-type: application/json" \
-  --data '{"handle":"participant.bsky.social","feed":"newsflow-be-1","mode":"replace"}'
+  --data '{"handle":"participant.bsky.social","feed":"newsflow-be-k","mode":"replace"}'
 ```
 
 Use `{"did":"did:plc:...", ...}` instead when the participant DID is already

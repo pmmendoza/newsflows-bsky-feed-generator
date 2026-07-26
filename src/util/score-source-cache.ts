@@ -13,15 +13,14 @@
  * background refresh (started at boot, like the scheduled updaters) keeps the
  * in-memory map warm, so the hot path is a plain `Map.get`.
  *
- * Fail-safe: before the first successful load, and on any refresh error, the
- * map yields `null`, so callers fall back to the rkey — byte-for-byte the
- * pre-cutover behavior. Since every catalog row currently has
- * `ranker_score_source = NULL`, the served ordering is unchanged until an
- * operator sets a feed's source.
+ * The cache fails closed until it has loaded successfully. A catalog row with
+ * `ranker_score_source = NULL` still explicitly means "serve self"; a missing
+ * row or failed refresh must not silently turn into that legitimate default.
  */
 import { Database } from '../db'
 
-let scoreSourceByFeed: Map<string, string | null> = new Map()
+let scoreSourceByFeed: Map<string, string | null> | null = null
+let cacheHealthy = false
 let refreshInFlight: Promise<void> | null = null
 
 export const scoreSourceRefreshMs = (): number => {
@@ -32,18 +31,25 @@ export const scoreSourceRefreshMs = (): number => {
 }
 
 /**
- * Synchronous per-request lookup. Returns the configured score source for a
- * feed (by rkey or feed_id), or `null` to mean "serve self" (fall back to the
- * rkey). Never throws.
+ * Synchronous per-request lookup. A stored `null` means "serve self"; absence
+ * means the cache cannot prove that no named source was declared, so it fails
+ * closed instead of silently using the rkey.
  */
 export function getScoreSource(feedKey: string): string | null {
+  if (!scoreSourceByFeed || !cacheHealthy) {
+    throw new Error('score_source_cache_unready')
+  }
+  if (!scoreSourceByFeed.has(feedKey)) {
+    throw new Error(`score_source_binding_missing feed=${feedKey}`)
+  }
   return scoreSourceByFeed.get(feedKey) ?? null
 }
 
 /**
  * Rebuild the map from `feedgen_ops.feed_catalog`. Keyed by both rkey and
  * feed_id so the lookup resolves whichever identifier the feed handlers pass.
- * On error the previous map is retained (fail-safe: stale ⇒ null ⇒ rkey).
+ * On error the previous map is retained but marked unhealthy, preventing it
+ * from silently serving a stale null binding as the rkey.
  */
 export async function refreshScoreSourceCache(db: Database): Promise<void> {
   if (refreshInFlight) return refreshInFlight
@@ -62,12 +68,15 @@ export async function refreshScoreSourceCache(db: Database): Promise<void> {
         if (row.feed_id) next.set(row.feed_id, source)
       }
       scoreSourceByFeed = next
+      cacheHealthy = true
     } catch (error) {
+      cacheHealthy = false
       console.error(
         `[${new Date().toISOString()}] - score-source-cache refresh failed; keeping previous map. error=${
           error instanceof Error ? error.message : String(error)
         }`,
       )
+      throw error
     }
   })()
 

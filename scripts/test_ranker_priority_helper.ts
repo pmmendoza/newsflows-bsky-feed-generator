@@ -84,6 +84,12 @@ function withEnv<T>(env: Record<string, string | undefined>, fn: () => T): T {
   }
 }
 
+async function main() {
+await refreshScoreSourceCache(fakeDbReturning([
+  { rkey: 'newsflow-nl-2', feed_id: 'newsflow-nl-2', ranker_score_source: null },
+  { rkey: 'newsflow-fr-2', feed_id: 'newsflow-fr-2', ranker_score_source: null },
+]))
+
 console.log('rkeyToEnvSuffix')
 {
   assert(rkeyToEnvSuffix('newsflow-nl-2') === 'NEWSFLOW_NL_2', 'newsflow-nl-2 → NEWSFLOW_NL_2')
@@ -253,8 +259,9 @@ async function scoreSourceCutoverTests() {
 
   console.log('D1.4 — NULL score source ⇒ profile_id falls back to rkey (identical to pre-cutover)')
   {
-    // Empty / unloaded cache returns null for every feed.
-    await refreshScoreSourceCache(fakeDbReturning([]))
+    await refreshScoreSourceCache(fakeDbReturning([
+      { rkey: 'newsflow-nl-2', feed_id: 'newsflow-nl-2', ranker_score_source: null },
+    ]))
     const c = applyRankerPriorityOrder(basePostQuery(), 'newsflow-nl-2').compile()
     assert(
       c.parameters.includes('newsflow-nl-2'),
@@ -268,6 +275,7 @@ async function scoreSourceCutoverTests() {
     await refreshScoreSourceCache(
       fakeDbReturning([
         { rkey: 'newsflow-nl-2', feed_id: 'newsflow-nl-2', ranker_score_source: 'science-nl-a' },
+        { rkey: 'newsflow-fr-2', feed_id: 'newsflow-fr-2', ranker_score_source: null },
       ]),
     )
     const c = applyRankerPriorityOrder(basePostQuery(), 'newsflow-nl-2').compile()
@@ -281,7 +289,7 @@ async function scoreSourceCutoverTests() {
       'rkey no longer bound once a source is configured',
       JSON.stringify(c.parameters),
     )
-    // A feed with no cache entry still falls back to its own rkey.
+    // A catalog row with no declared source still falls back to its own rkey.
     const other = applyRankerPriorityOrder(basePostQuery(), 'newsflow-fr-2').compile()
     assert(
       other.parameters.includes('newsflow-fr-2'),
@@ -290,17 +298,19 @@ async function scoreSourceCutoverTests() {
     )
   }
 
-  // Reset the shared map so nothing leaks to other test files/runs.
-  await refreshScoreSourceCache(fakeDbReturning([]))
+  // Reset the shared map to explicit serve-self bindings.
+  await refreshScoreSourceCache(fakeDbReturning([
+    { rkey: 'newsflow-nl-2', feed_id: 'newsflow-nl-2', ranker_score_source: null },
+  ]))
 }
 
-scoreSourceCutoverTests()
-  .then(() => {
-    console.log()
-    console.log(`Summary: ${passed} passed, ${failed} failed`)
-    if (failed > 0) process.exit(1)
-  })
-  .catch((err) => {
-    console.error('test harness error:', err)
-    process.exit(2)
-  })
+await scoreSourceCutoverTests()
+console.log()
+console.log(`Summary: ${passed} passed, ${failed} failed`)
+if (failed > 0) process.exit(1)
+}
+
+main().catch((err) => {
+  console.error('test harness error:', err)
+  process.exit(2)
+})

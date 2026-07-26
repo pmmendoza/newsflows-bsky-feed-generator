@@ -16,6 +16,7 @@ import { getRetentionConfig } from '../util/retention'
 import { ApiKeyAuthConfig, isApiKeyAuthorized, logUnauthorized } from '../util/api-auth'
 import { resolveEngagementTimeHours } from '../algos/feed-builder'
 import { isConfigActivationDegraded } from '../util/config-activation'
+import { getRankerPriorityServingStatus } from '../algos/ranker-priority-helper'
 
 type EngagementExportType = 'like' | 'repost' | 'comment' | 'quote'
 type EngagementExportScope = 'union' | 'publisher' | 'subscriber' | 'subscriber_on_publisher'
@@ -801,12 +802,18 @@ export default function registerMonitorEndpoints(server: Server, ctx: AppContext
       const buildSha = process.env.FEEDGEN_BUILD_SHA || undefined
       const feedCodeHash = process.env.FEEDGEN_FEED_CODE_HASH || undefined
       const rankerCodeHash = process.env.FEEDGEN_RANKER_CODE_HASH || undefined
+      const rankerPriorityServing = getRankerPriorityServingStatus()
 
       if (publisherDids.length === 0) {
         warnings.push('no_publisher_dids_configured')
       }
       if (scopedIngestionEnabled() && publisherDids.length === 0 && followsCount === 0) {
         warnings.push('scoped_ingestion_enabled_but_allowlist_empty')
+      }
+      if (rankerPriorityServing.some(
+        (status) => status.serving_ordering === 'unranked_recency',
+      )) {
+        warnings.push('ranker_priority_unranked_recency')
       }
 
       let firehoseHost: string | undefined
@@ -824,6 +831,9 @@ export default function registerMonitorEndpoints(server: Server, ctx: AppContext
         feed_code_hash: feedCodeHash ?? null,
         ranker_code_hash: rankerCodeHash ?? null,
         config_activation_degraded: configActivationDegraded,
+        ranker_priority: {
+          serving: rankerPriorityServing,
+        },
         ingestion: {
           scoped_ingestion_enabled: scopedIngestionEnabled(),
           track_subscriber_activity: trackSubscriberActivityEnabled(),

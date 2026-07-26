@@ -22,6 +22,7 @@ import { startFeedCatalogListener, stopFeedCatalogListener } from './util/catalo
 import { isRetentionSchedulerEnabledStrict } from './util/retention'
 import { recordConfigActivation as persistConfigActivation } from './util/config-activation'
 import registerConfigActivationAdminEndpoint from './methods/config-activation-admin'
+import { refreshScoreSourceCache } from './util/score-source-cache'
 
 export class FeedGenerator {
   public app: express.Application
@@ -135,6 +136,13 @@ export class FeedGenerator {
           )
         }
       }
+    }
+
+    // Ranker queries are synchronous and cannot safely infer a missing binding.
+    // Prime the cache before accepting traffic; a failed load aborts startup.
+    await refreshScoreSourceCache(this.db)
+
+    if (!this.cfg.readOnlyMode) {
       this.firehose.run(this.cfg.subscriptionReconnectDelay)
     }
 
@@ -162,8 +170,8 @@ export class FeedGenerator {
     this.followsUpdateTimer = setupFollowsUpdateScheduler(this.db, updateInterval)
     this.engagementUpdateTimer = setupEngagmentUpdateScheduler(this.db, updateInterval)
 
-    // D1.4: keep the ranker score-source map warm for the sync read-path lookup.
-    setupScoreSourceCacheScheduler(this.db)
+    // The startup load above already primed the map; refresh it on schedule.
+    setupScoreSourceCacheScheduler(this.db, undefined, false)
 
     // Set up daily full sync at 4:00 AM to remove unfollowed accounts
     setupDailyFullSyncScheduler(this.db)

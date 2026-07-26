@@ -4,6 +4,7 @@ import { DatabaseSchema, Post } from '../db/schema'
 import { AppContext } from '../config'
 import { SkeletonFeedPost } from '../lexicon/types/app/bsky/feed/defs'
 import { dualWriteLinkFields } from '../util/link-fields'
+import { recordRankerPriorityResult } from './ranker-priority-helper'
 
 // Type definition for FeedGenerator handler
 export type FeedGenerator = (ctx: AppContext, params: QueryParams, requesterDid: string) => Promise<AlgoOutput>
@@ -96,6 +97,10 @@ export async function buildFeed({
     publisherPostsQuery.execute(),
     otherPostsQuery.execute()
   ]);
+
+  // Ranker queries carry one request-level health marker on every result row.
+  // Chronological/engagement rows do not, so this is a no-op for those feeds.
+  recordRankerPriorityResult(shortname, [...publisherPosts, ...otherPosts])
 
   console.log(`[${new Date().toISOString()}] - Feed ${shortname} retrieved ${publisherPosts.length} publisher posts and ${otherPosts.length} other posts`);
 
