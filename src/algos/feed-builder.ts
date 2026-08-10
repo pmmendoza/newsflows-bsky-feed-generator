@@ -4,7 +4,7 @@ import { DatabaseSchema, Post } from '../db/schema'
 import { AppContext } from '../config'
 import { SkeletonFeedPost } from '../lexicon/types/app/bsky/feed/defs'
 import { dualWriteLinkFields } from '../util/link-fields'
-import { recordRankerPriorityResult } from './ranker-priority-helper'
+import { recordRankerPriorityResult, rkeyToEnvSuffix } from './ranker-priority-helper'
 
 // Type definition for FeedGenerator handler
 export type FeedGenerator = (ctx: AppContext, params: QueryParams, requesterDid: string) => Promise<AlgoOutput>
@@ -29,6 +29,57 @@ export function resolveEngagementTimeHours(): number {
   return process.env.ENGAGEMENT_TIME_HOURS
     ? parseInt(process.env.ENGAGEMENT_TIME_HOURS, 10)
     : 72
+}
+
+/**
+ * Per-feed serving-age window (hours) for a feed's PUBLISHER (ranked) posts.
+ *
+ * Motivation (BE K/M study feeds): the ranker ranks political clusters over a
+ * ~10-day push window, but high-engagement political stories are already several
+ * days old by the time they rank. The global 72h serving filter
+ * (resolveEngagementTimeHours) drops them before they reach the feed, so only a
+ * couple of political clusters survive and the ideology-diversity treatment has
+ * almost nothing to act on. Setting
+ *   FEEDGEN_SERVING_TIME_HOURS_<RKEY>=168   (e.g. FEEDGEN_SERVING_TIME_HOURS_NEWSFLOW_BE_K)
+ * lets that ONE feed serve its ranked publisher posts over a longer window.
+ *
+ * Scope — this changes ONLY the serving-time post-age filter for that feed's
+ * publisher query. It deliberately does NOT touch:
+ *   - the follows (2/3 of the feed) window — still resolveEngagementTimeHours();
+ *   - the engagement-RECOUNT window (util/engagement-updater.ts) — still the
+ *     global value, so ranker engagement inputs are unchanged; and
+ *   - any other feed — an unset/invalid override falls back to
+ *     resolveEngagementTimeHours(), i.e. byte-for-byte the prior behavior.
+ *
+ * Raw parseInt mirrors resolveEngagementTimeHours's contract; a non-finite or
+ * non-positive value falls back to the global default rather than serving junk.
+ */
+export function resolveServingTimeHours(shortname: string): number {
+  const raw = process.env[`FEEDGEN_SERVING_TIME_HOURS_${rkeyToEnvSuffix(shortname)}`]
+  if (raw !== undefined && raw !== '') {
+    const parsed = parseInt(raw, 10)
+    if (Number.isFinite(parsed) && parsed > 0) return parsed
+  }
+  return resolveEngagementTimeHours()
+}
+
+/**
+ * All active per-feed serving-window overrides as { <RKEY_ENV_SUFFIX>: hours },
+ * for the config-activation manifest (util/config-manifest.ts). Uses the same
+ * parse rule as resolveServingTimeHours so the manifest records exactly what
+ * serving uses (the manifest's load-bearing "no separate re-parse" rule).
+ */
+export function servingTimeHourOverrides(): Record<string, number> {
+  const out: Record<string, number> = {}
+  for (const key of Object.keys(process.env)) {
+    const match = /^FEEDGEN_SERVING_TIME_HOURS_([A-Z0-9_]+)$/.exec(key)
+    if (!match) continue
+    const value = process.env[key]
+    if (!value) continue
+    const parsed = parseInt(value, 10)
+    if (Number.isFinite(parsed) && parsed > 0) out[match[1]] = parsed
+  }
+  return out
 }
 
 export function archiveOutboxEnabled(): boolean {
@@ -65,9 +116,20 @@ export async function buildFeed({
   const limit = publisherLimit; // 1/3 from news + 2/3 other (legacy alias for cursor math)
   const requesterFollows = await getFollows(requesterDid, ctx.db)
   
-  // don't consider posts older than time limit hours
+  // don't consider posts older than the serving window. The FOLLOWS window is
+  // always the global engagement window. The PUBLISHER (ranked) window is the
+  // SAME unless this feed sets FEEDGEN_SERVING_TIME_HOURS_<RKEY> (BE K/M study
+  // feeds only) — when it doesn't, resolveServingTimeHours() returns the global
+  // value and publisherTimeLimit reuses the identical string, so any feed
+  // without an override is byte-for-byte unchanged (one Date.now, one timeLimit).
   const engagementTimeHours = resolveEngagementTimeHours();
-  const timeLimit = new Date(Date.now() - engagementTimeHours * 60 * 60 * 1000).toISOString();
+  const publisherTimeHours = resolveServingTimeHours(shortname);
+  const nowMs = Date.now();
+  const followsTimeLimit = new Date(nowMs - engagementTimeHours * 60 * 60 * 1000).toISOString();
+  const publisherTimeLimit =
+    publisherTimeHours === engagementTimeHours
+      ? followsTimeLimit
+      : new Date(nowMs - publisherTimeHours * 60 * 60 * 1000).toISOString();
 
   // Parse cursor if provided
   let cursorOffset = 0;
@@ -78,7 +140,7 @@ export async function buildFeed({
   // Build the queries using the provided builder functions
   const publisherPostsQuery = buildPublisherQuery(
     ctx.db,
-    timeLimit,
+    publisherTimeLimit,
     requesterFollows,
     cursorOffset,
     limit
@@ -86,7 +148,7 @@ export async function buildFeed({
 
   const otherPostsQuery = buildFollowsQuery(
     ctx.db,
-    timeLimit,
+    followsTimeLimit,
     requesterFollows,
     cursorOffset,
     followsLimit
