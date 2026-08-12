@@ -1,10 +1,15 @@
 import { Kysely } from 'kysely'
 import { QueryParams, OutputSchema as AlgoOutput } from '../lexicon/types/app/bsky/feed/getFeedSkeleton'
-import { DatabaseSchema, Post } from '../db/schema'
+import { DatabaseSchema, Post, PublisherPostMaxAgeSource, PublisherTimeClock } from '../db/schema'
 import { AppContext } from '../config'
 import { SkeletonFeedPost } from '../lexicon/types/app/bsky/feed/defs'
 import { dualWriteLinkFields } from '../util/link-fields'
-import { recordRankerPriorityResult, rkeyToEnvSuffix } from './ranker-priority-helper'
+import { recordRankerPriorityResult } from './ranker-priority-helper'
+import {
+  cutoffFromHours,
+  parseStrictPositiveHours,
+  resolvePublisherServingWindow,
+} from './publisher-serving-window'
 
 // Type definition for FeedGenerator handler
 export type FeedGenerator = (ctx: AppContext, params: QueryParams, requesterDid: string) => Promise<AlgoOutput>
@@ -15,52 +20,24 @@ export type QueryBuilder = (
   timeLimit: string,
   requesterFollows: string[],
   cursorOffset: number,
-  limit: number
+  limit: number,
+  referenceTimeIso: string,
 ) => any
 
-// Shared resolvers — the config-activation manifest (src/util/config-manifest.ts)
-// calls these SAME functions so it records exactly what serving uses, not a
-// separate re-parse. Deliberately a raw parseInt (NaN on invalid input,
-// e.g. `ENGAGEMENT_TIME_HOURS=abc`), matching the pre-existing behavior here
-// byte-for-byte — do NOT normalize invalid input to 72 (that's a different,
-// display-only resolver: methods/monitor.ts's getEngagementTimeHours(), used
-// only for the /api/config `engagement.time_hours` presentational field).
+// Followed-account compatibility horizon. Publisher serving uses the
+// materialized catalog value when present. The manifest calls this same strict
+// resolver so readback and serving cannot disagree on invalid legacy input.
 export function resolveEngagementTimeHours(): number {
-  return process.env.ENGAGEMENT_TIME_HOURS
-    ? parseInt(process.env.ENGAGEMENT_TIME_HOURS, 10)
-    : 72
+  return parseStrictPositiveHours(process.env.ENGAGEMENT_TIME_HOURS) ?? 72
 }
 
 /**
- * Per-feed serving-age window (hours) for a feed's PUBLISHER (ranked) posts.
- *
- * Motivation (BE K/M study feeds): the ranker ranks political clusters over a
- * ~10-day push window, but high-engagement political stories are already several
- * days old by the time they rank. The global 72h serving filter
- * (resolveEngagementTimeHours) drops them before they reach the feed, so only a
- * couple of political clusters survive and the ideology-diversity treatment has
- * almost nothing to act on. Setting
- *   FEEDGEN_SERVING_TIME_HOURS_<RKEY>=168   (e.g. FEEDGEN_SERVING_TIME_HOURS_NEWSFLOW_BE_K)
- * lets that ONE feed serve its ranked publisher posts over a longer window.
- *
- * Scope — this changes ONLY the serving-time post-age filter for that feed's
- * publisher query. It deliberately does NOT touch:
- *   - the follows (2/3 of the feed) window — still resolveEngagementTimeHours();
- *   - the engagement-RECOUNT window (util/engagement-updater.ts) — still the
- *     global value, so ranker engagement inputs are unchanged; and
- *   - any other feed — an unset/invalid override falls back to
- *     resolveEngagementTimeHours(), i.e. byte-for-byte the prior behavior.
- *
- * Raw parseInt mirrors resolveEngagementTimeHours's contract; a non-finite or
- * non-positive value falls back to the global default rather than serving junk.
+ * Transitional compatibility resolver retained for callers/tests that do not
+ * yet provide a catalog row. A valid materialized catalog value always wins in
+ * resolvePublisherServingWindow; readback labels this fallback when active.
  */
 export function resolveServingTimeHours(shortname: string): number {
-  const raw = process.env[`FEEDGEN_SERVING_TIME_HOURS_${rkeyToEnvSuffix(shortname)}`]
-  if (raw !== undefined && raw !== '') {
-    const parsed = parseInt(raw, 10)
-    if (Number.isFinite(parsed) && parsed > 0) return parsed
-  }
-  return resolveEngagementTimeHours()
+  return resolvePublisherServingWindow(shortname, null, null).effectiveHours
 }
 
 /**
@@ -76,8 +53,8 @@ export function servingTimeHourOverrides(): Record<string, number> {
     if (!match) continue
     const value = process.env[key]
     if (!value) continue
-    const parsed = parseInt(value, 10)
-    if (Number.isFinite(parsed) && parsed > 0) out[match[1]] = parsed
+    const parsed = parseStrictPositiveHours(value)
+    if (parsed !== null) out[match[1]] = parsed
   }
   return out
 }
@@ -94,6 +71,25 @@ export interface FeedGeneratorOptions {
   requesterDid: string
   buildPublisherQuery: QueryBuilder
   buildFollowsQuery: QueryBuilder
+  publisherPostMaxAgeDays?: number | null
+  publisherPostMaxAgeSource?: PublisherPostMaxAgeSource | null
+  publisherTimeClock?: PublisherTimeClock
+  feedCatalogRevision?: number | string | null
+  rankerScoreMaxAgeHours?: number | null
+  rankerScoreCompatibilityFallbackActive?: boolean
+  rankerMinScoreBackedShare?: number | null
+}
+
+export function feedPageOffsets(limit: number, cursor?: string) {
+  const followsOffset = cursor ? parseInt(cursor, 10) : 0
+  const publisherLimit = Math.max(1, Math.floor(limit / 3))
+  const followsLimit = publisherLimit * 2
+  return {
+    publisherLimit,
+    followsLimit,
+    publisherOffset: Math.floor(followsOffset / 2),
+    followsOffset,
+  }
 }
 
 // Main function to build a feed
@@ -103,47 +99,51 @@ export async function buildFeed({
   params,
   requesterDid,
   buildPublisherQuery,
-  buildFollowsQuery
+  buildFollowsQuery,
+  publisherPostMaxAgeDays,
+  publisherPostMaxAgeSource,
+  publisherTimeClock = 'receipt_time',
+  feedCatalogRevision = null,
+  rankerScoreMaxAgeHours = null,
+  rankerScoreCompatibilityFallbackActive = false,
+  rankerMinScoreBackedShare = null,
 }: FeedGeneratorOptions) {
-  console.log(`[${new Date().toISOString()}] - Feed ${shortname} requested by ${requesterDid}`);
+  const referenceTimeMs = Date.now()
+  const referenceTimeIso = new Date(referenceTimeMs).toISOString()
+  console.log(`[${referenceTimeIso}] - Feed ${shortname} requested by ${requesterDid}`);
   // Sprint 13 / T1: AppView probes with limit=1 and Math.floor(1/3)=0
   // makes the publisher query ask for 0 rows. Result: 200 + empty feed,
   // which AppView's online-probe heuristic can interpret as "feed broken".
   // Clamp to >=1 publisher and >=2 follows so probes always return content.
   // For limit>=3 this is a no-op (the floor split is unchanged).
-  const publisherLimit = Math.max(1, Math.floor(params.limit / 3));
-  const followsLimit = Math.max(2, Math.floor(params.limit * 2 / 3));
+  const paging = feedPageOffsets(params.limit, params.cursor)
+  const { publisherLimit, followsLimit } = paging
   const limit = publisherLimit; // 1/3 from news + 2/3 other (legacy alias for cursor math)
   const requesterFollows = await getFollows(requesterDid, ctx.db)
   
-  // don't consider posts older than the serving window. The FOLLOWS window is
-  // always the global engagement window. The PUBLISHER (ranked) window is the
-  // SAME unless this feed sets FEEDGEN_SERVING_TIME_HOURS_<RKEY> (BE K/M study
-  // feeds only) — when it doesn't, resolveServingTimeHours() returns the global
-  // value and publisherTimeLimit reuses the identical string, so any feed
-  // without an override is byte-for-byte unchanged (one Date.now, one timeLimit).
+  // Publisher and followed slices keep distinct cutoffs. The publisher slice
+  // consumes its materialized per-feed value; followed accounts retain the
+  // legacy receipt-time horizon. Both derive from one request reference time.
   const engagementTimeHours = resolveEngagementTimeHours();
-  const publisherTimeHours = resolveServingTimeHours(shortname);
-  const nowMs = Date.now();
-  const followsTimeLimit = new Date(nowMs - engagementTimeHours * 60 * 60 * 1000).toISOString();
-  const publisherTimeLimit =
-    publisherTimeHours === engagementTimeHours
-      ? followsTimeLimit
-      : new Date(nowMs - publisherTimeHours * 60 * 60 * 1000).toISOString();
+  const servingWindow = resolvePublisherServingWindow(
+    shortname,
+    publisherPostMaxAgeDays,
+    publisherPostMaxAgeSource,
+  )
+  const followsTimeLimit = cutoffFromHours(referenceTimeMs, engagementTimeHours)
+  const publisherTimeLimit = cutoffFromHours(referenceTimeMs, servingWindow.effectiveHours)
 
   // Parse cursor if provided
-  let cursorOffset = 0;
-  if (params.cursor) {
-    cursorOffset = parseInt(params.cursor, 10);
-  }
+  const cursorOffset = paging.followsOffset
 
   // Build the queries using the provided builder functions
   const publisherPostsQuery = buildPublisherQuery(
     ctx.db,
     publisherTimeLimit,
     requesterFollows,
-    cursorOffset,
-    limit
+    paging.publisherOffset,
+    limit,
+    referenceTimeIso,
   );
 
   const otherPostsQuery = buildFollowsQuery(
@@ -151,7 +151,8 @@ export async function buildFeed({
     followsTimeLimit,
     requesterFollows,
     cursorOffset,
-    followsLimit
+    followsLimit,
+    referenceTimeIso,
   );
 
   // Execute both queries in parallel
@@ -162,7 +163,8 @@ export async function buildFeed({
 
   // Ranker queries carry one request-level health marker on every result row.
   // Chronological/engagement rows do not, so this is a no-op for those feeds.
-  recordRankerPriorityResult(shortname, [...publisherPosts, ...otherPosts])
+  recordRankerPriorityResult(shortname, publisherPosts, rankerMinScoreBackedShare)
+  const rankerFreshScoredPublisherSlots = publisherPosts.filter((post: any) => post.__ranker_score != null).length
 
   console.log(`[${new Date().toISOString()}] - Feed ${shortname} retrieved ${publisherPosts.length} publisher posts and ${otherPosts.length} other posts`);
 
@@ -210,6 +212,16 @@ export async function buildFeed({
     publisherCount: publisherPosts.length,
     followsCount: otherPosts.length,
     servedPosts,
+    requestReferenceTime: referenceTimeIso,
+    publisherPostMaxAgeDays: publisherPostMaxAgeDays ?? null,
+    publisherPostMaxAgeSource: publisherPostMaxAgeSource ?? null,
+    publisherTimeClock,
+    publisherServingWindow: servingWindow,
+    feedCatalogRevision,
+    rankerScoreMaxAgeHours,
+    rankerScoreCompatibilityFallbackActive,
+    rankerMinScoreBackedShare,
+    rankerFreshScoredPublisherSlots,
   };
 
   if (archiveOutboxIsEnabled) {
@@ -239,6 +251,16 @@ type RequestLogInput = {
   publisherCount: number
   followsCount: number
   servedPosts: Post[]
+  requestReferenceTime: string
+  publisherPostMaxAgeDays: number | null
+  publisherPostMaxAgeSource: PublisherPostMaxAgeSource | null
+  publisherTimeClock: PublisherTimeClock
+  publisherServingWindow: ReturnType<typeof resolvePublisherServingWindow>
+  feedCatalogRevision: number | string | null
+  rankerScoreMaxAgeHours: number | null
+  rankerScoreCompatibilityFallbackActive: boolean
+  rankerMinScoreBackedShare: number | null
+  rankerFreshScoredPublisherSlots: number
 }
 
 async function logRequest(
@@ -265,6 +287,21 @@ async function logRequest(
         publisher_count: input.publisherCount,
         follows_count: input.followsCount,
         result_count: input.servedPosts.length,
+        request_reference_time: input.requestReferenceTime,
+        publisher_post_max_age_days: input.publisherPostMaxAgeDays,
+        publisher_post_max_age_source: input.publisherPostMaxAgeSource,
+        publisher_time_clock: input.publisherTimeClock,
+        publisher_serving_window_source: input.publisherServingWindow.source,
+        publisher_compatibility_fallback_active: input.publisherServingWindow.compatibilityFallbackActive,
+        feed_catalog_revision: input.feedCatalogRevision,
+        ranker_score_max_age_hours: input.rankerScoreMaxAgeHours,
+        ranker_score_compatibility_fallback_active: input.rankerScoreCompatibilityFallbackActive,
+        ranker_fresh_scored_publisher_slots: input.rankerFreshScoredPublisherSlots,
+        ranker_publisher_slots: input.publisherCount,
+        ranker_min_score_backed_share: input.rankerMinScoreBackedShare,
+        ranker_observed_score_backed_share: input.publisherCount > 0
+          ? input.rankerFreshScoredPublisherSlots / input.publisherCount
+          : null,
       })
       .returning('id')
       .executeTakeFirstOrThrow();
@@ -370,6 +407,7 @@ function buildArchivePayload({
       result_count: input.servedPosts.length,
       feedgen_build_sha: process.env.FEEDGEN_BUILD_SHA || null,
       algo_policy_id: input.shortname,
+      ...requestTimeProvenance(input),
     },
     post: {
       uri: post.uri,
@@ -392,6 +430,10 @@ function buildArchivePayload({
       repost_count: post.repost_count ?? null,
       comments_count: post.comments_count ?? null,
       quote_count: post.quote_count ?? null,
+      content_time_utc: post.content_time_utc ?? null,
+      content_time_status: post.content_time_status ?? 'legacy_unknown',
+      content_time_clamp_reason: post.content_time_clamp_reason ?? null,
+      content_time_validator_version: post.content_time_validator_version ?? null,
     },
   };
 }
@@ -423,9 +465,29 @@ function buildEmptyRequestPayload({
       result_count: 0,
       feedgen_build_sha: process.env.FEEDGEN_BUILD_SHA || null,
       algo_policy_id: input.shortname,
+      ...requestTimeProvenance(input),
     },
     post: null,
   };
+}
+
+function requestTimeProvenance(input: RequestLogInput) {
+  return {
+    request_reference_time: input.requestReferenceTime,
+    publisher_post_max_age_days: input.publisherPostMaxAgeDays,
+    publisher_post_max_age_source: input.publisherPostMaxAgeSource,
+    publisher_time_clock: input.publisherTimeClock,
+    publisher_serving_window: input.publisherServingWindow,
+    feed_catalog_revision: input.feedCatalogRevision,
+    ranker_score_max_age_hours: input.rankerScoreMaxAgeHours,
+    ranker_score_compatibility_fallback_active: input.rankerScoreCompatibilityFallbackActive,
+    ranker_fresh_scored_publisher_slots: input.rankerFreshScoredPublisherSlots,
+    ranker_publisher_slots: input.publisherCount,
+    ranker_observed_score_backed_share: input.publisherCount > 0
+      ? input.rankerFreshScoredPublisherSlots / input.publisherCount
+      : null,
+    ranker_min_score_backed_share: input.rankerMinScoreBackedShare,
+  }
 }
 
 // Helper function to get follows

@@ -1,6 +1,7 @@
 import dotenv from 'dotenv'
 import { createDb } from '../db'
 import { dualWriteLinkFields } from '../util/link-fields'
+import { validateContentTime } from '../util/content-time'
 
 type AppViewPost = {
   uri?: string
@@ -27,6 +28,11 @@ export type BackfillPostRow = {
   cid: string
   indexedAt: string
   createdAt: string
+  created_at_source_raw: Buffer
+  content_time_utc: string | null
+  content_time_status: 'source_valid' | 'source_invalid'
+  content_time_clamp_reason: 'missing' | 'unparseable' | 'future_skew' | 'past_bound' | null
+  content_time_validator_version: string
   author: string
   text: string
   rootUri: string
@@ -78,16 +84,6 @@ function sanitizeForPostgres(text: string | null | undefined): string {
   return text.replace(/\0/g, '')
 }
 
-function clampCreatedAt(raw: string | undefined | null, indexedAt: string): string {
-  if (!raw) return indexedAt
-  const d = new Date(raw)
-  const i = new Date(indexedAt)
-  if (isNaN(d.getTime()) || isNaN(i.getTime())) return indexedAt
-  if (d.getTime() > i.getTime() + 86_400_000) return indexedAt
-  if (d.getTime() < i.getTime() - 2 * 365 * 86_400_000) return indexedAt
-  return raw
-}
-
 function externalEmbed(embed: any): { uri?: string; title?: string; description?: string } | null {
   if (embed?.external && typeof embed.external.uri === 'string') return embed.external
   return null
@@ -109,12 +105,18 @@ export function normalizeAppViewPost(
   const indexedAt = post.indexedAt || new Date().toISOString()
   const record = post.record || {}
   const embed = externalEmbed(record.embed)
+  const contentTime = validateContentTime(record.createdAt, indexedAt)
 
   return {
     uri: post.uri,
     cid: post.cid,
     indexedAt,
-    createdAt: clampCreatedAt(record.createdAt, indexedAt),
+    createdAt: contentTime.legacy_created_at,
+    created_at_source_raw: contentTime.created_at_source_raw,
+    content_time_utc: contentTime.content_time_utc,
+    content_time_status: contentTime.content_time_status,
+    content_time_clamp_reason: contentTime.content_time_clamp_reason,
+    content_time_validator_version: contentTime.content_time_validator_version,
     author: expectedAuthorDid,
     text: sanitizeForPostgres(record.text),
     rootUri: record.reply?.root?.uri || '',

@@ -7,7 +7,7 @@
  *   - resolver parity: buildConfigManifest()'s resolved values equal what
  *     the actual serving code path computes, via the SAME shared resolver
  *     function — including an INVALID ENGAGEMENT_TIME_HOURS, where the
- *     manifest must carry the raw (possibly NaN) value feed-builder.ts uses,
+ *     manifest must carry the same strictly validated value feed-builder uses,
  *     not the normalized display-only value from methods/monitor.ts.
  *   - the dead flag FEEDGEN_PRIORITY_FROM_RANKER_PROD never appears.
  *   - raw-free SENTINEL: a unique sentinel in every secret env (incl. a
@@ -90,10 +90,10 @@ async function main() {
   await withEnv({ ENGAGEMENT_TIME_HOURS: 'not-a-number' }, () => {
     const manifest = buildConfigManifest(baseConfig())
     const servingValue = resolveEngagementTimeHours()
-    check(Number.isNaN(servingValue), 'sanity: raw parseInt on invalid input is NaN (matches feed-builder.ts:51 behavior)')
+    check(servingValue === 72, 'invalid legacy input falls back to the bounded compatibility default')
     check(
-      Number.isNaN(manifest.engagement.time_hours) === Number.isNaN(servingValue),
-      'resolver parity: manifest matches serving on INVALID input (both NaN) — NOT the normalized 72 from monitor.ts',
+      manifest.engagement.time_hours === servingValue,
+      'resolver parity: manifest matches strict serving fallback on invalid input',
     )
   })
 

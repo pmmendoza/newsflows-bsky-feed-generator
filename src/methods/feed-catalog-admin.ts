@@ -40,6 +40,11 @@ import {
   logUnauthorized,
 } from '../util/api-auth'
 import { isSubscribableFeed } from '../util/subscribable-feed'
+import {
+  isPublisherPostMaxAgeDays,
+  PUBLISHER_POST_MAX_AGE_DAYS_MAX,
+  resolvePublisherServingWindow,
+} from '../algos/publisher-serving-window'
 
 const adminWriteAuth: ApiKeyAuthConfig = {
   primaryEnv: ['FEEDGEN_ADMIN_API_KEY'],
@@ -69,6 +74,16 @@ const UPDATE_FIELDS = [
   'algo_policy_id',
   'ranker_policy_id',
   'ranker_score_source',
+  'ranker_score_max_age_hours',
+  'ranker_score_max_age_source',
+  'ranker_min_score_backed_share',
+  'ranker_min_score_backed_source',
+  'publisher_post_max_age_days',
+  'publisher_post_max_age_source',
+  'publisher_time_clock',
+  'publisher_time_transition_expires_at',
+  'content_time_cutover_min_valid_share',
+  'content_time_contract_version',
   'enabled',
   'access_policy_id',
   'study_id',
@@ -88,6 +103,16 @@ type CatalogInsertBody = {
   study_id?: string | null
   publisher_did?: string | null
   ranker_policy_id?: string | null
+  ranker_score_max_age_hours?: number | null
+  ranker_score_max_age_source?: 'study_default' | 'feed_override' | null
+  ranker_min_score_backed_share?: number | null
+  ranker_min_score_backed_source?: 'study_default' | 'feed_override' | null
+  publisher_post_max_age_days?: number | null
+  publisher_post_max_age_source?: 'study_default' | 'feed_override' | null
+  publisher_time_clock?: 'receipt_time' | 'content_time_v1'
+  publisher_time_transition_expires_at?: string | null
+  content_time_cutover_min_valid_share?: number | null
+  content_time_contract_version?: string | null
   enabled?: boolean
 }
 
@@ -99,17 +124,31 @@ type CatalogUpdateBody = {
   algo_policy_id?: string
   ranker_policy_id?: string | null
   ranker_score_source?: string | null
+  ranker_score_max_age_hours?: number | null
+  ranker_score_max_age_source?: 'study_default' | 'feed_override' | null
+  ranker_min_score_backed_share?: number | null
+  ranker_min_score_backed_source?: 'study_default' | 'feed_override' | null
   enabled?: boolean
   access_policy_id?: string
   study_id?: string | null
   retired_at?: string | null
-  if_current?: Partial<Record<UpdateField, boolean | string | null>>
+  publisher_post_max_age_days?: number | null
+  publisher_post_max_age_source?: 'study_default' | 'feed_override' | null
+  publisher_time_clock?: 'receipt_time' | 'content_time_v1'
+  publisher_time_transition_expires_at?: string | null
+  content_time_cutover_min_valid_share?: number | null
+  content_time_contract_version?: string | null
+  if_current?: Partial<Record<UpdateField, boolean | number | string | null>>
 }
 
 type CatalogBody = CatalogInsertBody | CatalogUpdateBody
 
 type CatalogDryRunBody = Omit<CatalogUpdateBody, 'op'> & {
   op?: 'update'
+}
+
+type CatalogBulkBody = {
+  updates: CatalogUpdateBody[]
 }
 
 type CatalogUpdatePatch = Partial<Pick<
@@ -119,6 +158,16 @@ type CatalogUpdatePatch = Partial<Pick<
   | 'algo_policy_id'
   | 'ranker_policy_id'
   | 'ranker_score_source'
+  | 'ranker_score_max_age_hours'
+  | 'ranker_score_max_age_source'
+  | 'ranker_min_score_backed_share'
+  | 'ranker_min_score_backed_source'
+  | 'publisher_post_max_age_days'
+  | 'publisher_post_max_age_source'
+  | 'publisher_time_clock'
+  | 'publisher_time_transition_expires_at'
+  | 'content_time_cutover_min_valid_share'
+  | 'content_time_contract_version'
   | 'enabled'
   | 'access_policy_id'
   | 'study_id'
@@ -129,7 +178,7 @@ type ValidatedCatalogUpdate = {
   op: 'update'
   rkey: string
   patch: CatalogUpdatePatch
-  ifCurrent?: Partial<Record<UpdateField, boolean | string | null>>
+  ifCurrent?: Partial<Record<UpdateField, boolean | number | string | null>>
 }
 
 type FeedCatalogDryRunMessage = {
@@ -205,7 +254,7 @@ function fieldValue(row: Pick<FeedCatalog, UpdateField>, field: UpdateField) {
 function currentFieldValues(row: Pick<FeedCatalog, UpdateField>) {
   return Object.fromEntries(
     UPDATE_FIELDS.map((field) => [field, fieldValue(row, field)]),
-  ) as Record<UpdateField, boolean | string | null>
+  ) as Record<UpdateField, boolean | number | string | null>
 }
 
 function proposedFieldValues(row: Pick<FeedCatalog, UpdateField>, patch: CatalogUpdatePatch) {
@@ -214,8 +263,8 @@ function proposedFieldValues(row: Pick<FeedCatalog, UpdateField>, patch: Catalog
 }
 
 function feedCatalogChanges(
-  current: Record<UpdateField, boolean | string | null>,
-  proposed: Record<UpdateField, boolean | string | null>,
+  current: Record<UpdateField, boolean | number | string | null>,
+  proposed: Record<UpdateField, boolean | number | string | null>,
   fields: readonly UpdateField[],
 ) {
   return fields
@@ -229,12 +278,12 @@ function feedCatalogChanges(
 
 function validateCurrentValues(
   value: unknown,
-): { ok: true; current?: Partial<Record<UpdateField, boolean | string | null>> } | { ok: false; error: string } {
+): { ok: true; current?: Partial<Record<UpdateField, boolean | number | string | null>> } | { ok: false; error: string } {
   if (value === undefined) return { ok: true }
   if (!value || typeof value !== 'object' || Array.isArray(value)) {
     return { ok: false, error: 'if_current must be an object when provided' }
   }
-  const current: Partial<Record<UpdateField, boolean | string | null>> = {}
+  const current: Partial<Record<UpdateField, boolean | number | string | null>> = {}
   for (const [field, fieldValue] of Object.entries(value)) {
     if (!isUpdateField(field)) {
       return { ok: false, error: `if_current contains unsupported field: ${field}` }
@@ -260,6 +309,15 @@ function validateCurrentValues(
     if (field === 'ranker_score_source' && !nullableString(fieldValue)) {
       return { ok: false, error: 'if_current.ranker_score_source must be string or null' }
     }
+    if (field === 'ranker_score_max_age_hours' && fieldValue !== null && (!Number.isInteger(fieldValue) || Number(fieldValue) < 1 || Number(fieldValue) > 8760)) {
+      return { ok: false, error: 'if_current.ranker_score_max_age_hours must be an integer from 1 to 8760, or null' }
+    }
+    if (field === 'ranker_min_score_backed_share' && fieldValue !== null && (typeof fieldValue !== 'number' || !Number.isFinite(fieldValue) || fieldValue <= 0 || fieldValue > 1)) {
+      return { ok: false, error: 'if_current.ranker_min_score_backed_share must be > 0 and <= 1, or null' }
+    }
+    if ((field === 'ranker_score_max_age_source' || field === 'ranker_min_score_backed_source') && fieldValue !== null && fieldValue !== 'study_default' && fieldValue !== 'feed_override') {
+      return { ok: false, error: `if_current.${field} must be study_default, feed_override, or null` }
+    }
     if (
       field === 'access_policy_id' &&
       (typeof fieldValue !== 'string' || !ALLOWED_ACCESS_POLICIES.has(fieldValue))
@@ -269,9 +327,70 @@ function validateCurrentValues(
     if ((field === 'study_id' || field === 'retired_at') && !nullableString(fieldValue)) {
       return { ok: false, error: `if_current.${field} must be string or null` }
     }
-    current[field] = fieldValue as boolean | string | null
+    if ((field === 'publisher_time_transition_expires_at' || field === 'content_time_contract_version') && !nullableString(fieldValue)) {
+      return { ok: false, error: `if_current.${field} must be string or null` }
+    }
+    if (field === 'content_time_cutover_min_valid_share' && fieldValue !== null && (typeof fieldValue !== 'number' || !Number.isFinite(fieldValue) || fieldValue <= 0 || fieldValue > 1)) {
+      return { ok: false, error: 'if_current.content_time_cutover_min_valid_share must be > 0 and <= 1, or null' }
+    }
+    if (field === 'publisher_post_max_age_days' && fieldValue !== null && !isPublisherPostMaxAgeDays(fieldValue)) {
+      return { ok: false, error: `if_current.publisher_post_max_age_days must be an integer from 1 to ${PUBLISHER_POST_MAX_AGE_DAYS_MAX}, or null` }
+    }
+    if (field === 'publisher_post_max_age_source' && fieldValue !== null && fieldValue !== 'study_default' && fieldValue !== 'feed_override') {
+      return { ok: false, error: 'if_current.publisher_post_max_age_source must be study_default, feed_override, or null' }
+    }
+    if (field === 'publisher_time_clock' && fieldValue !== 'receipt_time' && fieldValue !== 'content_time_v1') {
+      return { ok: false, error: 'if_current.publisher_time_clock must be receipt_time or content_time_v1' }
+    }
+    current[field] = fieldValue as boolean | number | string | null
   }
   return { ok: true, current }
+}
+
+function publisherAgeErrors(row: Pick<FeedCatalog, 'enabled' | 'publisher_post_max_age_days' | 'publisher_post_max_age_source' | 'publisher_time_clock' | 'publisher_time_transition_expires_at' | 'content_time_cutover_min_valid_share' | 'content_time_contract_version'>): string[] {
+  const errors: string[] = []
+  const days = row.publisher_post_max_age_days
+  const source = row.publisher_post_max_age_source
+  if (days != null && !isPublisherPostMaxAgeDays(days)) {
+    errors.push(`publisher_post_max_age_days must be an integer from 1 to ${PUBLISHER_POST_MAX_AGE_DAYS_MAX}`)
+  }
+  if (source != null && source !== 'study_default' && source !== 'feed_override') {
+    errors.push('publisher_post_max_age_source must be study_default or feed_override')
+  }
+  if ((days == null) !== (source == null)) {
+    errors.push('publisher_post_max_age_days and publisher_post_max_age_source must be set together')
+  }
+  if (row.enabled && (days == null || source == null)) {
+    errors.push('enabled feeds require a materialized publisher_post_max_age_days and provenance')
+  }
+  if (row.publisher_time_clock !== undefined && row.publisher_time_clock !== 'receipt_time' && row.publisher_time_clock !== 'content_time_v1') {
+    errors.push('publisher_time_clock must be receipt_time or content_time_v1')
+  }
+  if (row.content_time_cutover_min_valid_share != null && (!Number.isFinite(row.content_time_cutover_min_valid_share) || row.content_time_cutover_min_valid_share <= 0 || row.content_time_cutover_min_valid_share > 1)) {
+    errors.push('content_time_cutover_min_valid_share must be > 0 and <= 1')
+  }
+  if (row.publisher_time_transition_expires_at != null && !Number.isFinite(Date.parse(row.publisher_time_transition_expires_at))) {
+    errors.push('publisher_time_transition_expires_at must be a valid ISO timestamp')
+  }
+  if (row.publisher_time_clock === 'content_time_v1') {
+    if (row.content_time_cutover_min_valid_share == null) errors.push('content_time_v1 requires content_time_cutover_min_valid_share')
+    if (!row.content_time_contract_version) errors.push('content_time_v1 requires content_time_contract_version')
+    if (!row.publisher_time_transition_expires_at) errors.push('content_time_v1 requires publisher_time_transition_expires_at')
+  }
+  return errors
+}
+
+function rankerControlErrors(row: Pick<FeedCatalog, 'algo_policy_id' | 'ranker_score_max_age_hours' | 'ranker_score_max_age_source' | 'ranker_min_score_backed_share' | 'ranker_min_score_backed_source'>): string[] {
+  const values = [row.ranker_score_max_age_hours, row.ranker_score_max_age_source, row.ranker_min_score_backed_share, row.ranker_min_score_backed_source]
+  if (row.algo_policy_id !== 'ranker-priority') {
+    return values.some((value) => value != null) ? ['ranker serving controls must be null for non-ranker feeds'] : []
+  }
+  const errors: string[] = []
+  if (!Number.isInteger(row.ranker_score_max_age_hours) || Number(row.ranker_score_max_age_hours) < 1 || Number(row.ranker_score_max_age_hours) > 8760) errors.push('ranker-priority feeds require ranker_score_max_age_hours from 1 to 8760')
+  if (typeof row.ranker_min_score_backed_share !== 'number' || !Number.isFinite(row.ranker_min_score_backed_share) || row.ranker_min_score_backed_share <= 0 || row.ranker_min_score_backed_share > 1) errors.push('ranker-priority feeds require ranker_min_score_backed_share > 0 and <= 1')
+  if (row.ranker_score_max_age_source !== 'study_default' && row.ranker_score_max_age_source !== 'feed_override') errors.push('ranker_score_max_age_source must declare provenance')
+  if (row.ranker_min_score_backed_source !== 'study_default' && row.ranker_min_score_backed_source !== 'feed_override') errors.push('ranker_min_score_backed_source must declare provenance')
+  return errors
 }
 
 function validatePolicyPair(
@@ -308,6 +427,11 @@ export function operatorStatus(row: Pick<FeedCatalog, 'enabled' | 'access_policy
 }
 
 export function feedCatalogItemPayload(row: FeedCatalog) {
+  const servingWindow = resolvePublisherServingWindow(
+    row.rkey,
+    row.publisher_post_max_age_days,
+    row.publisher_post_max_age_source,
+  )
   return {
     feed_id: row.feed_id,
     rkey: row.rkey,
@@ -318,6 +442,29 @@ export function feedCatalogItemPayload(row: FeedCatalog) {
     algo_policy_id: row.algo_policy_id,
     ranker_policy_id: row.ranker_policy_id ?? null,
     ranker_score_source: row.ranker_score_source ?? null,
+    ranker_score_max_age_hours: row.ranker_score_max_age_hours ?? null,
+    ranker_score_max_age_source: row.ranker_score_max_age_source ?? null,
+    ranker_min_score_backed_share: row.ranker_min_score_backed_share ?? null,
+    ranker_min_score_backed_source: row.ranker_min_score_backed_source ?? null,
+    ranker_score_freshness: {
+      effective_hours: row.ranker_score_max_age_hours ?? 24,
+      effective_source: row.ranker_score_max_age_hours == null ? 'compatibility_default_24h' : row.ranker_score_max_age_source,
+      compatibility_fallback_active: row.algo_policy_id === 'ranker-priority' && row.ranker_score_max_age_hours == null,
+    },
+    publisher_post_max_age_days: row.publisher_post_max_age_days ?? null,
+    publisher_post_max_age_source: row.publisher_post_max_age_source ?? null,
+    publisher_time_clock: row.publisher_time_clock ?? 'receipt_time',
+    publisher_time_transition_expires_at: row.publisher_time_transition_expires_at ?? null,
+    content_time_cutover_min_valid_share: row.content_time_cutover_min_valid_share ?? null,
+    content_time_contract_version: row.content_time_contract_version ?? null,
+    catalog_revision: Number(row.catalog_revision ?? 0),
+    publisher_serving_window: {
+      effective_hours: servingWindow.effectiveHours,
+      effective_days: servingWindow.effectiveDays,
+      effective_source: servingWindow.source,
+      compatibility_fallback_active: servingWindow.compatibilityFallbackActive,
+      compatibility_env_key: servingWindow.compatibilityEnvKey,
+    },
     access_policy_id: row.access_policy_id,
     enabled: row.enabled,
     created_at: row.created_at ?? null,
@@ -378,6 +525,25 @@ export function validateInsert(body: any): { ok: true; row: CatalogInsertBody } 
   if (body.access_policy_id === 'study-only' && !isString(body?.study_id)) {
     return { ok: false, error: 'study_id required when access_policy_id=study-only' }
   }
+  const enabled = typeof body.enabled === 'boolean' ? body.enabled : true
+  const ageErrors = publisherAgeErrors({
+    enabled,
+    publisher_post_max_age_days: body.publisher_post_max_age_days,
+    publisher_post_max_age_source: body.publisher_post_max_age_source,
+    publisher_time_clock: body.publisher_time_clock ?? 'receipt_time',
+    publisher_time_transition_expires_at: body.publisher_time_transition_expires_at ?? null,
+    content_time_cutover_min_valid_share: body.content_time_cutover_min_valid_share ?? null,
+    content_time_contract_version: body.content_time_contract_version ?? null,
+  })
+  if (ageErrors.length > 0) return { ok: false, error: ageErrors.join('; ') }
+  const rankerErrors = rankerControlErrors({
+    algo_policy_id: body.algo_policy_id,
+    ranker_score_max_age_hours: body.ranker_score_max_age_hours ?? null,
+    ranker_score_max_age_source: body.ranker_score_max_age_source ?? null,
+    ranker_min_score_backed_share: body.ranker_min_score_backed_share ?? null,
+    ranker_min_score_backed_source: body.ranker_min_score_backed_source ?? null,
+  })
+  if (rankerErrors.length > 0) return { ok: false, error: rankerErrors.join('; ') }
   return {
     ok: true,
     row: {
@@ -391,7 +557,14 @@ export function validateInsert(body: any): { ok: true; row: CatalogInsertBody } 
       study_id: body.study_id ?? null,
       publisher_did: body.publisher_did ?? null,
       ranker_policy_id: body.ranker_policy_id ?? null,
-      enabled: typeof body.enabled === 'boolean' ? body.enabled : true,
+      ranker_score_max_age_hours: body.ranker_score_max_age_hours ?? null,
+      ranker_score_max_age_source: body.ranker_score_max_age_source ?? null,
+      ranker_min_score_backed_share: body.ranker_min_score_backed_share ?? null,
+      ranker_min_score_backed_source: body.ranker_min_score_backed_source ?? null,
+      publisher_post_max_age_days: body.publisher_post_max_age_days ?? null,
+      publisher_post_max_age_source: body.publisher_post_max_age_source ?? null,
+      publisher_time_clock: body.publisher_time_clock ?? 'receipt_time',
+      enabled,
     },
   }
 }
@@ -416,6 +589,17 @@ export function validateUpdate(body: any): { ok: true; row: ValidatedCatalogUpda
   if (body.ranker_score_source !== undefined && !nullableString(body.ranker_score_source)) {
     return { ok: false, error: 'ranker_score_source must be string or null' }
   }
+  if (body.ranker_score_max_age_hours !== undefined && body.ranker_score_max_age_hours !== null && (!Number.isInteger(body.ranker_score_max_age_hours) || body.ranker_score_max_age_hours < 1 || body.ranker_score_max_age_hours > 8760)) {
+    return { ok: false, error: 'ranker_score_max_age_hours must be an integer from 1 to 8760, or null' }
+  }
+  if (body.ranker_min_score_backed_share !== undefined && body.ranker_min_score_backed_share !== null && (typeof body.ranker_min_score_backed_share !== 'number' || !Number.isFinite(body.ranker_min_score_backed_share) || body.ranker_min_score_backed_share <= 0 || body.ranker_min_score_backed_share > 1)) {
+    return { ok: false, error: 'ranker_min_score_backed_share must be > 0 and <= 1, or null' }
+  }
+  for (const field of ['ranker_score_max_age_source', 'ranker_min_score_backed_source'] as const) {
+    if (body[field] !== undefined && body[field] !== null && body[field] !== 'study_default' && body[field] !== 'feed_override') {
+      return { ok: false, error: `${field} must be study_default, feed_override, or null` }
+    }
+  }
   const policy = validatePolicyPair(body.algo_policy_id, body.ranker_policy_id)
   if (!policy.ok) return policy
   if (body.enabled !== undefined && typeof body.enabled !== 'boolean') {
@@ -433,19 +617,47 @@ export function validateUpdate(body: any): { ok: true; row: ValidatedCatalogUpda
   if (body.retired_at !== undefined && !nullableString(body.retired_at)) {
     return { ok: false, error: 'retired_at must be string or null' }
   }
+  if (body.publisher_post_max_age_days !== undefined && body.publisher_post_max_age_days !== null && !isPublisherPostMaxAgeDays(body.publisher_post_max_age_days)) {
+    return { ok: false, error: `publisher_post_max_age_days must be an integer from 1 to ${PUBLISHER_POST_MAX_AGE_DAYS_MAX}, or null` }
+  }
+  if (body.publisher_post_max_age_source !== undefined && body.publisher_post_max_age_source !== null && body.publisher_post_max_age_source !== 'study_default' && body.publisher_post_max_age_source !== 'feed_override') {
+    return { ok: false, error: 'publisher_post_max_age_source must be study_default, feed_override, or null' }
+  }
+  if (body.publisher_time_clock !== undefined && body.publisher_time_clock !== 'receipt_time' && body.publisher_time_clock !== 'content_time_v1') {
+    return { ok: false, error: 'publisher_time_clock must be receipt_time or content_time_v1' }
+  }
+  if (body.publisher_time_transition_expires_at !== undefined && !nullableString(body.publisher_time_transition_expires_at)) {
+    return { ok: false, error: 'publisher_time_transition_expires_at must be string or null' }
+  }
+  if (body.content_time_cutover_min_valid_share !== undefined && body.content_time_cutover_min_valid_share !== null && (typeof body.content_time_cutover_min_valid_share !== 'number' || !Number.isFinite(body.content_time_cutover_min_valid_share) || body.content_time_cutover_min_valid_share <= 0 || body.content_time_cutover_min_valid_share > 1)) {
+    return { ok: false, error: 'content_time_cutover_min_valid_share must be > 0 and <= 1, or null' }
+  }
+  if (body.content_time_contract_version !== undefined && !nullableString(body.content_time_contract_version)) {
+    return { ok: false, error: 'content_time_contract_version must be string or null' }
+  }
   const updates = {
     display_name: body.display_name,
     publisher_did: body.publisher_did,
     algo_policy_id: body.algo_policy_id,
     ranker_policy_id: body.ranker_policy_id,
     ranker_score_source: body.ranker_score_source,
+    ranker_score_max_age_hours: body.ranker_score_max_age_hours,
+    ranker_score_max_age_source: body.ranker_score_max_age_source,
+    ranker_min_score_backed_share: body.ranker_min_score_backed_share,
+    ranker_min_score_backed_source: body.ranker_min_score_backed_source,
     enabled: body.enabled,
     access_policy_id: body.access_policy_id,
     study_id: body.study_id,
     retired_at: body.retired_at,
+    publisher_post_max_age_days: body.publisher_post_max_age_days,
+    publisher_post_max_age_source: body.publisher_post_max_age_source,
+    publisher_time_clock: body.publisher_time_clock,
+    publisher_time_transition_expires_at: body.publisher_time_transition_expires_at,
+    content_time_cutover_min_valid_share: body.content_time_cutover_min_valid_share,
+    content_time_contract_version: body.content_time_contract_version,
   }
   if (Object.values(updates).every((v) => v === undefined)) {
-    return { ok: false, error: 'at least one of enabled/access_policy_id/study_id/retired_at required' }
+    return { ok: false, error: 'at least one supported field is required' }
   }
   const current = validateCurrentValues(body.if_current)
   if (!current.ok) return current
@@ -499,6 +711,12 @@ export function buildFeedCatalogDryRun(
       message: `study_id does not exist in study_catalog: ${proposed.study_id}`,
     })
   }
+  for (const message of publisherAgeErrors(proposed)) {
+    blockers.push({ code: 'invalid-publisher-age', message })
+  }
+  for (const message of rankerControlErrors(proposed)) {
+    blockers.push({ code: 'invalid-ranker-controls', message })
+  }
   if (proposed.access_policy_id === 'disabled' && proposed.enabled === true) {
     warnings.push({
       code: 'access-disabled-feed-enabled',
@@ -538,7 +756,7 @@ export function buildFeedCatalogDryRun(
 
 export function currentValueMismatches(
   current: FeedCatalog,
-  expected: Partial<Record<UpdateField, boolean | string | null>> | undefined,
+  expected: Partial<Record<UpdateField, boolean | number | string | null>> | undefined,
 ) {
   if (!expected) return []
   const actual = currentFieldValues(current)
@@ -631,6 +849,17 @@ async function readCatalogRows(ctx: AppContext): Promise<FeedCatalog[]> {
       'algo_policy_id',
       'ranker_policy_id',
       'ranker_score_source',
+      'ranker_score_max_age_hours',
+      'ranker_score_max_age_source',
+      'ranker_min_score_backed_share',
+      'ranker_min_score_backed_source',
+      'publisher_post_max_age_days',
+      'publisher_post_max_age_source',
+      'publisher_time_clock',
+      'publisher_time_transition_expires_at',
+      'content_time_cutover_min_valid_share',
+      'content_time_contract_version',
+      'catalog_revision',
       'access_policy_id',
       'enabled',
       'created_at',
@@ -657,6 +886,17 @@ export async function readCatalogRowFromDb(
       'algo_policy_id',
       'ranker_policy_id',
       'ranker_score_source',
+      'ranker_score_max_age_hours',
+      'ranker_score_max_age_source',
+      'ranker_min_score_backed_share',
+      'ranker_min_score_backed_source',
+      'publisher_post_max_age_days',
+      'publisher_post_max_age_source',
+      'publisher_time_clock',
+      'publisher_time_transition_expires_at',
+      'content_time_cutover_min_valid_share',
+      'content_time_contract_version',
+      'catalog_revision',
       'access_policy_id',
       'enabled',
       'created_at',
@@ -736,6 +976,60 @@ async function studyExistsFromDb(db: any, studyId: string | null | undefined): P
 
 async function studyExists(ctx: AppContext, studyId: string | null | undefined): Promise<boolean | undefined> {
   return studyExistsFromDb(ctx.db, studyId)
+}
+
+async function applyCatalogUpdate(
+  trx: Transaction<DatabaseSchema>,
+  update: ValidatedCatalogUpdate,
+  identity: FeedCatalogHistoryIdentity,
+) {
+  const current = await readCatalogRowFromDb(trx, update.rkey, true)
+  if (!current) return { httpStatus: 404, payload: feedCatalogNotFoundPayload(update.rkey), applied: false }
+  const proposedStudyId = update.patch.study_id !== undefined
+    ? update.patch.study_id
+    : current.study_id
+  const dryRun = buildFeedCatalogDryRun(current, update, {
+    studyExists: await studyExistsFromDb(trx, proposedStudyId),
+  })
+  if (dryRun.blockers.length > 0) return {
+    httpStatus: 409,
+    payload: buildFeedCatalogApplyBlocked(dryRun, {
+      code: 'dry-run-blocked',
+      message: 'apply refused because feedgen dry-run has blockers',
+    }),
+    applied: false,
+  }
+  const mismatches = currentValueMismatches(current, update.ifCurrent)
+  if (mismatches.length > 0) return {
+    httpStatus: 409,
+    payload: buildFeedCatalogApplyConflict(dryRun, mismatches),
+    applied: false,
+  }
+  if (dryRun.change_count === 0) return {
+    httpStatus: 200,
+    payload: buildFeedCatalogApplyResult(current, current, dryRun, false),
+    applied: false,
+  }
+  const result = await trx
+    .updateTable('feedgen_ops.feed_catalog')
+    .set({ ...update.patch, catalog_revision: Number(current.catalog_revision ?? 0) + 1 } as any)
+    .where('rkey', '=', update.rkey)
+    .executeTakeFirst()
+  if (Number(result.numUpdatedRows ?? 0) === 0) return {
+    httpStatus: 404,
+    payload: feedCatalogNotFoundPayload(update.rkey),
+    applied: false,
+  }
+  const after = await readCatalogRowFromDb(trx, update.rkey)
+  if (!after) return { httpStatus: 500, payload: { error: 'updated row could not be read back' }, applied: false }
+  await appendFeedCatalogHistory(trx, current, after, dryRun.changes, identity)
+  return { httpStatus: 200, payload: buildFeedCatalogApplyResult(current, after, dryRun, true), applied: true }
+}
+
+class BulkApplyAbort extends Error {
+  constructor(readonly httpStatus: number, readonly payload: unknown) {
+    super('bulk feed catalog apply aborted')
+  }
 }
 
 export default function registerFeedCatalogAdminEndpoint(
@@ -861,6 +1155,69 @@ export default function registerFeedCatalogAdminEndpoint(
     }
   })
 
+  server.xrpc.router.post('/api/admin/feed_catalog/bulk', async (req, res) => {
+    if (!isApiKeyAuthorized(req, adminWriteAuth)) {
+      logUnauthorized('/api/admin/feed_catalog/bulk')
+      return res.status(401).json({ error: 'Unauthorized: Invalid API key' })
+    }
+    const body = req.body as CatalogBulkBody | undefined
+    if (!body || !Array.isArray(body.updates) || body.updates.length < 1 || body.updates.length > 100) {
+      return res.status(400).json({ error: 'updates must contain 1 to 100 update rows' })
+    }
+    const validated: ValidatedCatalogUpdate[] = []
+    for (const item of body.updates) {
+      const result = validateUpdate(item)
+      if (!result.ok) return res.status(400).json({ error: result.error })
+      if (!result.row.ifCurrent || Object.keys(result.row.ifCurrent).length === 0) {
+        return res.status(400).json({
+          error: 'bulk updates require non-empty if_current CAS values for every row',
+        })
+      }
+      validated.push(result.row)
+    }
+    const rkeys = validated.map((item) => item.rkey)
+    if (new Set(rkeys).size !== rkeys.length) {
+      return res.status(400).json({ error: 'bulk updates must contain unique rkeys' })
+    }
+    const identity = historyIdentity(req.headers)
+    try {
+      const results = await ctx.db.transaction().execute(async (trx) => {
+        const rows: unknown[] = []
+        // Stable lock order prevents two overlapping bulk applies deadlocking.
+        for (const update of [...validated].sort((a, b) => a.rkey.localeCompare(b.rkey))) {
+          const result = await applyCatalogUpdate(trx, update, identity)
+          if (result.httpStatus !== 200) throw new BulkApplyAbort(result.httpStatus, result.payload)
+          rows.push(result.payload)
+        }
+        return rows
+      })
+      return res.json({
+        schema_version: 1,
+        operation: 'feed.bulk-update',
+        status: 'applied',
+        applied: true,
+        result_count: results.length,
+        results,
+        raw_values_in_output: false,
+      })
+    } catch (err) {
+      if (err instanceof BulkApplyAbort) {
+        return res.status(err.httpStatus).json({
+          schema_version: 1,
+          operation: 'feed.bulk-update',
+          status: 'aborted',
+          applied: false,
+          blocker: err.payload,
+          raw_values_in_output: false,
+        })
+      }
+      console.error(
+        `[${new Date().toISOString()}] - feed_catalog-admin: bulk error. ${err instanceof Error ? err.message : String(err)}`,
+      )
+      return res.status(500).json({ error: 'InternalServerError' })
+    }
+  })
+
   server.xrpc.router.post('/api/admin/feed_catalog', async (req, res) => {
     if (!isApiKeyAuthorized(req, adminWriteAuth)) {
       logUnauthorized('/api/admin/feed_catalog')
@@ -890,6 +1247,17 @@ export default function registerFeedCatalogAdminEndpoint(
               study_id: v.row.study_id,
               publisher_did: v.row.publisher_did,
               ranker_policy_id: v.row.ranker_policy_id,
+              ranker_score_max_age_hours: v.row.ranker_score_max_age_hours,
+              ranker_score_max_age_source: v.row.ranker_score_max_age_source,
+              ranker_min_score_backed_share: v.row.ranker_min_score_backed_share,
+              ranker_min_score_backed_source: v.row.ranker_min_score_backed_source,
+              publisher_post_max_age_days: v.row.publisher_post_max_age_days,
+              publisher_post_max_age_source: v.row.publisher_post_max_age_source,
+              publisher_time_clock: v.row.publisher_time_clock,
+              publisher_time_transition_expires_at: v.row.publisher_time_transition_expires_at,
+              content_time_cutover_min_valid_share: v.row.content_time_cutover_min_valid_share,
+              content_time_contract_version: v.row.content_time_contract_version,
+              catalog_revision: 1,
               enabled: v.row.enabled,
             } as any)
             .execute()
@@ -914,86 +1282,8 @@ export default function registerFeedCatalogAdminEndpoint(
       if (body.op === 'update') {
         const v = validateUpdate(body)
         if (!v.ok) return res.status(400).json({ error: v.error })
-        const apply = await ctx.db.transaction().execute(async (trx) => {
-          // Lock the row before the CAS check so concurrent updates serialize:
-          // the loser re-reads post-commit and its if_current check 409s.
-          const current = await readCatalogRowFromDb(trx, v.row.rkey, true)
-          if (!current) {
-            return {
-              httpStatus: 404,
-              payload: feedCatalogNotFoundPayload(v.row.rkey),
-              applied: false,
-            }
-          }
-          const proposedStudyId =
-            v.row.patch.study_id !== undefined
-              ? v.row.patch.study_id
-              : current.study_id
-          const dryRun = buildFeedCatalogDryRun(current, v.row, {
-            studyExists: await studyExistsFromDb(trx, proposedStudyId),
-          })
-          if (dryRun.blockers.length > 0) {
-            return {
-              httpStatus: 409,
-              payload: buildFeedCatalogApplyBlocked(
-                dryRun,
-                {
-                  code: 'dry-run-blocked',
-                  message: 'apply refused because feedgen dry-run has blockers',
-                },
-              ),
-              applied: false,
-            }
-          }
-          const mismatches = currentValueMismatches(current, v.row.ifCurrent)
-          if (mismatches.length > 0) {
-            return {
-              httpStatus: 409,
-              payload: buildFeedCatalogApplyConflict(dryRun, mismatches),
-              applied: false,
-            }
-          }
-          if (dryRun.change_count === 0) {
-            return {
-              httpStatus: 200,
-              payload: buildFeedCatalogApplyResult(current, current, dryRun, false),
-              applied: false,
-            }
-          }
-          const result = await trx
-            .updateTable('feedgen_ops.feed_catalog')
-            .set(v.row.patch as any)
-            .where('rkey', '=', v.row.rkey)
-            .executeTakeFirst()
-          const numUpdated = Number(result.numUpdatedRows ?? 0)
-          if (numUpdated === 0) {
-            return {
-              httpStatus: 404,
-              payload: feedCatalogNotFoundPayload(v.row.rkey),
-              applied: false,
-            }
-          }
-          const after = await readCatalogRowFromDb(trx, v.row.rkey)
-          if (!after) {
-            return {
-              httpStatus: 500,
-              payload: { error: 'updated row could not be read back' },
-              applied: false,
-            }
-          }
-          await appendFeedCatalogHistory(
-            trx,
-            current,
-            after,
-            dryRun.changes,
-            identity,
-          )
-          return {
-            httpStatus: 200,
-            payload: buildFeedCatalogApplyResult(current, after, dryRun, true),
-            applied: true,
-          }
-        })
+        const apply = await ctx.db.transaction().execute((trx) =>
+          applyCatalogUpdate(trx, v.row, identity))
         if (apply.applied) {
           console.log(
             `[${new Date().toISOString()}] - feed_catalog-admin: UPDATE rkey=${v.row.rkey} ${JSON.stringify(v.row.patch)}`,

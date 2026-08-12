@@ -8,6 +8,8 @@
 import { Kysely } from 'kysely'
 import { DatabaseSchema } from '../../db/schema'
 import { applyPoliticianFilterIfEnabled } from '../politician-filter'
+import { PublisherTimeClock } from '../../db/schema'
+import { applyPublisherRecencyOrder, applyPublisherTimeFilter } from '../publisher-time'
 
 export function publisherQueryChronological(
   db: Kysely<DatabaseSchema>,
@@ -17,6 +19,7 @@ export function publisherQueryChronological(
   limit: number,
   publisherDid: string,
   shortname = '',
+  publisherTimeClock: PublisherTimeClock = 'receipt_time',
 ) {
   const base = db
     .selectFrom('post')
@@ -25,10 +28,13 @@ export function publisherQueryChronological(
     // LAST, so pe.uri (NULL on fail-open rows) would clobber post.uri.
     .selectAll('post')
     .where('author', '=', publisherDid)
-    .where('post.indexedAt', '>=', timeLimit)
-  return applyPoliticianFilterIfEnabled(base, shortname)
-    .orderBy('indexedAt', 'desc')
-    .orderBy('cid', 'desc')
+  return applyPublisherRecencyOrder(
+    applyPoliticianFilterIfEnabled(
+      applyPublisherTimeFilter(base, publisherTimeClock, timeLimit),
+      shortname,
+    ),
+    publisherTimeClock,
+  )
     .offset(cursorOffset)
     .limit(limit)
 }
