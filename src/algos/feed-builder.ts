@@ -80,6 +80,18 @@ export interface FeedGeneratorOptions {
   rankerMinScoreBackedShare?: number | null
 }
 
+export function feedPageOffsets(limit: number, cursor?: string) {
+  const followsOffset = cursor ? parseInt(cursor, 10) : 0
+  const publisherLimit = Math.max(1, Math.floor(limit / 3))
+  const followsLimit = publisherLimit * 2
+  return {
+    publisherLimit,
+    followsLimit,
+    publisherOffset: Math.floor(followsOffset / 2),
+    followsOffset,
+  }
+}
+
 // Main function to build a feed
 export async function buildFeed({
   shortname,
@@ -104,8 +116,8 @@ export async function buildFeed({
   // which AppView's online-probe heuristic can interpret as "feed broken".
   // Clamp to >=1 publisher and >=2 follows so probes always return content.
   // For limit>=3 this is a no-op (the floor split is unchanged).
-  const publisherLimit = Math.max(1, Math.floor(params.limit / 3));
-  const followsLimit = Math.max(2, Math.floor(params.limit * 2 / 3));
+  const paging = feedPageOffsets(params.limit, params.cursor)
+  const { publisherLimit, followsLimit } = paging
   const limit = publisherLimit; // 1/3 from news + 2/3 other (legacy alias for cursor math)
   const requesterFollows = await getFollows(requesterDid, ctx.db)
   
@@ -122,17 +134,14 @@ export async function buildFeed({
   const publisherTimeLimit = cutoffFromHours(referenceTimeMs, servingWindow.effectiveHours)
 
   // Parse cursor if provided
-  let cursorOffset = 0;
-  if (params.cursor) {
-    cursorOffset = parseInt(params.cursor, 10);
-  }
+  const cursorOffset = paging.followsOffset
 
   // Build the queries using the provided builder functions
   const publisherPostsQuery = buildPublisherQuery(
     ctx.db,
     publisherTimeLimit,
     requesterFollows,
-    cursorOffset,
+    paging.publisherOffset,
     limit,
     referenceTimeIso,
   );

@@ -27,6 +27,7 @@
     "test:publisher-catalog-controls": "ts-node scripts/test_publisher_catalog_controls.ts",
     "test:publisher-window-activation": "ts-node scripts/test_publisher_window_activation.ts",
     "test:publisher-window-db": "ts-node scripts/test_publisher_window_db.ts",
+    "test:feed-pagination": "ts-node scripts/test_feed_pagination.ts",
     "test:content-time-contract": "ts-node scripts/test_content_time_contract.ts",
     "test:politician-filter-execute": "ts-node scripts/test_politician_filter_execute.ts",
     "test:subscriptions": "ts-node scripts/test_subscription_state_unit.ts && ts-node scripts/test_access_policy.ts && ts-node scripts/test_subscriptions.ts && ts-node scripts/test_subscription_state_integration.ts && ts-node scripts/test_semantic_be_feed_id_migration.ts && ts-node scripts/test_kind_seed_migration.ts && ts-node scripts/test_subscriber_webui_state.ts",
