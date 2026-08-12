@@ -138,6 +138,9 @@ async function connectAndListen(connectionString: string): Promise<void> {
       },
     }
   } catch (err) {
+    await client.end().catch(() => {
+      /* best effort */
+    })
     cleanup()
     console.warn(
       `[${new Date().toISOString()}] - catalog-listener: startup failed; falling back to TTL-only invalidation. error=${
