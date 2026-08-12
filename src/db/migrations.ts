@@ -946,3 +946,205 @@ migrations['010_config_activation'] = {
     `.execute(db)
   },
 }
+
+migrations['011_publisher_post_max_age'] = {
+  // Expand-only compatibility release. Existing rows remain nullable until the
+  // root desired-state projection materializes every effective per-feed value;
+  // serving uses the explicitly labelled compatibility fallback meanwhile.
+  async up(db: Kysely<unknown>) {
+    await sql`
+      ALTER TABLE feedgen_ops.feed_catalog
+        ADD COLUMN publisher_post_max_age_days integer,
+        ADD COLUMN publisher_post_max_age_source text,
+        ADD COLUMN ranker_score_max_age_hours integer,
+        ADD COLUMN ranker_score_max_age_source text,
+        ADD COLUMN ranker_min_score_backed_share double precision,
+        ADD COLUMN ranker_min_score_backed_source text,
+        ADD COLUMN publisher_time_clock text NOT NULL DEFAULT 'receipt_time',
+        ADD COLUMN publisher_time_transition_expires_at text,
+        ADD COLUMN content_time_cutover_min_valid_share double precision,
+        ADD COLUMN content_time_contract_version text,
+        ADD COLUMN catalog_revision bigint NOT NULL DEFAULT 0,
+        ADD CONSTRAINT feed_catalog_publisher_post_max_age_bounds
+          CHECK (publisher_post_max_age_days IS NULL OR publisher_post_max_age_days BETWEEN 1 AND 365),
+        ADD CONSTRAINT feed_catalog_publisher_post_max_age_pair
+          CHECK (
+            num_nonnulls(publisher_post_max_age_days, publisher_post_max_age_source) IN (0, 2)
+            AND (publisher_post_max_age_source IS NULL
+              OR publisher_post_max_age_source IN ('study_default', 'feed_override'))
+          ),
+        ADD CONSTRAINT feed_catalog_publisher_time_clock_values
+          CHECK (publisher_time_clock IN ('receipt_time', 'content_time_v1')),
+        ADD CONSTRAINT feed_catalog_ranker_controls
+          CHECK ((
+            (algo_policy_id = 'ranker-priority'
+              AND ranker_score_max_age_hours BETWEEN 1 AND 8760
+              AND ranker_min_score_backed_share > 0
+              AND ranker_min_score_backed_share <= 1
+              AND ranker_score_max_age_source IN ('study_default', 'feed_override')
+              AND ranker_min_score_backed_source IN ('study_default', 'feed_override'))
+            OR
+            (algo_policy_id <> 'ranker-priority'
+              AND num_nonnulls(ranker_score_max_age_hours, ranker_score_max_age_source,
+                ranker_min_score_backed_share, ranker_min_score_backed_source) = 0)
+          ) IS TRUE) NOT VALID,
+        ADD CONSTRAINT feed_catalog_content_time_valid_share_bounds
+          CHECK (content_time_cutover_min_valid_share IS NULL OR (content_time_cutover_min_valid_share > 0 AND content_time_cutover_min_valid_share <= 1)),
+        ADD CONSTRAINT feed_catalog_content_time_activation_requirements
+          CHECK (
+            publisher_time_clock = 'receipt_time'
+            OR (publisher_time_transition_expires_at IS NOT NULL
+                AND content_time_cutover_min_valid_share IS NOT NULL
+                AND content_time_contract_version IS NOT NULL)
+          )
+    `.execute(db)
+
+    await sql`
+      ALTER TABLE request_log
+        ADD COLUMN request_reference_time text,
+        ADD COLUMN publisher_post_max_age_days integer,
+        ADD COLUMN publisher_post_max_age_source text,
+        ADD COLUMN publisher_time_clock text,
+        ADD COLUMN publisher_serving_window_source text,
+        ADD COLUMN publisher_compatibility_fallback_active boolean,
+        ADD COLUMN feed_catalog_revision bigint
+        , ADD COLUMN ranker_score_max_age_hours integer
+        , ADD COLUMN ranker_score_compatibility_fallback_active boolean
+        , ADD COLUMN ranker_fresh_scored_publisher_slots integer
+        , ADD COLUMN ranker_publisher_slots integer
+        , ADD COLUMN ranker_min_score_backed_share double precision
+        , ADD COLUMN ranker_observed_score_backed_share double precision
+    `.execute(db)
+
+    for (const table of ['post', 'engagement']) {
+      await sql.raw(`
+        SET LOCAL lock_timeout = '5s';
+        SET LOCAL statement_timeout = '30s';
+        ALTER TABLE ${table}
+          ADD COLUMN created_at_source_raw bytea,
+          ADD COLUMN content_time_utc text,
+          ADD COLUMN content_time_status text,
+          ADD COLUMN content_time_clamp_reason text,
+          ADD COLUMN content_time_validator_version text;
+        ALTER TABLE ${table}
+          ADD CONSTRAINT ${table}_content_time_status_values
+            CHECK (content_time_status IN ('source_valid', 'source_invalid', 'legacy_unknown')) NOT VALID;
+        ALTER TABLE ${table}
+          ADD CONSTRAINT ${table}_content_time_reason_values
+            CHECK (content_time_clamp_reason IS NULL OR content_time_clamp_reason IN ('missing', 'unparseable', 'future_skew', 'past_bound')) NOT VALID;
+        ALTER TABLE ${table}
+          ADD CONSTRAINT ${table}_content_time_pair
+            CHECK (
+              (content_time_status = 'source_valid'
+                AND content_time_utc IS NOT NULL
+                AND content_time_clamp_reason IS NULL
+                AND created_at_source_raw IS NOT NULL
+                AND content_time_validator_version IS NOT NULL)
+              OR (content_time_status = 'source_invalid'
+                AND content_time_utc IS NULL
+                AND content_time_clamp_reason IS NOT NULL
+                AND created_at_source_raw IS NOT NULL
+                AND content_time_validator_version IS NOT NULL)
+              OR (content_time_status = 'legacy_unknown'
+                AND content_time_utc IS NULL
+                AND content_time_clamp_reason IS NULL
+                AND created_at_source_raw IS NULL
+                AND content_time_validator_version IS NULL)
+            ) NOT VALID;
+      `).execute(db)
+    }
+
+    await sql`
+      SET LOCAL lock_timeout = '5s';
+      SET LOCAL statement_timeout = '30s';
+      CREATE FUNCTION feedgen_ops.notify_feed_catalog_changed()
+      RETURNS trigger
+      LANGUAGE plpgsql
+      AS $$
+      BEGIN
+        PERFORM pg_notify(
+          'feed_catalog_changed',
+          json_build_object(
+            'rkey', COALESCE(NEW.rkey, OLD.rkey),
+            'op', lower(TG_OP)
+          )::text
+        );
+        RETURN COALESCE(NEW, OLD);
+      END
+      $$;
+      CREATE TRIGGER feed_catalog_notify_changed
+      AFTER INSERT OR UPDATE OR DELETE ON feedgen_ops.feed_catalog
+      FOR EACH ROW EXECUTE FUNCTION feedgen_ops.notify_feed_catalog_changed()
+    `.execute(db)
+  },
+  async down(db: Kysely<unknown>) {
+    await sql`
+      DROP TRIGGER feed_catalog_notify_changed ON feedgen_ops.feed_catalog;
+      DROP FUNCTION feedgen_ops.notify_feed_catalog_changed()
+    `.execute(db)
+    await sql`
+      ALTER TABLE request_log
+        DROP COLUMN ranker_observed_score_backed_share,
+        DROP COLUMN ranker_min_score_backed_share,
+        DROP COLUMN ranker_publisher_slots,
+        DROP COLUMN ranker_fresh_scored_publisher_slots,
+        DROP COLUMN ranker_score_compatibility_fallback_active,
+        DROP COLUMN ranker_score_max_age_hours,
+        DROP COLUMN feed_catalog_revision,
+        DROP COLUMN publisher_compatibility_fallback_active,
+        DROP COLUMN publisher_serving_window_source,
+        DROP COLUMN publisher_time_clock,
+        DROP COLUMN publisher_post_max_age_source,
+        DROP COLUMN publisher_post_max_age_days,
+        DROP COLUMN request_reference_time
+    `.execute(db)
+    for (const table of ['engagement', 'post']) {
+      await sql.raw(`
+        ALTER TABLE ${table}
+          DROP CONSTRAINT ${table}_content_time_pair,
+          DROP CONSTRAINT ${table}_content_time_reason_values,
+          DROP CONSTRAINT ${table}_content_time_status_values,
+          DROP COLUMN content_time_validator_version,
+          DROP COLUMN content_time_clamp_reason,
+          DROP COLUMN content_time_status,
+          DROP COLUMN content_time_utc,
+          DROP COLUMN created_at_source_raw
+      `).execute(db)
+    }
+    await sql`
+      ALTER TABLE feedgen_ops.feed_catalog
+        DROP CONSTRAINT feed_catalog_content_time_activation_requirements,
+        DROP CONSTRAINT feed_catalog_content_time_valid_share_bounds,
+        DROP CONSTRAINT feed_catalog_publisher_time_clock_values,
+        DROP CONSTRAINT feed_catalog_ranker_controls,
+        DROP CONSTRAINT feed_catalog_publisher_post_max_age_pair,
+        DROP CONSTRAINT feed_catalog_publisher_post_max_age_bounds,
+        DROP COLUMN catalog_revision,
+        DROP COLUMN content_time_contract_version,
+        DROP COLUMN content_time_cutover_min_valid_share,
+        DROP COLUMN publisher_time_transition_expires_at,
+        DROP COLUMN publisher_time_clock,
+        DROP COLUMN ranker_min_score_backed_source,
+        DROP COLUMN ranker_min_score_backed_share,
+        DROP COLUMN ranker_score_max_age_source,
+        DROP COLUMN ranker_score_max_age_hours,
+        DROP COLUMN publisher_post_max_age_source,
+        DROP COLUMN publisher_post_max_age_days
+    `.execute(db)
+  },
+}
+
+export async function validateContentTimeConstraints(db: Kysely<unknown>) {
+  // Validation scans existing rows without holding the stronger ADD-CONSTRAINT
+  // lock. Keep bounded timeouts so a busy production table fails safely and can
+  // be retried instead of blocking ingestion indefinitely.
+  for (const table of ['post', 'engagement']) {
+    await sql.raw(`
+        SET LOCAL lock_timeout = '5s';
+        SET LOCAL statement_timeout = '2min';
+        ALTER TABLE ${table} VALIDATE CONSTRAINT ${table}_content_time_status_values;
+        ALTER TABLE ${table} VALIDATE CONSTRAINT ${table}_content_time_reason_values;
+        ALTER TABLE ${table} VALIDATE CONSTRAINT ${table}_content_time_pair;
+    `).execute(db)
+  }
+}

@@ -9,6 +9,8 @@ import { Kysely } from 'kysely'
 import { DatabaseSchema } from '../../db/schema'
 import { applyPriorityOrderForFeed } from '../ranker-priority-helper'
 import { applyPoliticianFilterIfEnabled } from '../politician-filter'
+import { PublisherTimeClock } from '../../db/schema'
+import { applyPublisherTimeFilter } from '../publisher-time'
 
 export function publisherQueryRankerPriority(
   db: Kysely<DatabaseSchema>,
@@ -19,15 +21,23 @@ export function publisherQueryRankerPriority(
   publisherDid: string,
   shortname: string,
   feedId = shortname,
+  publisherTimeClock: PublisherTimeClock = 'receipt_time',
+  referenceTimeIso = new Date().toISOString(),
+  rankerScoreMaxAgeHours?: number,
 ) {
   const base = db
     .selectFrom('post')
     .selectAll('post')
     .where('author', '=', publisherDid)
-    .where('post.indexedAt', '>=', timeLimit)
   return applyPriorityOrderForFeed(
-    applyPoliticianFilterIfEnabled(base, shortname),
+    applyPoliticianFilterIfEnabled(
+      applyPublisherTimeFilter(base, publisherTimeClock, timeLimit),
+      shortname,
+    ),
     feedId,
+    publisherTimeClock,
+    referenceTimeIso,
+    rankerScoreMaxAgeHours,
   ).offset(cursorOffset).limit(limit)
 }
 
@@ -40,6 +50,8 @@ export function followsQueryRankerPriority(
   publisherDid: string,
   shortname: string,
   feedId = shortname,
+  referenceTimeIso = new Date().toISOString(),
+  rankerScoreMaxAgeHours?: number,
 ) {
   const base = db
     .selectFrom('post')
@@ -50,5 +62,8 @@ export function followsQueryRankerPriority(
   return applyPriorityOrderForFeed(
     applyPoliticianFilterIfEnabled(base, shortname),
     feedId,
+    'receipt_time',
+    referenceTimeIso,
+    rankerScoreMaxAgeHours,
   ).offset(cursorOffset).limit(limit)
 }

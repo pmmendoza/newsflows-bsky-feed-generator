@@ -27,6 +27,8 @@ import {
   applyPriorityOrderForFeed,
   rkeyToEnvSuffix,
   useRankerPriority,
+  recordRankerPriorityResult,
+  getRankerPriorityServingStatus,
 } from '../src/algos/ranker-priority-helper'
 import { refreshScoreSourceCache } from '../src/util/score-source-cache'
 
@@ -188,7 +190,8 @@ console.log('Score path — applyRankerPriorityOrder')
 console.log('Recency filter respects FEEDGEN_RANKER_PROD_FRESHNESS_HOURS env')
 {
   withEnv({ FEEDGEN_RANKER_PROD_FRESHNESS_HOURS: '6' }, () => {
-    const c = applyRankerPriorityOrder(basePostQuery(), 'newsflow-nl-2').compile()
+    const reference = '2026-08-12T12:00:00.000Z'
+    const c = applyRankerPriorityOrder(basePostQuery(), 'newsflow-nl-2', 'receipt_time', reference).compile()
     const isoParam = c.parameters.find(
       (p) =>
         typeof p === 'string' &&
@@ -198,13 +201,11 @@ console.log('Recency filter respects FEEDGEN_RANKER_PROD_FRESHNESS_HOURS env')
       assert(false, 'expected ISO cutoff parameter', JSON.stringify(c.parameters))
     } else {
       const cutoffMs = new Date(isoParam).getTime()
-      const sixHoursAgo = Date.now() - 6 * 60 * 60 * 1000
-      // Allow ±2 minutes of slack for clock + execution time.
-      const slackMs = 2 * 60 * 1000
+      const sixHoursAgo = Date.parse(reference) - 6 * 60 * 60 * 1000
       assert(
-        Math.abs(cutoffMs - sixHoursAgo) < slackMs,
-        '6h env honoured',
-        `cutoff=${isoParam} expected~${new Date(sixHoursAgo).toISOString()}`,
+        cutoffMs === sixHoursAgo,
+        '6h env honoured from captured request reference',
+        `cutoff=${isoParam} expected=${new Date(sixHoursAgo).toISOString()}`,
       )
     }
   })
@@ -237,6 +238,30 @@ console.log('Wrapper — applyPriorityOrderForFeed routes via env')
       )
     },
   )
+}
+
+console.log('Catalog score freshness overrides transitional env input')
+{
+  withEnv({ FEEDGEN_RANKER_PROD_FRESHNESS_HOURS: '6' }, () => {
+    const reference = '2026-08-12T12:00:00.000Z'
+    const c = applyRankerPriorityOrder(basePostQuery(), 'newsflow-nl-2', 'receipt_time', reference, 30).compile()
+    assert(
+      c.parameters.includes('2026-08-11T06:00:00.000Z'),
+      'materialized 30h value wins over 6h compatibility env',
+      JSON.stringify(c.parameters),
+    )
+  })
+}
+
+console.log('Score-backed publisher-slot floor evidence')
+{
+  recordRankerPriorityResult('newsflow-nl-2', [
+    { __ranker_profile_id: 'science-nl', __ranker_score: 0.9 },
+    { __ranker_profile_id: 'science-nl', __ranker_score: null },
+  ], 0.75)
+  const status = getRankerPriorityServingStatus().find((row) => row.feed_rkey === 'newsflow-nl-2')
+  assert(status?.fresh_scored_publisher_slots === 1 && status.publisher_slots === 2, 'health exposes raw-free numerator and denominator')
+  assert(status?.score_backed_share === 0.5 && status.floor_met === false, 'health evaluates owner-provided floor without dropping rows')
 }
 
 // D1.4 read-path cutover: join on fcp.profile_id resolved from the

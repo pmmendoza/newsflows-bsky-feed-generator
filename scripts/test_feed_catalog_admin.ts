@@ -55,6 +55,9 @@ const baseFeed: FeedCatalog = {
   study_id: 'newsflows-main',
   algo_policy_id: 'chronological',
   ranker_policy_id: null,
+  publisher_post_max_age_days: 3,
+  publisher_post_max_age_source: 'study_default',
+  publisher_time_clock: 'receipt_time',
   access_policy_id: 'study-only',
   enabled: true,
   created_at: '2026-05-01T00:00:00Z',
@@ -526,6 +529,11 @@ function fakeHistoryDb(
 
   function insertInto(table: string) {
     let values: any
+    const decodeJsonExpression = (value: any) => {
+      const node = value?.toOperationNode?.()
+      const serialized = node?.parameters?.[0]?.value
+      return typeof serialized === 'string' ? JSON.parse(serialized) : value
+    }
     const query: any = {
       values: (next: any) => {
         values = next
@@ -535,6 +543,9 @@ function fakeHistoryDb(
         if (table === 'feedgen_ops.feed_catalog_history') {
           history.push({
             ...values,
+            before_row: values.before_row == null ? null : decodeJsonExpression(values.before_row),
+            after_row: decodeJsonExpression(values.after_row),
+            changed_fields: decodeJsonExpression(values.changed_fields),
             changed_at: `2026-07-23T00:00:${String(values.revision).padStart(2, '0')}Z`,
           })
         } else if (table === 'feedgen_ops.feed_catalog') {
@@ -766,7 +777,26 @@ async function testHistoryReadEndpointAuthPaginationAndNewestFirst() {
   })
 }
 
+async function testBulkRequiresCasAndUniqueRows() {
+  const fake = fakeHistoryDb({ ...baseFeed, study_id: null, access_policy_id: 'subscriber-default' })
+  process.env.FEEDGEN_ADMIN_API_KEY = 'bulk-admin-key'
+  await withFeedCatalogServer(fake.db, async (server) => {
+    const missingCas = await requestJson(server, '/api/admin/feed_catalog/bulk', 'POST', { 'api-key': 'bulk-admin-key' }, {
+      updates: [{ op: 'update', rkey: baseFeed.rkey, enabled: false }],
+    })
+    assertEqual(missingCas.status, 400, 'bulk rows require CAS')
+    const duplicate = await requestJson(server, '/api/admin/feed_catalog/bulk', 'POST', { 'api-key': 'bulk-admin-key' }, {
+      updates: [
+        { op: 'update', rkey: baseFeed.rkey, enabled: false, if_current: { enabled: true } },
+        { op: 'update', rkey: baseFeed.rkey, enabled: false, if_current: { enabled: true } },
+      ],
+    })
+    assertEqual(duplicate.status, 400, 'bulk rows require unique rkeys')
+  })
+}
+
 const tests = [
+  testBulkRequiresCasAndUniqueRows,
   testAdminUpdateWritesOneHistoryRowPerRevision,
   testHistoryReadEndpointAuthPaginationAndNewestFirst,
   testUpdatePathLocksRowGetPathDoesNot,

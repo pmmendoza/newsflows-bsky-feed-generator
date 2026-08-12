@@ -31,7 +31,7 @@ import { Database } from '../db'
 import { buildFeed, FeedGenerator } from './feed-builder'
 import { Policy, pickPolicy } from './make-handler'
 
-const CACHE_TTL_MS = 5 * 60 * 1000
+export const DISPATCH_CACHE_TTL_MS = 5 * 60 * 1000
 
 // Sprint 15 — catalog enum + TS Policy type now share the same set of
 // values. Migration 021 renamed `feed_catalog.algo_policy_id` from
@@ -79,9 +79,10 @@ export function invalidateDispatchCache(rkey?: string): void {
 export async function resolveDynamicHandler(
   db: Database,
   rkey: string,
+  nowMs = Date.now(),
 ): Promise<FeedGenerator | null> {
   const cached = dispatchCache.get(rkey)
-  if (cached && cached.expires_at_ms > Date.now()) {
+  if (cached && cached.expires_at_ms > nowMs) {
     return cached.handler
   }
 
@@ -89,7 +90,20 @@ export async function resolveDynamicHandler(
   try {
     const row = await db
       .selectFrom('feedgen_ops.feed_catalog')
-      .select(['feed_id', 'publisher_did', 'algo_policy_id', 'enabled'])
+      .select([
+        'feed_id',
+        'publisher_did',
+        'algo_policy_id',
+        'enabled',
+        'publisher_post_max_age_days',
+        'publisher_post_max_age_source',
+        'publisher_time_clock',
+        'ranker_score_max_age_hours',
+        'ranker_score_max_age_source',
+        'ranker_min_score_backed_share',
+        'ranker_min_score_backed_source',
+        'catalog_revision',
+      ])
       .where('rkey', '=', rkey)
       .executeTakeFirst()
 
@@ -121,6 +135,8 @@ export async function resolveDynamicHandler(
         publisherDid,
         rkey,
         String(row.feed_id),
+        row.publisher_time_clock ?? 'receipt_time',
+        policy === 'ranker-priority' ? (row.ranker_score_max_age_hours ?? 24) : undefined,
       )
       handler = async (
         ctx: AppContext,
@@ -134,6 +150,13 @@ export async function resolveDynamicHandler(
           requesterDid,
           buildPublisherQuery: buildPublisher,
           buildFollowsQuery: buildFollows,
+          publisherPostMaxAgeDays: row.publisher_post_max_age_days,
+          publisherPostMaxAgeSource: row.publisher_post_max_age_source,
+          publisherTimeClock: row.publisher_time_clock ?? 'receipt_time',
+          feedCatalogRevision: row.catalog_revision ?? 0,
+          rankerScoreMaxAgeHours: policy === 'ranker-priority' ? (row.ranker_score_max_age_hours ?? 24) : null,
+          rankerScoreCompatibilityFallbackActive: policy === 'ranker-priority' && row.ranker_score_max_age_hours == null,
+          rankerMinScoreBackedShare: row.ranker_min_score_backed_share ?? null,
         })
       }
     }
@@ -147,6 +170,6 @@ export async function resolveDynamicHandler(
     return null
   }
 
-  dispatchCache.set(rkey, { handler, expires_at_ms: Date.now() + CACHE_TTL_MS })
+  dispatchCache.set(rkey, { handler, expires_at_ms: nowMs + DISPATCH_CACHE_TTL_MS })
   return handler
 }

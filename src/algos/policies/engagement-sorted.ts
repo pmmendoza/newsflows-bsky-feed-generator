@@ -10,8 +10,10 @@
 import { Kysely, sql } from 'kysely'
 import { DatabaseSchema } from '../../db/schema'
 import { applyPoliticianFilterIfEnabled } from '../politician-filter'
+import { PublisherTimeClock } from '../../db/schema'
+import { applyPublisherTimeFilter } from '../publisher-time'
 
-function engagementOrderExpr(timeLimit: string) {
+function engagementOrderExpr(timeLimit: string, referenceTimeIso: string, timeColumn: 'indexedAt' | 'content_time_utc') {
   return sql`
     -- Base engagement score (likes + reposts + comments + quotes)
     COALESCE(
@@ -23,12 +25,12 @@ function engagementOrderExpr(timeLimit: string) {
     )
     *
     -- Time decay factor (newer posts get higher multiplier)
-    (1 - POWER(
+    GREATEST(0, LEAST(1, 1 - POWER(
       -- Age since timeLimit / Total time window
-      (EXTRACT(EPOCH FROM NOW()) - EXTRACT(EPOCH FROM "indexedAt"::timestamp)) /
-      (EXTRACT(EPOCH FROM NOW()) - EXTRACT(EPOCH FROM ${timeLimit}::timestamp)),
+      (EXTRACT(EPOCH FROM ${referenceTimeIso}::timestamptz) - EXTRACT(EPOCH FROM ${sql.ref(`post.${timeColumn}`)}::timestamptz)) /
+      NULLIF(EXTRACT(EPOCH FROM ${referenceTimeIso}::timestamptz) - EXTRACT(EPOCH FROM ${timeLimit}::timestamptz), 0),
       2
-    ))
+    )))
   `
 }
 
@@ -40,6 +42,8 @@ export function publisherQueryEngagement(
   limit: number,
   publisherDid: string,
   shortname = '',
+  publisherTimeClock: PublisherTimeClock = 'receipt_time',
+  referenceTimeIso = new Date().toISOString(),
 ) {
   const base = db
     .selectFrom('post')
@@ -48,11 +52,16 @@ export function publisherQueryEngagement(
     // LAST, so pe.uri (NULL on fail-open rows) would clobber post.uri.
     .selectAll('post')
     .where('author', '=', publisherDid)
-    .where('post.indexedAt', '>=', timeLimit)
-  return applyPoliticianFilterIfEnabled(base, shortname)
-    .orderBy(engagementOrderExpr(timeLimit), 'desc')
-    .orderBy('indexedAt', 'desc')
-    .orderBy('cid', 'desc')
+  const filtered = applyPoliticianFilterIfEnabled(
+    applyPublisherTimeFilter(base, publisherTimeClock, timeLimit),
+    shortname,
+  )
+  const timeColumn = publisherTimeClock === 'content_time_v1' ? 'content_time_utc' : 'indexedAt'
+  return filtered
+    .orderBy(engagementOrderExpr(timeLimit, referenceTimeIso, timeColumn), 'desc')
+    .orderBy(`post.${timeColumn}` as any, 'desc')
+    .orderBy('post.indexedAt', 'desc')
+    .orderBy('post.uri', 'desc')
     .offset(cursorOffset)
     .limit(limit)
 }
@@ -65,6 +74,7 @@ export function followsQueryEngagement(
   limit: number,
   publisherDid: string,
   shortname = '',
+  referenceTimeIso = new Date().toISOString(),
 ) {
   const base = db
     .selectFrom('post')
@@ -73,7 +83,7 @@ export function followsQueryEngagement(
     .where('post.indexedAt', '>=', timeLimit)
     .where((eb) => eb('author', 'in', requesterFollows))
   return applyPoliticianFilterIfEnabled(base, shortname)
-    .orderBy(engagementOrderExpr(timeLimit), 'desc')
+    .orderBy(engagementOrderExpr(timeLimit, referenceTimeIso, 'indexedAt'), 'desc')
     .orderBy('indexedAt', 'desc')
     .orderBy('cid', 'desc')
     .offset(cursorOffset)

@@ -11,6 +11,7 @@ import {
   restrictPublisherEngagementToSubscribersEnabled,
 } from './util/ingestion-scope'
 import { dualWriteLinkFields } from './util/link-fields'
+import { validateContentTime } from './util/content-time'
 
 // for saving embedded preview cards
 function isExternalEmbed(embed: any): embed is { external: { uri: string, title: string, description: string } } {
@@ -48,24 +49,6 @@ function sanitizeForPostgres(text: string | null | undefined): string {
   if (text === null || text === undefined) return '';
   // Remove null bytes which cause PostgreSQL errors
   return text.replace(/\0/g, '');
-}
-
-// Clamp client-supplied createdAt to a sane range.
-// ATProto createdAt is set by the client device and can be bogus.
-// Falls back to indexedAt (server time) if out of range.
-function clampCreatedAt(raw: string | undefined | null, indexedAt: string): string {
-  if (!raw) return indexedAt
-  try {
-    const d = new Date(raw)
-    const i = new Date(indexedAt)
-    if (isNaN(d.getTime())) return indexedAt
-    // Reject if more than 1 day in the future or more than 2 years in the past
-    if (d.getTime() > i.getTime() + 86_400_000) return indexedAt
-    if (d.getTime() < i.getTime() - 2 * 365 * 86_400_000) return indexedAt
-    return raw
-  } catch {
-    return indexedAt
-  }
 }
 
 export class FirehoseSubscription extends FirehoseSubscriptionBase {
@@ -160,6 +143,7 @@ export class FirehoseSubscription extends FirehoseSubscriptionBase {
       .filter(shouldStorePost)
       .map((create) => {
         const postIndexedAt = new Date().toISOString()
+        const contentTime = validateContentTime(create.record.createdAt, postIndexedAt)
         const external = create.record.embed && isExternalEmbed(create.record.embed)
           ? create.record.embed.external
           : null
@@ -167,7 +151,12 @@ export class FirehoseSubscription extends FirehoseSubscriptionBase {
           uri: create.uri,
           cid: create.cid,
           indexedAt: postIndexedAt,
-          createdAt: clampCreatedAt(create.record.createdAt, postIndexedAt),
+          createdAt: contentTime.legacy_created_at,
+          created_at_source_raw: contentTime.created_at_source_raw,
+          content_time_utc: contentTime.content_time_utc,
+          content_time_status: contentTime.content_time_status,
+          content_time_clamp_reason: contentTime.content_time_clamp_reason,
+          content_time_validator_version: contentTime.content_time_validator_version,
           author: create.author,
           text: sanitizeForPostgres(create.record.text),
           rootUri: create.record.reply?.root?.uri || "",
@@ -192,6 +181,7 @@ export class FirehoseSubscription extends FirehoseSubscriptionBase {
       .filter(shouldStoreEngagement)
       .map((create) => {
         const engIndexedAt = new Date().toISOString()
+        const contentTime = validateContentTime(create.record.createdAt, engIndexedAt)
         return {
           uri: create.uri,
           cid: create.cid,
@@ -199,7 +189,12 @@ export class FirehoseSubscription extends FirehoseSubscriptionBase {
           subjectCid: create.record.subject.cid,
           type: 1,
           indexedAt: engIndexedAt,
-          createdAt: clampCreatedAt(create.record.createdAt, engIndexedAt),
+          createdAt: contentTime.legacy_created_at,
+          created_at_source_raw: contentTime.created_at_source_raw,
+          content_time_utc: contentTime.content_time_utc,
+          content_time_status: contentTime.content_time_status,
+          content_time_clamp_reason: contentTime.content_time_clamp_reason,
+          content_time_validator_version: contentTime.content_time_validator_version,
           author: create.author,
         }
       }).concat(
@@ -207,6 +202,7 @@ export class FirehoseSubscription extends FirehoseSubscriptionBase {
           .filter(shouldStoreEngagement)
           .map((create) => {
             const engIndexedAt = new Date().toISOString()
+            const contentTime = validateContentTime(create.record.createdAt, engIndexedAt)
             return {
               uri: create.uri,
               cid: create.cid,
@@ -214,7 +210,12 @@ export class FirehoseSubscription extends FirehoseSubscriptionBase {
               subjectCid: create.record.subject.cid,
               type: 2,
               indexedAt: engIndexedAt,
-              createdAt: clampCreatedAt(create.record.createdAt, engIndexedAt),
+              createdAt: contentTime.legacy_created_at,
+              created_at_source_raw: contentTime.created_at_source_raw,
+              content_time_utc: contentTime.content_time_utc,
+              content_time_status: contentTime.content_time_status,
+              content_time_clamp_reason: contentTime.content_time_clamp_reason,
+              content_time_validator_version: contentTime.content_time_validator_version,
               author: create.author,
             }
           })
@@ -225,6 +226,7 @@ export class FirehoseSubscription extends FirehoseSubscriptionBase {
             if (!quoted) return []
             if (!shouldStoreQuoteEngagement(create.author, quoted.uri)) return []
             const engIndexedAt = new Date().toISOString()
+            const contentTime = validateContentTime(create.record.createdAt, engIndexedAt)
             return [{
               uri: create.uri,
               cid: create.cid,
@@ -232,7 +234,12 @@ export class FirehoseSubscription extends FirehoseSubscriptionBase {
               subjectCid: quoted.cid,
               type: 3,
               indexedAt: engIndexedAt,
-              createdAt: clampCreatedAt(create.record.createdAt, engIndexedAt),
+              createdAt: contentTime.legacy_created_at,
+              created_at_source_raw: contentTime.created_at_source_raw,
+              content_time_utc: contentTime.content_time_utc,
+              content_time_status: contentTime.content_time_status,
+              content_time_clamp_reason: contentTime.content_time_clamp_reason,
+              content_time_validator_version: contentTime.content_time_validator_version,
               author: create.author,
             }]
           })

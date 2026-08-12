@@ -16,8 +16,9 @@
  */
 
 import { Kysely, SqlBool, sql } from 'kysely'
-import { DatabaseSchema } from '../db/schema'
+import { DatabaseSchema, PublisherTimeClock } from '../db/schema'
 import { getScoreSource } from '../util/score-source-cache'
+import { applyPublisherRecencyOrder } from './publisher-time'
 
 /**
  * Normalise a feed rkey to the env-name suffix.
@@ -56,11 +57,16 @@ export type RankerPriorityServingStatus = {
   profile_id: string
   serving_ordering: 'ranked' | 'unranked_recency'
   observed_at: string
+  fresh_scored_publisher_slots: number
+  publisher_slots: number
+  score_backed_share: number | null
+  minimum_score_backed_share: number | null
+  floor_met: boolean | null
 }
 
 const servingStatusByFeed = new Map<string, RankerPriorityServingStatus>()
 
-export function recordRankerPriorityResult(feedRkey: string, rows: any[]): void {
+export function recordRankerPriorityResult(feedRkey: string, rows: any[], minimumShare: number | null = null): void {
   const row = rows[0]
   if (
     !row ||
@@ -78,6 +84,13 @@ export function recordRankerPriorityResult(feedRkey: string, rows: any[]): void 
     profile_id: row.__ranker_profile_id,
     serving_ordering,
     observed_at: new Date().toISOString(),
+    fresh_scored_publisher_slots: rows.filter((candidate) => candidate.__ranker_score != null).length,
+    publisher_slots: rows.length,
+    score_backed_share: rows.length > 0 ? rows.filter((candidate) => candidate.__ranker_score != null).length / rows.length : null,
+    minimum_score_backed_share: minimumShare,
+    floor_met: rows.length > 0 && minimumShare != null
+      ? rows.filter((candidate) => candidate.__ranker_score != null).length / rows.length >= minimumShare
+      : null,
   }
   servingStatusByFeed.set(status.feed_rkey, status)
 
@@ -133,15 +146,19 @@ export function freshnessHours(): number {
 export function applyRankerPriorityOrder(
   query: AnySelect,
   rkey: string,
+  publisherTimeClock: PublisherTimeClock = 'receipt_time',
+  referenceTimeIso = new Date().toISOString(),
+  rankerScoreMaxAgeHours?: number,
 ): AnySelect {
+  const maxAgeHours = rankerScoreMaxAgeHours ?? freshnessHours()
   const cutoffIso = new Date(
-    Date.now() - freshnessHours() * 60 * 60 * 1000,
+    Date.parse(referenceTimeIso) - maxAgeHours * 60 * 60 * 1000,
   ).toISOString()
   // D1.4 read-path cutover: serve scores by the feed's configured profile.
   // ranker_score_source is NULL for every feed today, so profileId === rkey
   // and the join is identical to the pre-cutover `fcp.feed_id = rkey`.
   const profileId = getScoreSource(rkey) ?? rkey
-  return (query as any)
+  const ranked = (query as any)
     .leftJoin(
       'ranker_prod.feed_current_priority as fcp',
       (join: any) =>
@@ -168,8 +185,7 @@ export function applyRankerPriorityOrder(
         ]),
       'desc',
     )
-    .orderBy('post.indexedAt', 'desc')
-    .orderBy('post.cid', 'desc')
+  return applyPublisherRecencyOrder(ranked, publisherTimeClock)
 }
 
 /**
@@ -181,8 +197,11 @@ export function applyRankerPriorityOrder(
 export function applyPriorityOrderForFeed(
   query: AnySelect,
   rkey: string,
+  publisherTimeClock: PublisherTimeClock = 'receipt_time',
+  referenceTimeIso = new Date().toISOString(),
+  rankerScoreMaxAgeHours?: number,
 ): AnySelect {
-  return applyRankerPriorityOrder(query, rkey)
+  return applyRankerPriorityOrder(query, rkey, publisherTimeClock, referenceTimeIso, rankerScoreMaxAgeHours)
 }
 
 // Re-export for the type system

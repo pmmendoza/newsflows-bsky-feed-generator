@@ -20,6 +20,7 @@
 import { QueryParams } from '../lexicon/types/app/bsky/feed/getFeedSkeleton'
 import { AppContext } from '../config'
 import { buildFeed, FeedGenerator, QueryBuilder } from './feed-builder'
+import { PublisherTimeClock } from '../db/schema'
 import {
   publisherQueryChronological,
   followsQueryChronological,
@@ -66,28 +67,30 @@ export function pickPolicy(
   publisherDid: string,
   shortname: string,
   feedId = shortname,
+  publisherTimeClock: PublisherTimeClock = 'receipt_time',
+  rankerScoreMaxAgeHours?: number,
 ): { buildPublisher: QueryBuilder; buildFollows: QueryBuilder } {
   switch (policy) {
     case 'chronological':
       return {
         buildPublisher: (db, t, f, c, l) =>
-          publisherQueryChronological(db, t, f, c, l, publisherDid, shortname),
+          publisherQueryChronological(db, t, f, c, l, publisherDid, shortname, publisherTimeClock),
         buildFollows: (db, t, f, c, l) =>
           followsQueryChronological(db, t, f, c, l, publisherDid, shortname),
       }
     case 'ranker-priority':
       return {
-        buildPublisher: (db, t, f, c, l) =>
-          publisherQueryRankerPriority(db, t, f, c, l, publisherDid, shortname, feedId),
-        buildFollows: (db, t, f, c, l) =>
-          followsQueryRankerPriority(db, t, f, c, l, publisherDid, shortname, feedId),
+        buildPublisher: (db, t, f, c, l, referenceTimeIso) =>
+          publisherQueryRankerPriority(db, t, f, c, l, publisherDid, shortname, feedId, publisherTimeClock, referenceTimeIso, rankerScoreMaxAgeHours),
+        buildFollows: (db, t, f, c, l, referenceTimeIso) =>
+          followsQueryRankerPriority(db, t, f, c, l, publisherDid, shortname, feedId, referenceTimeIso, rankerScoreMaxAgeHours),
       }
     case 'engagement-sorted':
       return {
-        buildPublisher: (db, t, f, c, l) =>
-          publisherQueryEngagement(db, t, f, c, l, publisherDid, shortname),
-        buildFollows: (db, t, f, c, l) =>
-          followsQueryEngagement(db, t, f, c, l, publisherDid, shortname),
+        buildPublisher: (db, t, f, c, l, referenceTimeIso) =>
+          publisherQueryEngagement(db, t, f, c, l, publisherDid, shortname, publisherTimeClock, referenceTimeIso),
+        buildFollows: (db, t, f, c, l, referenceTimeIso) =>
+          followsQueryEngagement(db, t, f, c, l, publisherDid, shortname, referenceTimeIso),
       }
   }
 }

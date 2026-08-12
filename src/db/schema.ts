@@ -29,6 +29,11 @@ export type Post = {
   cid: string
   indexedAt: string
   createdAt: string
+  created_at_source_raw?: Buffer | null
+  content_time_utc?: string | null
+  content_time_status?: ContentTimeStatus
+  content_time_clamp_reason?: ContentTimeClampReason | null
+  content_time_validator_version?: string | null
   author: string
   text: string
   rootUri: string
@@ -54,6 +59,11 @@ export type Engagement = {
   type: number
   indexedAt: string
   createdAt: string
+  created_at_source_raw?: Buffer | null
+  content_time_utc?: string | null
+  content_time_status?: ContentTimeStatus
+  content_time_clamp_reason?: ContentTimeClampReason | null
+  content_time_validator_version?: string | null
   author: string
 }
 
@@ -101,6 +111,19 @@ export type RequestLog = {
   publisher_count?: number | null
   follows_count?: number | null
   result_count?: number | null
+  request_reference_time?: string | null
+  publisher_post_max_age_days?: number | null
+  publisher_post_max_age_source?: string | null
+  publisher_time_clock?: string | null
+  publisher_serving_window_source?: string | null
+  publisher_compatibility_fallback_active?: boolean | null
+  feed_catalog_revision?: number | string | null
+  ranker_score_max_age_hours?: number | null
+  ranker_score_compatibility_fallback_active?: boolean | null
+  ranker_fresh_scored_publisher_slots?: number | null
+  ranker_publisher_slots?: number | null
+  ranker_min_score_backed_share?: number | null
+  ranker_observed_score_backed_share?: number | null
 }
 
 export type RequestPosts = {
@@ -211,6 +234,19 @@ export type FeedCatalog = {
   // Migration 008: the profile a feed currently serves scores from.
   // NULL ⇒ serve its own rkey (see score-source-cache / D1.4).
   ranker_score_source?: string | null
+  ranker_score_max_age_hours?: number | null
+  ranker_score_max_age_source?: PublisherPostMaxAgeSource | null
+  ranker_min_score_backed_share?: number | null
+  ranker_min_score_backed_source?: PublisherPostMaxAgeSource | null
+  // Effective per-feed value already resolved by the root catalog. Feedgen
+  // materializes it and does not implement study inheritance.
+  publisher_post_max_age_days?: number | null
+  publisher_post_max_age_source?: PublisherPostMaxAgeSource | null
+  publisher_time_clock?: PublisherTimeClock
+  publisher_time_transition_expires_at?: string | null
+  content_time_cutover_min_valid_share?: number | null
+  content_time_contract_version?: string | null
+  catalog_revision?: number | string
   enabled: boolean
   created_at?: string | Date
   retired_at?: string | Date | null
@@ -227,14 +263,19 @@ export interface FeedCatalogHistory {
   after_row: FeedCatalog
   changed_fields: Array<{
     field: string
-    current: boolean | string | null
-    proposed: boolean | string | null
+    current: boolean | number | string | null
+    proposed: boolean | number | string | null
   }>
   feed_code_hash_before: string | null
   feed_code_hash_after: string | null
   ranker_code_hash_before: string | null
   ranker_code_hash_after: string | null
 }
+
+export type ContentTimeStatus = 'source_valid' | 'source_invalid' | 'legacy_unknown'
+export type ContentTimeClampReason = 'missing' | 'unparseable' | 'future_skew' | 'past_bound'
+export type PublisherTimeClock = 'receipt_time' | 'content_time_v1'
+export type PublisherPostMaxAgeSource = 'study_default' | 'feed_override'
 
 // feedgen_ops.config_activation (migration 010). `config` is the
 // canonical-JSON behavior manifest (src/util/config-manifest.ts), written as

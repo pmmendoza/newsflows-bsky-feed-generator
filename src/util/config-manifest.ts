@@ -96,6 +96,8 @@ export function buildConfigManifest(cfg: Config) {
       // empty {} when none set. Only the publisher (ranked) window is overridden;
       // the follows window + engagement-recount window stay on time_hours.
       serving_time_hours_overrides: servingTimeHourOverrides(),
+      publisher_serving_window_authority: 'feed_catalog_with_transitional_env_fallback',
+      compatibility_fallback_retirement_gate: 'materialized_catalog_production_proof',
     },
     politician_filter: {
       kill_switch_disabled: politicianFilterKillSwitchDisabled(),
