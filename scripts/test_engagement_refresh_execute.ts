@@ -58,6 +58,7 @@ async function main() {
       `.execute(trx)
       await sql`CREATE INDEX idx_post_indexedat ON post ("indexedAt")`.execute(trx)
       await sql`CREATE INDEX post_author_index ON post (author)`.execute(trx)
+      await sql`INSERT INTO subscriber VALUES ('did:subscriber')`.execute(trx)
       await sql`INSERT INTO follows SELECT 'did:sub', 'did:follow-' || n FROM generate_series(1, 1999) AS n`.execute(trx)
       await sql`INSERT INTO follows VALUES ('did:sub', 'did:publisher-receipt')`.execute(trx)
       await sql`INSERT INTO follows VALUES ('did:sub', 'did:publisher-all-active')`.execute(trx)
@@ -85,11 +86,29 @@ async function main() {
       await insertPost('at://publisher/all-active', 'did:publisher-all-active', atHoursAgo(47))
       await insertPost('at://comment/one', 'did:commenter', atHoursAgo(1), null, null, 'at://follow/recent')
       await sql`
+        INSERT INTO post(uri, cid, "indexedAt", "createdAt", author, text, "rootUri", "rootCid", "linkUrl", "linkTitle", "linkDescription")
+        SELECT 'at://bulk/other-' || n, 'cid', ${atHoursAgo(1)}, ${atHoursAgo(1)}, 'did:follow-' || n, '', '', '', '', '', ''
+        FROM generate_series(1, 501) AS n
+      `.execute(trx)
+      await sql`
+        INSERT INTO post(uri, cid, "indexedAt", "createdAt", author, text, "rootUri", "rootCid", "linkUrl", "linkTitle", "linkDescription")
+        SELECT 'at://bulk/publisher-' || n, 'cid', ${atHoursAgo(1)}, ${atHoursAgo(1)}, 'did:publisher-receipt', '', '', '', '', '', ''
+        FROM generate_series(1, 501) AS n
+      `.execute(trx)
+      await insertPost('at://comment/publisher-subscriber', 'did:subscriber', atHoursAgo(1), null, null, 'at://bulk/publisher-1')
+      await insertPost('at://comment/publisher-outsider', 'did:outsider', atHoursAgo(1), null, null, 'at://bulk/publisher-1')
+      await sql`
         INSERT INTO engagement VALUES
           ('at://like/one', 'cid', 'at://follow/recent', 'cid', 2, ${atHoursAgo(1)}, ${atHoursAgo(1)}, 'did:liker'),
           ('at://repost/one', 'cid', 'at://follow/recent', 'cid', 1, ${atHoursAgo(1)}, ${atHoursAgo(1)}, 'did:reposter'),
           ('at://quote/one', 'cid', 'at://follow/recent', 'cid', 3, ${atHoursAgo(1)}, ${atHoursAgo(1)}, 'did:quoter'),
-          ('at://like/all-active', 'cid', 'at://publisher/all-active', 'cid', 2, ${atHoursAgo(1)}, ${atHoursAgo(1)}, 'did:outsider')
+          ('at://like/all-active', 'cid', 'at://publisher/all-active', 'cid', 2, ${atHoursAgo(1)}, ${atHoursAgo(1)}, 'did:outsider'),
+          ('at://publisher/repost-subscriber', 'cid', 'at://bulk/publisher-1', 'cid', 1, ${atHoursAgo(1)}, ${atHoursAgo(1)}, 'did:subscriber'),
+          ('at://publisher/like-subscriber', 'cid', 'at://bulk/publisher-1', 'cid', 2, ${atHoursAgo(1)}, ${atHoursAgo(1)}, 'did:subscriber'),
+          ('at://publisher/quote-subscriber', 'cid', 'at://bulk/publisher-1', 'cid', 3, ${atHoursAgo(1)}, ${atHoursAgo(1)}, 'did:subscriber'),
+          ('at://publisher/repost-outsider', 'cid', 'at://bulk/publisher-1', 'cid', 1, ${atHoursAgo(1)}, ${atHoursAgo(1)}, 'did:outsider'),
+          ('at://publisher/like-outsider', 'cid', 'at://bulk/publisher-1', 'cid', 2, ${atHoursAgo(1)}, ${atHoursAgo(1)}, 'did:outsider'),
+          ('at://publisher/quote-outsider', 'cid', 'at://bulk/publisher-1', 'cid', 3, ${atHoursAgo(1)}, ${atHoursAgo(1)}, 'did:outsider')
       `.execute(trx)
 
       const plan = deriveEngagementRefreshPlan(await trx.selectFrom('feedgen_ops.feed_catalog')
@@ -113,16 +132,40 @@ async function main() {
       }
       const receipt = await selectRecentPublisherPosts(trx as any, ['did:publisher-receipt'], 'receipt_time', plan.receiptCutoff)!.execute()
       const selected = await selectEngagementRefreshPosts(trx as any, plan, referenceMs)
-      assert.deepEqual(followed.map((row) => row.uri).sort(), ['at://follow/boundary', 'at://follow/recent', 'at://publisher/all-active', 'at://publisher/receipt'])
-      assert.deepEqual(receipt.map((row) => row.uri), ['at://publisher/receipt'])
-      assert.deepEqual(selected.map((row) => row.uri).sort(), [
+      assert.equal(followed.length, 1006)
+      assert.deepEqual(followed.map((row) => row.uri).filter((uri) => !uri.startsWith('at://bulk/')).sort(), ['at://follow/boundary', 'at://follow/recent', 'at://publisher/all-active', 'at://publisher/receipt'])
+      assert.equal(receipt.length, 502)
+      assert.deepEqual(receipt.map((row) => row.uri).filter((uri) => !uri.startsWith('at://bulk/')), ['at://publisher/receipt'])
+      assert.equal(selected.length, 1008)
+      assert.deepEqual(selected.map((row) => row.uri).filter((uri) => !uri.startsWith('at://bulk/')).sort(), [
         'at://follow/boundary', 'at://follow/recent', 'at://publisher/all-active', 'at://publisher/content', 'at://publisher/receipt', 'at://ranker/eligible',
       ])
 
-      await updateEngagement(trx as any, referenceMs)
+      queries.length = 0
+      await Promise.all([
+        updateEngagement(trx as any, referenceMs),
+        updateEngagement(trx as any, referenceMs),
+      ])
+      const reactionQueries = queries.filter((query) => /from "engagement"/i.test(query.sql) && /group by .*"engagement"\."type"/i.test(query.sql))
+      assert.equal(reactionQueries.length, 4, 'publisher and other reactions must each use two combined queries')
+      for (const query of reactionQueries) {
+        assert.match(query.sql, /"engagement"\."type" in \(/i)
+        assert.ok(query.parameters.filter((value) => typeof value === 'string' && value.startsWith('at://')).length <= 500, 'reaction queries must bind at most 500 URIs')
+        assert.deepEqual(query.parameters.filter((value) => [1, 2, 3].includes(Number(value))).map(Number).sort(), [1, 2, 3])
+      }
+      assert.equal(reactionQueries.filter((query) => /"engagement"\."author" in \(/i.test(query.sql)).length, 2, 'publisher reaction queries must retain subscriber filtering')
+      const commentQueries = queries.filter((query) => /from "post" as "comments"/i.test(query.sql))
+      assert.equal(commentQueries.length, 4, 'publisher and other comments must each use two queries')
+      assert.ok(commentQueries.every((query) => query.parameters.filter((value) => typeof value === 'string' && value.startsWith('at://')).length <= 500), 'comment queries must bind at most 500 URIs')
+      const updateQueries = queries.filter((query) => /^\s*update post\s+set/im.test(query.sql))
+      assert.equal(updateQueries.length, 3, 'one coalesced refresh must update 1,008 posts in three batches')
+      assert.ok(updateQueries.every((query) => new Set(query.parameters.filter((value) => typeof value === 'string' && value.startsWith('at://'))).size <= 500), 'update queries must target at most 500 distinct URIs')
       const refreshed = await trx.selectFrom('post').select(['likes_count', 'repost_count', 'quote_count', 'comments_count'])
         .where('uri', '=', 'at://follow/recent').executeTakeFirstOrThrow()
       assert.deepEqual(refreshed, { likes_count: 1, repost_count: 1, quote_count: 1, comments_count: 1 })
+      const publisherRefreshed = await trx.selectFrom('post').select(['likes_count', 'repost_count', 'quote_count', 'comments_count'])
+        .where('uri', '=', 'at://bulk/publisher-1').executeTakeFirstOrThrow()
+      assert.deepEqual(publisherRefreshed, { likes_count: 1, repost_count: 1, quote_count: 1, comments_count: 1 })
       const allActivePublisher = await trx.selectFrom('post').select('likes_count')
         .where('uri', '=', 'at://publisher/all-active').executeTakeFirstOrThrow()
       assert.equal(allActivePublisher.likes_count, 0, 'followed chronological publisher must retain subscriber-only classification')
