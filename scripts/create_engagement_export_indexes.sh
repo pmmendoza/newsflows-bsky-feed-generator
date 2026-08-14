@@ -29,6 +29,14 @@ CREATE INDEX CONCURRENTLY IF NOT EXISTS post_comment_author_createdat_idx
 CREATE INDEX CONCURRENTLY IF NOT EXISTS post_comment_rooturi_createdat_idx
   ON post ("rootUri", "createdAt")
   WHERE "rootUri" <> '';
+
+CREATE INDEX CONCURRENTLY IF NOT EXISTS post_comment_rootdid_createdat_idx
+  ON post (split_part("rootUri"::text, '/', 3), "createdAt")
+  WHERE "rootUri" <> '';
+
+CREATE INDEX CONCURRENTLY IF NOT EXISTS post_comment_rootdid_content_time_idx
+  ON post (split_part("rootUri"::text, '/', 3), content_time_utc)
+  WHERE "rootUri" <> '' AND content_time_status = 'source_valid';
 SQL
 
 echo "Index creation commands submitted successfully."
