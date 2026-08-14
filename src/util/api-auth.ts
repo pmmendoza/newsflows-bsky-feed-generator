@@ -27,13 +27,26 @@ export function hasConfiguredApiKey(config: ApiKeyAuthConfig): boolean {
   return getConfiguredApiKeys(config).size > 0
 }
 
+/** Return only the configured key's environment-name class, never key material. */
+export function getAuthorizedApiKeyEnv(
+  req: express.Request,
+  config: ApiKeyAuthConfig,
+): string | null {
+  const presented = parseHeaderValue(req.headers['api-key'])?.trim()
+  if (!presented) return null
+
+  for (const envName of config.primaryEnv) {
+    const configured = process.env[envName]?.trim()
+    if (configured && configured === presented) return envName
+  }
+  return null
+}
+
 export function isApiKeyAuthorized(
   req: express.Request,
   config: ApiKeyAuthConfig,
 ): boolean {
-  const presented = parseHeaderValue(req.headers['api-key'])?.trim()
-  if (!presented) return false
-  return getConfiguredApiKeys(config).has(presented)
+  return getAuthorizedApiKeyEnv(req, config) !== null
 }
 
 export function logUnauthorized(endpoint: string) {

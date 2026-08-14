@@ -13,7 +13,12 @@ import {
 } from '../util/ingestion-scope'
 import { resolvePublisherDidInfo, resolvePublisherDids } from '../util/publisher-dids'
 import { getRetentionConfig } from '../util/retention'
-import { ApiKeyAuthConfig, isApiKeyAuthorized, logUnauthorized } from '../util/api-auth'
+import {
+  ApiKeyAuthConfig,
+  getAuthorizedApiKeyEnv,
+  isApiKeyAuthorized,
+  logUnauthorized,
+} from '../util/api-auth'
 import { resolveEngagementTimeHours } from '../algos/feed-builder'
 import { isConfigActivationDegraded } from '../util/config-activation'
 import { getRankerPriorityServingStatus } from '../algos/ranker-priority-helper'
@@ -113,6 +118,13 @@ export const monitorReadAuth: ApiKeyAuthConfig = {
     'FEEDGEN_RANKER_API_KEY',
     'FEEDGEN_ADMIN_API_KEY',
   ],
+}
+
+const monitorReadKeyClasses: Record<string, string> = {
+  FEEDGEN_MONITOR_API_KEY: 'monitor',
+  FEEDGEN_READ_API_KEY: 'read',
+  FEEDGEN_RANKER_API_KEY: 'ranker',
+  FEEDGEN_ADMIN_API_KEY: 'admin',
 }
 
 function getPackageVersion(): string | undefined {
@@ -1708,7 +1720,21 @@ export default function registerMonitorEndpoints(server: Server, ctx: AppContext
   })
 
   server.xrpc.router.get('/api/engagement', async (req, res) => {
-    if (!isApiKeyAuthorized(req, monitorReadAuth)) {
+    const authorizedKeyEnv = getAuthorizedApiKeyEnv(req, monitorReadAuth)
+    const keyClass = authorizedKeyEnv
+      ? monitorReadKeyClasses[authorizedKeyEnv] ?? 'other'
+      : 'unauthorized'
+    res.once('finish', () => {
+      console.log(JSON.stringify({
+        timestamp: new Date().toISOString(),
+        event: 'feedgen_engagement_route_hit',
+        route: '/api/engagement',
+        status: res.statusCode,
+        key_class: keyClass,
+      }))
+    })
+
+    if (!authorizedKeyEnv) {
       logUnauthorized('/api/engagement')
       return res.status(401).json({ error: 'Unauthorized: Invalid API key' })
     }
