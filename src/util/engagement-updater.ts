@@ -47,11 +47,7 @@ export function selectRecentFollowedPosts(db: Database, cutoff: string) {
     .selectFrom('post')
     .select(['post.uri', 'post.author'])
     .where('post.indexedAt', '>=', cutoff)
-    .where((eb) => eb.exists(
-      eb.selectFrom('follows')
-        .select('follows.follows')
-        .whereRef('follows.follows', '=', 'post.author'),
-    ))
+    .where(sql<boolean>`post.author = ANY (ARRAY(SELECT f.follows FROM follows AS f))`)
 }
 
 export function selectRecentPublisherPosts(
