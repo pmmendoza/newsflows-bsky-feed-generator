@@ -64,7 +64,7 @@ async function main() {
   check(address && typeof address === 'object', 'test server must listen')
   const base = `http://127.0.0.1:${address.port}/api/compliance/engagement`
   const headers = { 'api-key': 'contract-test-key' }
-  const query = '?feed_id=newsflow-be-k&since=2026-08-01T00:00:00Z&until=2026-08-02T00:00:00Z&scope=publisher&types=like'
+  const query = '?feed_id=newsflow-be-k&since=2026-08-01T00:00:00Z&until=2026-08-02T00:00:00Z&scope=publisher&types=like,comment'
   process.env.FEEDGEN_MONITOR_API_KEY = 'contract-test-key'
   try {
     let response = await fetch(base + query, { headers })
@@ -90,12 +90,17 @@ async function main() {
     payload = await response.json()
     check(payload.science_eligible === false, 'below-threshold validity must fail closed')
 
-    response = await fetch(base + '?since=2026-08-01T00:00:00Z&until=2026-08-02T00:00:00Z&scope=publisher&types=like', { headers })
+    response = await fetch(base + '?since=2026-08-01T00:00:00Z&until=2026-08-02T00:00:00Z&scope=publisher&types=like,comment', { headers })
     payload = await response.json()
     check(payload.science_eligible === false && payload.time_clock === 'receipt_time', 'missing feed binding must stay transitional')
 
     check(queries.some((text) => text.includes("content_time_status = 'source_valid'") && text.includes('content_time_utc')), 'event SQL must enforce valid content time')
-    check(queries.some((text) => text.includes('FROM candidates') && text.includes('"indexedAt"')), 'validity denominator must use bounded receipt time')
+    const validityQuery = queries.find((text) => text.includes('FROM candidates'))
+    check(validityQuery !== undefined && validityQuery.includes('e."indexedAt"') && validityQuery.includes('p."indexedAt"'), 'validity denominator must use bounded receipt time')
+    check(!validityQuery.includes('"indexedAt")::timestamptz'), 'validity receipt-time bounds must not cast indexed columns')
+    const receiptQuery = queries.find((text) => text.includes('e."createdAt" AS created_at'))
+    check(receiptQuery !== undefined && receiptQuery.includes('p."createdAt" AS created_at'), 'transitional export must query receipt time')
+    check(!receiptQuery.includes('"createdAt")::timestamptz'), 'receipt-time bounds must not cast indexed columns')
   } finally {
     delete process.env.FEEDGEN_MONITOR_API_KEY
     await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()))
