@@ -7,6 +7,7 @@ import { resolvePublisherDids } from './publisher-dids'
 const ENGAGEMENT_TYPE_REPOST = 1
 const ENGAGEMENT_TYPE_LIKE = 2
 const ENGAGEMENT_TYPE_QUOTE = 3
+const FOLLOWED_AUTHOR_CHUNK_SIZE = 1000
 
 type RefreshCatalogRow = {
   rkey: string
@@ -45,12 +46,12 @@ export function deriveEngagementRefreshPlan(rows: RefreshCatalogRow[], reference
 export async function selectRecentFollowedPosts(db: Database, cutoff: string) {
   const authors = (await db.selectFrom('follows').select('follows').distinct().execute()).map((row) => row.follows)
   const posts: Array<{ uri: string, author: string }> = []
-  for (let index = 0; index < authors.length; index += 1000) {
+  for (let index = 0; index < authors.length; index += FOLLOWED_AUTHOR_CHUNK_SIZE) {
     posts.push(...await db
       .selectFrom('post')
       .select(['post.uri', 'post.author'])
       .where('post.indexedAt', '>=', cutoff)
-      .where('post.author', 'in', authors.slice(index, index + 1000))
+      .where('post.author', 'in', authors.slice(index, index + FOLLOWED_AUTHOR_CHUNK_SIZE))
       .execute())
   }
   return posts
