@@ -8,7 +8,8 @@ const ENGAGEMENT_TYPE_REPOST = 1
 const ENGAGEMENT_TYPE_LIKE = 2
 const ENGAGEMENT_TYPE_QUOTE = 3
 const FOLLOWED_AUTHOR_CHUNK_SIZE = 1000
-const AGGREGATION_URI_CHUNK_SIZE = 1000
+const ENGAGEMENT_REFRESH_BATCH_SIZE = 500
+let refreshInFlight: Promise<void> | null = null
 
 type RefreshCatalogRow = {
   rkey: string
@@ -105,11 +106,8 @@ export async function selectEngagementRefreshPosts(
  * For publisher posts (from newsbots), only counts engagement from subscribers
  * For other posts, counts all engagement
  */
-export async function updateEngagement(db: Database, referenceMs = Date.now()): Promise<void> {
+async function runEngagementRefresh(db: Database, referenceMs: number): Promise<void> {
   try {
-    // Postgres supports at most 65535 bind params. Kysely binds one param per array element for `IN (...)`.
-    // Chunk large URI lists to avoid protocol errors at scale.
-    const IN_CLAUSE_CHUNK_SIZE = 5000;
     const execInChunks = async <T>(items: string[], chunkSize: number, stage: string, fn: (chunk: string[]) => Promise<T[]>): Promise<T[]> => {
       const results: T[] = [];
       const totalBatches = Math.ceil(items.length / chunkSize)
@@ -172,7 +170,7 @@ export async function updateEngagement(db: Database, referenceMs = Date.now()): 
 
     // Count reactions for other posts from all authors.
     const otherReactionCounts = otherPostUris.length > 0
-      ? await execInChunks(otherPostUris, AGGREGATION_URI_CHUNK_SIZE, 'reactions_other', async (chunk) => {
+      ? await execInChunks(otherPostUris, ENGAGEMENT_REFRESH_BATCH_SIZE, 'reactions_other', async (chunk) => {
         return db
           .selectFrom('engagement')
           .where('engagement.subjectUri', 'in', chunk)
@@ -189,7 +187,7 @@ export async function updateEngagement(db: Database, referenceMs = Date.now()): 
 
     // For publisher posts, count reactions only from subscribers.
     const publisherReactionCounts = (publisherPostUris.length > 0 && subscriberDids.length > 0)
-      ? await execInChunks(publisherPostUris, AGGREGATION_URI_CHUNK_SIZE, 'reactions_publisher', async (chunk) => {
+      ? await execInChunks(publisherPostUris, ENGAGEMENT_REFRESH_BATCH_SIZE, 'reactions_publisher', async (chunk) => {
         return db
           .selectFrom('engagement')
           .where('engagement.subjectUri', 'in', chunk)
@@ -210,7 +208,7 @@ export async function updateEngagement(db: Database, referenceMs = Date.now()): 
     // Count comments for each post (comments are posts with rootUri pointing to the original post)
     // For other posts: count all comments
     const otherCommentsResult = otherPostUris.length > 0
-      ? await execInChunks(otherPostUris, IN_CLAUSE_CHUNK_SIZE, 'comments_other', async (chunk) => {
+      ? await execInChunks(otherPostUris, ENGAGEMENT_REFRESH_BATCH_SIZE, 'comments_other', async (chunk) => {
         return db
           .selectFrom('post as comments')
           .where('comments.rootUri', 'in', chunk)
@@ -226,7 +224,7 @@ export async function updateEngagement(db: Database, referenceMs = Date.now()): 
 
     // For publisher posts: only count comments from subscribers
     const publisherCommentsResult = (publisherPostUris.length > 0 && subscriberDids.length > 0)
-      ? await execInChunks(publisherPostUris, IN_CLAUSE_CHUNK_SIZE, 'comments_publisher', async (chunk) => {
+      ? await execInChunks(publisherPostUris, ENGAGEMENT_REFRESH_BATCH_SIZE, 'comments_publisher', async (chunk) => {
         return db
           .selectFrom('post as comments')
           .where('comments.rootUri', 'in', chunk)
@@ -258,9 +256,11 @@ export async function updateEngagement(db: Database, referenceMs = Date.now()): 
     );
 
     // Update posts with counts
-    const batchSize = 5000;
-    for (let i = 0; i < postUris.length; i += batchSize) {
-      const batchUris = postUris.slice(i, i + batchSize);
+    const totalUpdateBatches = Math.ceil(postUris.length / ENGAGEMENT_REFRESH_BATCH_SIZE)
+    for (let i = 0; i < postUris.length; i += ENGAGEMENT_REFRESH_BATCH_SIZE) {
+      const batchUris = postUris.slice(i, i + ENGAGEMENT_REFRESH_BATCH_SIZE);
+      const batch = Math.floor(i / ENGAGEMENT_REFRESH_BATCH_SIZE) + 1
+      console.log(JSON.stringify({ event: 'engagement_refresh_batch_start', stage: 'update_posts', batch, total_batches: totalUpdateBatches, uri_count: batchUris.length }))
 
       // Build CASE statements for bulk update using sql template
       const likesCases = sql.join(
@@ -294,7 +294,7 @@ export async function updateEngagement(db: Database, referenceMs = Date.now()): 
         WHERE uri IN (${sql.join(batchUris.map(uri => sql`${uri}`), sql`, `)})
       `.execute(db);
 
-      console.log(`[${new Date().toISOString()}] - Updated batch ${Math.floor(i / batchSize) + 1}/${Math.ceil(postUris.length / batchSize)} (${batchUris.length} posts)`);
+      console.log(JSON.stringify({ event: 'engagement_refresh_batch_complete', stage: 'update_posts', batch, total_batches: totalUpdateBatches, uri_count: batchUris.length }))
     }
 
     console.log(JSON.stringify({
@@ -309,5 +309,15 @@ export async function updateEngagement(db: Database, referenceMs = Date.now()): 
   } catch (error) {
     console.error('Error in scheduled engagement update:', error);
     throw error; // Re-throw to allow caller to handle the error
+  }
+}
+
+export async function updateEngagement(db: Database, referenceMs = Date.now()): Promise<void> {
+  if (refreshInFlight) return refreshInFlight
+  refreshInFlight = runEngagementRefresh(db, referenceMs)
+  try {
+    await refreshInFlight
+  } finally {
+    refreshInFlight = null
   }
 }

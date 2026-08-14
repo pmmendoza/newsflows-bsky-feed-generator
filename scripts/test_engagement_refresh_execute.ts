@@ -88,12 +88,12 @@ async function main() {
       await sql`
         INSERT INTO post(uri, cid, "indexedAt", "createdAt", author, text, "rootUri", "rootCid", "linkUrl", "linkTitle", "linkDescription")
         SELECT 'at://bulk/other-' || n, 'cid', ${atHoursAgo(1)}, ${atHoursAgo(1)}, 'did:follow-' || n, '', '', '', '', '', ''
-        FROM generate_series(1, 1001) AS n
+        FROM generate_series(1, 501) AS n
       `.execute(trx)
       await sql`
         INSERT INTO post(uri, cid, "indexedAt", "createdAt", author, text, "rootUri", "rootCid", "linkUrl", "linkTitle", "linkDescription")
         SELECT 'at://bulk/publisher-' || n, 'cid', ${atHoursAgo(1)}, ${atHoursAgo(1)}, 'did:publisher-receipt', '', '', '', '', '', ''
-        FROM generate_series(1, 1001) AS n
+        FROM generate_series(1, 501) AS n
       `.execute(trx)
       await insertPost('at://comment/publisher-subscriber', 'did:subscriber', atHoursAgo(1), null, null, 'at://bulk/publisher-1')
       await insertPost('at://comment/publisher-outsider', 'did:outsider', atHoursAgo(1), null, null, 'at://bulk/publisher-1')
@@ -132,25 +132,34 @@ async function main() {
       }
       const receipt = await selectRecentPublisherPosts(trx as any, ['did:publisher-receipt'], 'receipt_time', plan.receiptCutoff)!.execute()
       const selected = await selectEngagementRefreshPosts(trx as any, plan, referenceMs)
-      assert.equal(followed.length, 2006)
+      assert.equal(followed.length, 1006)
       assert.deepEqual(followed.map((row) => row.uri).filter((uri) => !uri.startsWith('at://bulk/')).sort(), ['at://follow/boundary', 'at://follow/recent', 'at://publisher/all-active', 'at://publisher/receipt'])
-      assert.equal(receipt.length, 1002)
+      assert.equal(receipt.length, 502)
       assert.deepEqual(receipt.map((row) => row.uri).filter((uri) => !uri.startsWith('at://bulk/')), ['at://publisher/receipt'])
-      assert.equal(selected.length, 2008)
+      assert.equal(selected.length, 1008)
       assert.deepEqual(selected.map((row) => row.uri).filter((uri) => !uri.startsWith('at://bulk/')).sort(), [
         'at://follow/boundary', 'at://follow/recent', 'at://publisher/all-active', 'at://publisher/content', 'at://publisher/receipt', 'at://ranker/eligible',
       ])
 
       queries.length = 0
-      await updateEngagement(trx as any, referenceMs)
+      await Promise.all([
+        updateEngagement(trx as any, referenceMs),
+        updateEngagement(trx as any, referenceMs),
+      ])
       const reactionQueries = queries.filter((query) => /from "engagement"/i.test(query.sql) && /group by .*"engagement"\."type"/i.test(query.sql))
       assert.equal(reactionQueries.length, 4, 'publisher and other reactions must each use two combined queries')
       for (const query of reactionQueries) {
         assert.match(query.sql, /"engagement"\."type" in \(/i)
-        assert.ok(query.parameters.filter((value) => typeof value === 'string' && value.startsWith('at://')).length <= 1000, 'reaction queries must bind at most 1,000 URIs')
+        assert.ok(query.parameters.filter((value) => typeof value === 'string' && value.startsWith('at://')).length <= 500, 'reaction queries must bind at most 500 URIs')
         assert.deepEqual(query.parameters.filter((value) => [1, 2, 3].includes(Number(value))).map(Number).sort(), [1, 2, 3])
       }
       assert.equal(reactionQueries.filter((query) => /"engagement"\."author" in \(/i.test(query.sql)).length, 2, 'publisher reaction queries must retain subscriber filtering')
+      const commentQueries = queries.filter((query) => /from "post" as "comments"/i.test(query.sql))
+      assert.equal(commentQueries.length, 4, 'publisher and other comments must each use two queries')
+      assert.ok(commentQueries.every((query) => query.parameters.filter((value) => typeof value === 'string' && value.startsWith('at://')).length <= 500), 'comment queries must bind at most 500 URIs')
+      const updateQueries = queries.filter((query) => /^\s*update post\s+set/im.test(query.sql))
+      assert.equal(updateQueries.length, 3, 'one coalesced refresh must update 1,008 posts in three batches')
+      assert.ok(updateQueries.every((query) => new Set(query.parameters.filter((value) => typeof value === 'string' && value.startsWith('at://'))).size <= 500), 'update queries must target at most 500 distinct URIs')
       const refreshed = await trx.selectFrom('post').select(['likes_count', 'repost_count', 'quote_count', 'comments_count'])
         .where('uri', '=', 'at://follow/recent').executeTakeFirstOrThrow()
       assert.deepEqual(refreshed, { likes_count: 1, repost_count: 1, quote_count: 1, comments_count: 1 })
