@@ -17,11 +17,14 @@ import { ApiKeyAuthConfig, isApiKeyAuthorized, logUnauthorized } from '../util/a
 import { resolveEngagementTimeHours } from '../algos/feed-builder'
 import { isConfigActivationDegraded } from '../util/config-activation'
 import { getRankerPriorityServingStatus } from '../algos/ranker-priority-helper'
+import { assessEngagementScienceEligibility } from '../util/engagement-time-contract'
+import { CONTENT_TIME_VALIDATOR_VERSION } from '../util/content-time'
 
 type EngagementExportType = 'like' | 'repost' | 'comment' | 'quote'
 type EngagementExportScope = 'union' | 'publisher' | 'subscriber' | 'subscriber_on_publisher'
 type ActivityScope = 'publisher_posts' | 'feed_posts' | 'all_tracked'
 type EngagementTargetMode = 'any' | 'publisher' | 'non_publisher'
+type EngagementCohortMode = 'events' | 'validity'
 
 type EngagementExportEvent = {
   type: EngagementExportType
@@ -29,6 +32,9 @@ type EngagementExportEvent = {
   subject_uri: string
   author_did: string
   created_at: string
+  indexed_at: string
+  content_time_status: string | null
+  content_time_validator_version: string | null
   comment_root_uri: string | null
   quote_subject_uri: string | null
   publisher_target_any: boolean
@@ -44,6 +50,16 @@ type EngagementFilters = {
   types: EngagementExportType[]
   subscriberDid: string | null
   includeOtherSubscriberActivity: boolean
+  feedId: string | null
+}
+
+type EngagementExportFeedClock = {
+  feed_id: string
+  publisher_did?: string | null
+  publisher_time_clock?: string | null
+  content_time_cutover_min_valid_share?: number | null
+  content_time_contract_version?: string | null
+  publisher_time_transition_expires_at?: string | null
 }
 
 type EngagementCursor = {
@@ -162,6 +178,7 @@ function buildFilterSignature(filters: EngagementFilters): string {
     types: [...filters.types].sort(),
     subscriber_did: filters.subscriberDid ?? null,
     include_other_subscriber_activity: filters.includeOtherSubscriberActivity,
+    feed_id: filters.feedId,
   }
   const json = JSON.stringify(normalized)
   return createHash('sha256').update(json).digest('hex')
@@ -1017,7 +1034,47 @@ export default function registerMonitorEndpoints(server: Server, ctx: AppContext
       return res.status(401).json({ error: 'Unauthorized' })
     }
 
-    const publisherDids = await resolvePublisherDids(db)
+    const feedId = typeof req.query?.feed_id === 'string' && req.query.feed_id.length > 0
+      ? req.query.feed_id
+      : null
+    if (req.query?.feed_id !== undefined && feedId === null) {
+      return res.status(400).json({ error: 'BadRequest', message: 'feed_id must be a non-empty string' })
+    }
+    let feedClock: EngagementExportFeedClock | null = null
+    if (feedId) {
+      try {
+        feedClock = await ctx.db
+          .selectFrom('feedgen_ops.feed_catalog')
+          .select([
+            'feed_id',
+            'publisher_did',
+            'publisher_time_clock',
+            'content_time_cutover_min_valid_share',
+            'content_time_contract_version',
+            'publisher_time_transition_expires_at',
+          ])
+          .where('feed_id', '=', feedId)
+          .where('enabled', '=', true)
+          .executeTakeFirst() ?? null
+      } catch (error) {
+        console.error('Error resolving compliance engagement feed clock:', error)
+        return res.status(503).json({ error: 'FeedClockUnavailable' })
+      }
+      if (!feedClock) {
+        return res.status(400).json({ error: 'BadRequest', message: 'feed_id must identify an enabled catalog feed' })
+      }
+      if (!feedClock.publisher_did) {
+        return res.status(503).json({ error: 'FeedClockUnavailable', message: 'feed catalog row has no publisher_did' })
+      }
+    }
+    const referenceMs = Date.now()
+    const explicitBounds = typeof req.query?.since === 'string' && typeof req.query?.until === 'string'
+    const contentTime = !responseSource && feedClock?.publisher_time_clock === 'content_time_v1'
+    const contractVersion = contentTime ? feedClock?.content_time_contract_version ?? null : null
+
+    const publisherDids = feedClock?.publisher_did
+      ? [feedClock.publisher_did]
+      : await resolvePublisherDids(db)
 
     const { since: defaultSince, until: defaultUntil } = getDefaultSinceUntil()
 
@@ -1138,6 +1195,7 @@ export default function registerMonitorEndpoints(server: Server, ctx: AppContext
         types,
         subscriberDid: subscriberDid ?? null,
         includeOtherSubscriberActivity,
+        feedId,
       }
       filterSig = buildFilterSignature(filters)
 
@@ -1188,7 +1246,12 @@ export default function registerMonitorEndpoints(server: Server, ctx: AppContext
     const otherOffset = useOtherCursor ? 0 : offset
     const otherEffectiveLimit = limit + 1
 
-    const buildBaseUnion = (requireSubscriberActors: boolean, targetMode: EngagementTargetMode) => {
+    const buildBaseUnion = (
+      requireSubscriberActors: boolean,
+      targetMode: EngagementTargetMode,
+      cohortMode: EngagementCohortMode = 'events',
+    ) => {
+      const validityCohort = cohortMode === 'validity'
       const engagementJoin = requireSubscriberActors
         ? sql`JOIN subscriber s_sub ON s_sub.did = e.author`
         : sql``
@@ -1219,6 +1282,21 @@ export default function registerMonitorEndpoints(server: Server, ctx: AppContext
             ? buildAtUriDidMembershipFilter(sql`p."rootUri"`, publisherDids, false)
             : sql<boolean>`true`
 
+      const engagementEventTime = contentTime ? sql`e.content_time_utc` : sql`e."createdAt"`
+      const postEventTime = contentTime ? sql`p.content_time_utc` : sql`p."createdAt"`
+      const engagementWindowTime = validityCohort ? sql`e."indexedAt"` : engagementEventTime
+      const postWindowTime = validityCohort ? sql`p."indexedAt"` : postEventTime
+      const engagementStatus = responseSource ? sql`'legacy_unknown'` : sql`e.content_time_status`
+      const postStatus = responseSource ? sql`'legacy_unknown'` : sql`p.content_time_status`
+      const engagementValidator = responseSource ? sql`NULL` : sql`e.content_time_validator_version`
+      const postValidator = responseSource ? sql`NULL` : sql`p.content_time_validator_version`
+      const engagementEligible = !contentTime || validityCohort
+        ? sql<boolean>`true`
+        : sql<boolean>`e.content_time_status = 'source_valid' AND e.content_time_validator_version = ${contractVersion}`
+      const postEligible = !contentTime || validityCohort
+        ? sql<boolean>`true`
+        : sql<boolean>`p.content_time_status = 'source_valid' AND p.content_time_validator_version = ${contractVersion}`
+
       const baseParts: Array<ReturnType<typeof sql>> = []
 
       if (engagementTypeCodes.length > 0) {
@@ -1233,13 +1311,17 @@ export default function registerMonitorEndpoints(server: Server, ctx: AppContext
             e.uri AS event_uri,
             e."subjectUri" AS subject_uri,
             e.author AS author_did,
-            e."createdAt" AS created_at,
+            ${engagementEventTime} AS created_at,
+            e."indexedAt" AS indexed_at,
+            ${engagementStatus} AS content_time_status,
+            ${engagementValidator} AS content_time_validator_version,
             (${subscriberActorExpr(sql`e.author`)}) AS is_subscriber_actor
           FROM engagement e
           ${engagementJoin}
           WHERE
-            e."createdAt" >= ${since}
-            AND e."createdAt" < ${until}
+            (${engagementEligible})
+            AND (${engagementWindowTime})::timestamptz >= ${since}::timestamptz
+            AND (${engagementWindowTime})::timestamptz < ${until}::timestamptz
             AND e.type in (${sql.join(engagementTypeCodes)})
             AND (${engagementAuthorFilter})
             AND (${engagementTargetFilter})
@@ -1253,14 +1335,18 @@ export default function registerMonitorEndpoints(server: Server, ctx: AppContext
             p.uri AS event_uri,
             p."rootUri" AS subject_uri,
             p.author AS author_did,
-            p."createdAt" AS created_at,
+            ${postEventTime} AS created_at,
+            p."indexedAt" AS indexed_at,
+            ${postStatus} AS content_time_status,
+            ${postValidator} AS content_time_validator_version,
             (${subscriberActorExpr(sql`p.author`)}) AS is_subscriber_actor
           FROM post p
           ${postJoin}
           WHERE
             p."rootUri" != ''
-            AND p."createdAt" >= ${since}
-            AND p."createdAt" < ${until}
+            AND (${postEligible})
+            AND (${postWindowTime})::timestamptz >= ${since}::timestamptz
+            AND (${postWindowTime})::timestamptz < ${until}::timestamptz
             AND (${postAuthorFilter})
             AND (${postTargetFilter})
         `)
@@ -1274,6 +1360,9 @@ export default function registerMonitorEndpoints(server: Server, ctx: AppContext
             '' AS subject_uri,
             '' AS author_did,
             '' AS created_at,
+            '' AS indexed_at,
+            'legacy_unknown' AS content_time_status,
+            NULL AS content_time_validator_version,
             false AS is_subscriber_actor
           WHERE false
         `
@@ -1284,18 +1373,20 @@ export default function registerMonitorEndpoints(server: Server, ctx: AppContext
       return sql.join(baseParts, sql` UNION ALL `)
     }
 
-    const mainBaseUnion =
+    const buildScopedBaseUnion = (cohortMode: EngagementCohortMode) =>
       scope === 'publisher'
-        ? buildBaseUnion(Boolean(subscriberDid), 'publisher')
+        ? buildBaseUnion(Boolean(subscriberDid), 'publisher', cohortMode)
         : scope === 'subscriber'
-          ? buildBaseUnion(true, 'any')
+          ? buildBaseUnion(true, 'any', cohortMode)
           : scope === 'subscriber_on_publisher'
-            ? buildBaseUnion(true, 'publisher')
+            ? buildBaseUnion(true, 'publisher', cohortMode)
             : sql`
-                ${buildBaseUnion(Boolean(subscriberDid), 'publisher')}
+                ${buildBaseUnion(Boolean(subscriberDid), 'publisher', cohortMode)}
                 UNION ALL
-                ${buildBaseUnion(true, 'any')}
+                ${buildBaseUnion(true, 'any', cohortMode)}
               `
+    const mainBaseUnion = buildScopedBaseUnion('events')
+    const validityBaseUnion = buildScopedBaseUnion('validity')
     const mainScopeFilter = sql<boolean>`true`
     const otherBaseUnion = buildBaseUnion(true, 'non_publisher')
     const otherScopeFilter = sql<boolean>`true`
@@ -1315,6 +1406,9 @@ export default function registerMonitorEndpoints(server: Server, ctx: AppContext
             b.subject_uri,
             b.author_did,
             b.created_at,
+            b.indexed_at,
+            b.content_time_status,
+            b.content_time_validator_version,
             (${publisherTargetExpr}) AS is_publisher_target,
             b.is_subscriber_actor,
             CASE b.type
@@ -1347,7 +1441,10 @@ export default function registerMonitorEndpoints(server: Server, ctx: AppContext
             event_uri,
             subject_uri,
             author_did,
-            created_at
+            created_at,
+            indexed_at,
+            content_time_status,
+            content_time_validator_version
           FROM scoped
           ORDER BY event_uri, created_at DESC, type_rank DESC
         )
@@ -1357,6 +1454,9 @@ export default function registerMonitorEndpoints(server: Server, ctx: AppContext
           d.subject_uri,
           d.author_did,
           d.created_at,
+          d.indexed_at,
+          d.content_time_status,
+          d.content_time_validator_version,
           a.comment_root_uri,
           a.quote_subject_uri,
           COALESCE(a.publisher_target_any, false) AS publisher_target_any,
@@ -1383,6 +1483,65 @@ export default function registerMonitorEndpoints(server: Server, ctx: AppContext
         }
       }
 
+      let validity = {
+        numerator: 0,
+        denominator: 0,
+        source_invalid: 0,
+        legacy_unknown: 0,
+        validator_version_mismatch: 0,
+      }
+      if (!responseSource && feedClock) {
+        const result = await sql<{
+          numerator: number | string
+          denominator: number | string
+          source_invalid: number | string
+          legacy_unknown: number | string
+          validator_version_mismatch: number | string
+        }>`
+          WITH base AS (${validityBaseUnion}), candidates AS (
+            SELECT DISTINCT ON (event_uri)
+              event_uri, content_time_status, content_time_validator_version
+            FROM base
+            ORDER BY event_uri
+          )
+          SELECT
+            COUNT(*) FILTER (
+              WHERE content_time_status = 'source_valid'
+                AND content_time_validator_version = ${contractVersion}
+            ) AS numerator,
+            COUNT(*) AS denominator,
+            COUNT(*) FILTER (WHERE content_time_status = 'source_invalid') AS source_invalid,
+            COUNT(*) FILTER (WHERE content_time_status = 'legacy_unknown' OR content_time_status IS NULL) AS legacy_unknown,
+            COUNT(*) FILTER (
+              WHERE content_time_status = 'source_valid'
+                AND content_time_validator_version IS DISTINCT FROM ${contractVersion}
+            ) AS validator_version_mismatch
+          FROM candidates
+        `.execute(db)
+        const counts = result.rows[0]
+        validity = {
+          numerator: normalizeCount(counts?.numerator),
+          denominator: normalizeCount(counts?.denominator),
+          source_invalid: normalizeCount(counts?.source_invalid),
+          legacy_unknown: normalizeCount(counts?.legacy_unknown),
+          validator_version_mismatch: normalizeCount(counts?.validator_version_mismatch),
+        }
+      }
+      const minimumValidShare = typeof feedClock?.content_time_cutover_min_valid_share === 'number'
+        ? feedClock.content_time_cutover_min_valid_share
+        : NaN
+      const { observedValidShare, scienceEligible } = assessEngagementScienceEligibility({
+        contentTime,
+        explicitBounds,
+        contractVersion,
+        expectedContractVersion: CONTENT_TIME_VALIDATOR_VERSION,
+        transitionExpiresAt: feedClock?.publisher_time_transition_expires_at ?? null,
+        referenceMs,
+        minimumValidShare,
+        numerator: validity.numerator,
+        denominator: validity.denominator,
+      })
+
       const response: any = {
         since,
         until,
@@ -1391,6 +1550,18 @@ export default function registerMonitorEndpoints(server: Server, ctx: AppContext
         limit,
         count: events.length,
         events,
+        feed_id: feedClock?.feed_id ?? null,
+        science_eligible: scienceEligible,
+        time_clock: contentTime ? 'content_time_v1' : 'receipt_time',
+        content_time_contract_version: contractVersion,
+        publisher_time_transition_expires_at: feedClock?.publisher_time_transition_expires_at ?? null,
+        validity: {
+          ...validity,
+          observed_valid_share: observedValidShare,
+          minimum_valid_share: Number.isFinite(minimumValidShare) ? minimumValidShare : null,
+          denominator_clock: 'receipt_time',
+          denominator_bounds: '[since,until)',
+        },
       }
       if (nextCursor) {
         response.next_cursor = nextCursor
@@ -1420,6 +1591,9 @@ export default function registerMonitorEndpoints(server: Server, ctx: AppContext
               b.subject_uri,
               b.author_did,
               b.created_at,
+              b.indexed_at,
+              b.content_time_status,
+              b.content_time_validator_version,
               (${publisherTargetExpr}) AS is_publisher_target,
               b.is_subscriber_actor,
               CASE b.type
@@ -1452,7 +1626,10 @@ export default function registerMonitorEndpoints(server: Server, ctx: AppContext
               event_uri,
               subject_uri,
               author_did,
-              created_at
+              created_at,
+              indexed_at,
+              content_time_status,
+              content_time_validator_version
             FROM scoped
             ORDER BY event_uri, created_at DESC, type_rank DESC
           )
@@ -1462,6 +1639,9 @@ export default function registerMonitorEndpoints(server: Server, ctx: AppContext
             d.subject_uri,
             d.author_did,
             d.created_at,
+            d.indexed_at,
+            d.content_time_status,
+            d.content_time_validator_version,
             a.comment_root_uri,
             a.quote_subject_uri,
             COALESCE(a.publisher_target_any, false) AS publisher_target_any,
