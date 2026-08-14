@@ -8,6 +8,7 @@ const ENGAGEMENT_TYPE_REPOST = 1
 const ENGAGEMENT_TYPE_LIKE = 2
 const ENGAGEMENT_TYPE_QUOTE = 3
 const FOLLOWED_AUTHOR_CHUNK_SIZE = 1000
+const AGGREGATION_URI_CHUNK_SIZE = 1000
 
 type RefreshCatalogRow = {
   rkey: string
@@ -109,11 +110,15 @@ export async function updateEngagement(db: Database, referenceMs = Date.now()): 
     // Postgres supports at most 65535 bind params. Kysely binds one param per array element for `IN (...)`.
     // Chunk large URI lists to avoid protocol errors at scale.
     const IN_CLAUSE_CHUNK_SIZE = 5000;
-    const execInChunks = async <T>(items: string[], fn: (chunk: string[]) => Promise<T[]>): Promise<T[]> => {
+    const execInChunks = async <T>(items: string[], chunkSize: number, stage: string, fn: (chunk: string[]) => Promise<T[]>): Promise<T[]> => {
       const results: T[] = [];
-      for (let i = 0; i < items.length; i += IN_CLAUSE_CHUNK_SIZE) {
-        const chunk = items.slice(i, i + IN_CLAUSE_CHUNK_SIZE);
+      const totalBatches = Math.ceil(items.length / chunkSize)
+      for (let i = 0; i < items.length; i += chunkSize) {
+        const chunk = items.slice(i, i + chunkSize);
+        const batch = Math.floor(i / chunkSize) + 1
+        console.log(JSON.stringify({ event: 'engagement_refresh_batch_start', stage, batch, total_batches: totalBatches, uri_count: chunk.length }))
         results.push(...(await fn(chunk)));
+        console.log(JSON.stringify({ event: 'engagement_refresh_batch_complete', stage, batch, total_batches: totalBatches, uri_count: chunk.length }))
       }
       return results;
     };
@@ -165,118 +170,47 @@ export async function updateEngagement(db: Database, referenceMs = Date.now()): 
 
     console.log(`[${new Date().toISOString()}] - Found ${postUris.length} posts to update engagement stats for (${publisherPostUris.length} from publishers, ${otherPostUris.length} from others).`);
 
-    // Count likes for each post
-    // For other posts: count all engagement
-    const otherLikesResult = otherPostUris.length > 0
-      ? await execInChunks(otherPostUris, async (chunk) => {
+    // Count reactions for other posts from all authors.
+    const otherReactionCounts = otherPostUris.length > 0
+      ? await execInChunks(otherPostUris, AGGREGATION_URI_CHUNK_SIZE, 'reactions_other', async (chunk) => {
         return db
           .selectFrom('engagement')
           .where('engagement.subjectUri', 'in', chunk)
-          .where('engagement.type', '=', ENGAGEMENT_TYPE_LIKE)
+          .where('engagement.type', 'in', [ENGAGEMENT_TYPE_REPOST, ENGAGEMENT_TYPE_LIKE, ENGAGEMENT_TYPE_QUOTE])
           .select([
             'engagement.subjectUri as uri',
+            'engagement.type',
             db.fn.count<number>('uri').as('count')
           ])
-          .groupBy('engagement.subjectUri')
+          .groupBy(['engagement.subjectUri', 'engagement.type'])
           .execute();
       })
       : [];
 
-    // For publisher posts: only count engagement from subscribers
-    const publisherLikesResult = (publisherPostUris.length > 0 && subscriberDids.length > 0)
-      ? await execInChunks(publisherPostUris, async (chunk) => {
-        return db
-          .selectFrom('engagement')
-          .where('engagement.subjectUri', 'in', chunk)
-          .where('engagement.author', 'in', subscriberDids)
-          .where('engagement.type', '=', ENGAGEMENT_TYPE_LIKE)
-          .select([
-            'engagement.subjectUri as uri',
-            db.fn.count<number>('uri').as('count')
-          ])
-          .groupBy('engagement.subjectUri')
-          .execute();
-      })
-      : [];
-
-    const likeCountsResult = [...otherLikesResult, ...publisherLikesResult];
-
-    // Count reposts for each post
-    // For other posts: count all engagement
-    const otherRepostsResult = otherPostUris.length > 0
-      ? await execInChunks(otherPostUris, async (chunk) => {
-        return db
-          .selectFrom('engagement')
-          .where('engagement.subjectUri', 'in', chunk)
-          .where('engagement.type', '=', ENGAGEMENT_TYPE_REPOST)
-          .select([
-            'engagement.subjectUri as uri',
-            db.fn.count<number>('uri').as('count')
-          ])
-          .groupBy('engagement.subjectUri')
-          .execute();
-      })
-      : [];
-
-    // For publisher posts: only count engagement from subscribers
-    const publisherRepostsResult = (publisherPostUris.length > 0 && subscriberDids.length > 0)
-      ? await execInChunks(publisherPostUris, async (chunk) => {
+    // For publisher posts, count reactions only from subscribers.
+    const publisherReactionCounts = (publisherPostUris.length > 0 && subscriberDids.length > 0)
+      ? await execInChunks(publisherPostUris, AGGREGATION_URI_CHUNK_SIZE, 'reactions_publisher', async (chunk) => {
         return db
           .selectFrom('engagement')
           .where('engagement.subjectUri', 'in', chunk)
           .where('engagement.author', 'in', subscriberDids)
-          .where('engagement.type', '=', ENGAGEMENT_TYPE_REPOST)
+          .where('engagement.type', 'in', [ENGAGEMENT_TYPE_REPOST, ENGAGEMENT_TYPE_LIKE, ENGAGEMENT_TYPE_QUOTE])
           .select([
             'engagement.subjectUri as uri',
+            'engagement.type',
             db.fn.count<number>('uri').as('count')
           ])
-          .groupBy('engagement.subjectUri')
+          .groupBy(['engagement.subjectUri', 'engagement.type'])
           .execute();
       })
       : [];
 
-    const repostCountsResult = [...otherRepostsResult, ...publisherRepostsResult];
-
-    // Count quotes for each post
-    // For other posts: count all engagement
-    const otherQuotesResult = otherPostUris.length > 0
-      ? await execInChunks(otherPostUris, async (chunk) => {
-        return db
-          .selectFrom('engagement')
-          .where('engagement.subjectUri', 'in', chunk)
-          .where('engagement.type', '=', ENGAGEMENT_TYPE_QUOTE)
-          .select([
-            'engagement.subjectUri as uri',
-            db.fn.count<number>('uri').as('count')
-          ])
-          .groupBy('engagement.subjectUri')
-          .execute();
-      })
-      : [];
-
-    // For publisher posts: only count engagement from subscribers
-    const publisherQuotesResult = (publisherPostUris.length > 0 && subscriberDids.length > 0)
-      ? await execInChunks(publisherPostUris, async (chunk) => {
-        return db
-          .selectFrom('engagement')
-          .where('engagement.subjectUri', 'in', chunk)
-          .where('engagement.author', 'in', subscriberDids)
-          .where('engagement.type', '=', ENGAGEMENT_TYPE_QUOTE)
-          .select([
-            'engagement.subjectUri as uri',
-            db.fn.count<number>('uri').as('count')
-          ])
-          .groupBy('engagement.subjectUri')
-          .execute();
-      })
-      : [];
-
-    const quoteCountsResult = [...otherQuotesResult, ...publisherQuotesResult];
+    const reactionCounts = [...otherReactionCounts, ...publisherReactionCounts]
 
     // Count comments for each post (comments are posts with rootUri pointing to the original post)
     // For other posts: count all comments
     const otherCommentsResult = otherPostUris.length > 0
-      ? await execInChunks(otherPostUris, async (chunk) => {
+      ? await execInChunks(otherPostUris, IN_CLAUSE_CHUNK_SIZE, 'comments_other', async (chunk) => {
         return db
           .selectFrom('post as comments')
           .where('comments.rootUri', 'in', chunk)
@@ -292,7 +226,7 @@ export async function updateEngagement(db: Database, referenceMs = Date.now()): 
 
     // For publisher posts: only count comments from subscribers
     const publisherCommentsResult = (publisherPostUris.length > 0 && subscriberDids.length > 0)
-      ? await execInChunks(publisherPostUris, async (chunk) => {
+      ? await execInChunks(publisherPostUris, IN_CLAUSE_CHUNK_SIZE, 'comments_publisher', async (chunk) => {
         return db
           .selectFrom('post as comments')
           .where('comments.rootUri', 'in', chunk)
@@ -310,20 +244,17 @@ export async function updateEngagement(db: Database, referenceMs = Date.now()): 
     const commentCountsResult = [...otherCommentsResult, ...publisherCommentsResult];
 
     // Create maps for quick lookups
-    const likesMap = new Map(
-      likeCountsResult.map(result => [result.uri, Number(result.count)])
-    );
-
-    const repostsMap = new Map(
-      repostCountsResult.map(result => [result.uri, Number(result.count)])
-    );
+    const likesMap = new Map<string, number>();
+    const repostsMap = new Map<string, number>();
+    const quotesMap = new Map<string, number>();
+    for (const result of reactionCounts) {
+      if (result.type === ENGAGEMENT_TYPE_LIKE) likesMap.set(result.uri, Number(result.count))
+      if (result.type === ENGAGEMENT_TYPE_REPOST) repostsMap.set(result.uri, Number(result.count))
+      if (result.type === ENGAGEMENT_TYPE_QUOTE) quotesMap.set(result.uri, Number(result.count))
+    }
 
     const commentsMap = new Map(
       commentCountsResult.map(result => [result.uri, Number(result.count)])
-    );
-
-    const quotesMap = new Map(
-      quoteCountsResult.map(result => [result.uri, Number(result.count)])
     );
 
     // Update posts with counts
