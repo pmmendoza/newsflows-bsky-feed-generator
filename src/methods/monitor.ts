@@ -1296,6 +1296,12 @@ export default function registerMonitorEndpoints(server: Server, ctx: AppContext
       const postEligible = !contentTime || validityCohort
         ? sql<boolean>`true`
         : sql<boolean>`p.content_time_status = 'source_valid' AND p.content_time_validator_version = ${contractVersion}`
+      const engagementWindowFilter = validityCohort || !contentTime
+        ? sql<boolean>`${engagementWindowTime} >= ${since} AND ${engagementWindowTime} < ${until}`
+        : sql<boolean>`(${engagementWindowTime})::timestamptz >= ${since}::timestamptz AND (${engagementWindowTime})::timestamptz < ${until}::timestamptz`
+      const postWindowFilter = validityCohort || !contentTime
+        ? sql<boolean>`${postWindowTime} >= ${since} AND ${postWindowTime} < ${until}`
+        : sql<boolean>`(${postWindowTime})::timestamptz >= ${since}::timestamptz AND (${postWindowTime})::timestamptz < ${until}::timestamptz`
 
       const baseParts: Array<ReturnType<typeof sql>> = []
 
@@ -1320,8 +1326,7 @@ export default function registerMonitorEndpoints(server: Server, ctx: AppContext
           ${engagementJoin}
           WHERE
             (${engagementEligible})
-            AND (${engagementWindowTime})::timestamptz >= ${since}::timestamptz
-            AND (${engagementWindowTime})::timestamptz < ${until}::timestamptz
+            AND (${engagementWindowFilter})
             AND e.type in (${sql.join(engagementTypeCodes)})
             AND (${engagementAuthorFilter})
             AND (${engagementTargetFilter})
@@ -1345,8 +1350,7 @@ export default function registerMonitorEndpoints(server: Server, ctx: AppContext
           WHERE
             p."rootUri" != ''
             AND (${postEligible})
-            AND (${postWindowTime})::timestamptz >= ${since}::timestamptz
-            AND (${postWindowTime})::timestamptz < ${until}::timestamptz
+            AND (${postWindowFilter})
             AND (${postAuthorFilter})
             AND (${postTargetFilter})
         `)
