@@ -19,7 +19,13 @@ const atHoursAgo = (hours: number) => new Date(referenceMs - hours * 3_600_000).
 const atDaysAgo = (days: number) => atHoursAgo(days * 24)
 
 async function main() {
-  const db = new Kysely<any>({ dialect: new PostgresDialect({ pool: new Pool({ connectionString: dsn }) }) })
+  const queries: Array<{ sql: string, parameters: readonly unknown[] }> = []
+  const db = new Kysely<any>({
+    dialect: new PostgresDialect({ pool: new Pool({ connectionString: dsn }) }),
+    log(event) {
+      if (event.level === 'query') queries.push(event.query)
+    },
+  })
   const priorEngagementTimeHours = process.env.ENGAGEMENT_TIME_HOURS
   process.env.ENGAGEMENT_TIME_HOURS = '48'
   try {
@@ -52,9 +58,10 @@ async function main() {
       `.execute(trx)
       await sql`CREATE INDEX idx_post_indexedat ON post ("indexedAt")`.execute(trx)
       await sql`CREATE INDEX post_author_index ON post (author)`.execute(trx)
-      await sql`INSERT INTO follows SELECT 'did:sub', 'did:follow-' || n FROM generate_series(1, 50000) AS n`.execute(trx)
+      await sql`INSERT INTO follows SELECT 'did:sub', 'did:follow-' || n FROM generate_series(1, 1999) AS n`.execute(trx)
       await sql`INSERT INTO follows VALUES ('did:sub', 'did:publisher-receipt')`.execute(trx)
       await sql`INSERT INTO follows VALUES ('did:sub', 'did:publisher-all-active')`.execute(trx)
+      await sql`INSERT INTO follows VALUES ('did:sub', 'did:follow-1')`.execute(trx)
       await sql`
         INSERT INTO feedgen_ops.feed_catalog VALUES
           ('engagement-receipt', 'did:publisher-receipt', 3, 'receipt_time', true, 'engagement-sorted'),
@@ -68,6 +75,7 @@ async function main() {
         VALUES (${uri}, 'cid', ${indexedAt}, ${indexedAt}, ${author}, '', ${rootUri}, '', '', '', '', ${contentTime}, ${contentStatus})
       `.execute(trx)
       await insertPost('at://follow/recent', 'did:follow-1', atHoursAgo(47))
+      await insertPost('at://follow/boundary', 'did:follow-3', atHoursAgo(48))
       await insertPost('at://publisher/receipt', 'did:publisher-receipt', atDaysAgo(2))
       await insertPost('at://publisher/content', 'did:publisher-content', atDaysAgo(12), atDaysAgo(9), 'source_valid')
       await insertPost('at://follow/expired', 'did:follow-2', atHoursAgo(49))
@@ -91,17 +99,24 @@ async function main() {
       assert.equal(plan.receiptDays, 3, 'chronological-only publisher must not widen the cached publisher plan')
       const followedCutoff = cutoffFromHours(referenceMs, resolveEngagementTimeHours())
       assert.equal(followedCutoff, atHoursAgo(48))
-      const followedSql = selectRecentFollowedPosts(trx as any, followedCutoff).compile().sql.toLowerCase()
-      assert.match(followedSql, /post\.author\s*=\s*any\s*\(\s*array\s*\(\s*select\s+f\.follows\s+from\s+follows\s+as\s+f\s*\)\s*\)/)
-      assert.doesNotMatch(followedSql, /exists\s*\(/)
-      assert.deepEqual(selectRecentFollowedPosts(trx as any, followedCutoff).compile().parameters, [followedCutoff])
-      const followed = await selectRecentFollowedPosts(trx as any, followedCutoff).execute()
+      queries.length = 0
+      const followed = await selectRecentFollowedPosts(trx as any, followedCutoff)
+      const followedAuthorQueries = queries.filter((query) => /select distinct "follows" from "follows"/i.test(query.sql))
+      const followedPostQueries = queries.filter((query) => /select "post"\."uri", "post"\."author" from "post"/i.test(query.sql))
+      assert.equal(followedAuthorQueries.length, 1, 'followed authors must be selected once')
+      assert.equal(followedPostQueries.length, 3, '2,001 distinct authors must use three sequential post selects')
+      for (const query of followedPostQueries) {
+        assert.doesNotMatch(query.sql, /exists\s*\(|\bany\s*\(/i)
+        assert.match(query.sql, /"post"\."author" in \(/i)
+        assert.equal(query.parameters[0], followedCutoff)
+        assert.ok(query.parameters.length - 1 <= 1000, 'each post select must bind at most 1,000 authors')
+      }
       const receipt = await selectRecentPublisherPosts(trx as any, ['did:publisher-receipt'], 'receipt_time', plan.receiptCutoff)!.execute()
       const selected = await selectEngagementRefreshPosts(trx as any, plan, referenceMs)
-      assert.deepEqual(followed.map((row) => row.uri).sort(), ['at://follow/recent', 'at://publisher/all-active', 'at://publisher/receipt'])
+      assert.deepEqual(followed.map((row) => row.uri).sort(), ['at://follow/boundary', 'at://follow/recent', 'at://publisher/all-active', 'at://publisher/receipt'])
       assert.deepEqual(receipt.map((row) => row.uri), ['at://publisher/receipt'])
       assert.deepEqual(selected.map((row) => row.uri).sort(), [
-        'at://follow/recent', 'at://publisher/all-active', 'at://publisher/content', 'at://publisher/receipt', 'at://ranker/eligible',
+        'at://follow/boundary', 'at://follow/recent', 'at://publisher/all-active', 'at://publisher/content', 'at://publisher/receipt', 'at://ranker/eligible',
       ])
 
       await updateEngagement(trx as any, referenceMs)
