@@ -8,8 +8,8 @@
  */
 import { Kysely, PostgresDialect, sql } from 'kysely'
 import { Pool } from 'pg'
-import { buildFeed } from '../src/algos/feed-builder'
-import { pickPolicy, Policy } from '../src/algos/make-handler'
+import { invalidateDispatchCache, resolveDynamicHandler } from '../src/algos/catalog-dispatch'
+import { Policy } from '../src/algos/make-handler'
 import { refreshScoreSourceCache } from '../src/util/score-source-cache'
 
 const REQUESTER = 'did:plc:pagination-requester'
@@ -30,18 +30,14 @@ function check(condition: unknown, message: string): asserts condition {
   if (!condition) throw new Error(message)
 }
 
-async function serve(db: any, rkey: string, policy: Policy, cursor?: string, publisherDid = PUBLISHER) {
-  const { buildPublisher, buildFollows } = pickPolicy(policy, publisherDid, rkey)
-  return buildFeed({
-    shortname: rkey,
-    ctx: { db } as any,
-    params: { feed: '', limit: 3, cursor } as any,
-    requesterDid: REQUESTER,
-    buildPublisherQuery: buildPublisher,
-    buildFollowsQuery: buildFollows,
-    publisherPostMaxAgeDays: 1,
-    publisherPostMaxAgeSource: 'feed_override',
-  })
+async function serve(db: any, rkey: string, cursor?: string, publisherDid?: string) {
+  if (publisherDid) {
+    await db.updateTable('feedgen_ops.feed_catalog' as any).set({ publisher_did: publisherDid }).where('rkey', '=', rkey).execute()
+  }
+  invalidateDispatchCache(rkey)
+  const handler = await resolveDynamicHandler(db, rkey)
+  check(handler, `${rkey}: active catalog handler must resolve`)
+  return handler({ db } as any, { feed: '', limit: 3, cursor } as any, REQUESTER)
 }
 
 async function bootstrap(db: any, prefix: string) {
@@ -57,7 +53,13 @@ async function bootstrap(db: any, prefix: string) {
   await sql`CREATE TABLE IF NOT EXISTS follows (subject text NOT NULL, follows text NOT NULL)`.execute(db)
   await sql`
     CREATE TABLE IF NOT EXISTS feedgen_ops.feed_catalog (
-      rkey text PRIMARY KEY, feed_id text NOT NULL, ranker_score_source text
+      rkey text PRIMARY KEY, feed_id text NOT NULL, publisher_did text NOT NULL,
+      algo_policy_id text NOT NULL, enabled boolean NOT NULL,
+      publisher_post_max_age_days integer, publisher_post_max_age_source text,
+      publisher_time_clock text, ranker_score_max_age_hours integer,
+      ranker_score_max_age_source text, ranker_min_score_backed_share double precision,
+      ranker_min_score_backed_source text, catalog_revision integer,
+      ranker_score_source text
     )
   `.execute(db)
   await sql`
@@ -80,7 +82,15 @@ async function bootstrap(db: any, prefix: string) {
   ]
   await db.insertInto('follows').values({ subject: REQUESTER, follows: FOLLOWED }).execute()
   await db.insertInto('feedgen_ops.feed_catalog' as any)
-    .values(policyCases.map(({ rkey }) => ({ rkey, feed_id: rkey, ranker_score_source: null }))).execute()
+    .values(policyCases.map(({ rkey, policy }) => ({
+      rkey, feed_id: rkey, publisher_did: PUBLISHER, algo_policy_id: policy, enabled: true,
+      publisher_post_max_age_days: 1, publisher_post_max_age_source: 'feed_override',
+      publisher_time_clock: 'receipt_time', ranker_score_max_age_hours: policy === 'ranker-priority' ? 24 : null,
+      ranker_score_max_age_source: policy === 'ranker-priority' ? 'feed_override' : null,
+      ranker_min_score_backed_share: policy === 'ranker-priority' ? 0.8 : null,
+      ranker_min_score_backed_source: policy === 'ranker-priority' ? 'feed_override' : null,
+      catalog_revision: 1, ranker_score_source: null,
+    }))).execute()
   await refreshScoreSourceCache(db)
   await db.insertInto('post').values(rows.map((row) => ({ ...row, indexedAt: now, createdAt: now }))).execute()
   await db.insertInto('ranker_prod.post_political_eligibility' as any)
@@ -90,11 +100,11 @@ async function bootstrap(db: any, prefix: string) {
   return { publisherUris, followedUris }
 }
 
-async function assertThreePages(db: any, rkey: string, policy: Policy, publisherUris: string[], followedUris: string[]) {
+async function assertThreePages(db: any, rkey: string, publisherUris: string[], followedUris: string[]) {
   let cursor: string | undefined
   const served: string[] = []
   for (let page = 0; page < 3; page += 1) {
-    const result = await serve(db, rkey, policy, cursor)
+    const result = await serve(db, rkey, cursor)
     const posts = result.feed.map((item) => item.post)
     const expected = [publisherUris[2 - page], followedUris[5 - page * 2], followedUris[4 - page * 2]]
     check(posts.join(',') === expected.join(','), `${rkey}: equal timestamps must order page ${page + 1} by deterministic tie-breakers`)
@@ -104,11 +114,11 @@ async function assertThreePages(db: any, rkey: string, policy: Policy, publisher
   }
   check(new Set(served).size === served.length, `${rkey}: three pages must not duplicate URIs`)
   check(served.length === 9, `${rkey}: three pages must not skip URIs`)
-  const legacy = await serve(db, rkey, policy, '2')
+  const legacy = await serve(db, rkey, '2')
   check(legacy.feed.map((item) => item.post).join(',') === served.slice(3, 6).join(','), `${rkey}: legacy integer cursor must select page two`)
 }
 
-async function assertExhaustion(db: any, rkey: string, policy: Policy) {
+async function assertExhaustion(db: any, rkey: string) {
   const publisher = `${PUBLISHER}-${rkey}`
   const followed = `${FOLLOWED}-${rkey}`
   const now = new Date(Date.now() - 60 * 60 * 1000).toISOString()
@@ -125,22 +135,22 @@ async function assertExhaustion(db: any, rkey: string, policy: Policy) {
   await db.deleteFrom('post').where('author', '=', followed).execute()
   let cursor: string | undefined
   for (let page = 0; page < 3; page += 1) {
-    const result = await serve(db, rkey, policy, cursor, publisher)
+    const result = await serve(db, rkey, cursor, publisher)
     check(result.feed.length === 1, `publisher-only leg must serve page ${page + 1}`)
     cursor = result.cursor
   }
-  const publisherTerminal = await serve(db, rkey, policy, cursor, publisher)
+  const publisherTerminal = await serve(db, rkey, cursor, publisher)
   check(publisherTerminal.feed.length === 0 && publisherTerminal.cursor === undefined, 'publisher-only exhaustion must terminate without a cursor')
 
   await db.deleteFrom('post').where('author', '=', publisher).execute()
   await db.insertInto('post').values(followedRows).execute()
   cursor = undefined
   for (let page = 0; page < 3; page += 1) {
-    const result = await serve(db, rkey, policy, cursor, publisher)
+    const result = await serve(db, rkey, cursor, publisher)
     check(result.feed.length === 2, `followed-only leg must serve page ${page + 1}`)
     cursor = result.cursor
   }
-  const terminal = await serve(db, rkey, policy, cursor, publisher)
+  const terminal = await serve(db, rkey, cursor, publisher)
   check(terminal.feed.length === 0 && terminal.cursor === undefined, 'followed-only exhaustion must terminate without a cursor')
 }
 
@@ -156,8 +166,8 @@ async function main() {
   try {
     await db.transaction().execute(async (trx) => {
       const fixture = await bootstrap(trx, `at://pagination-${process.pid}-${Date.now()}`)
-      for (const testCase of policyCases) await assertThreePages(trx, testCase.rkey, testCase.policy, fixture.publisherUris, fixture.followedUris)
-      for (const testCase of policyCases) await assertExhaustion(trx, testCase.rkey, testCase.policy)
+      for (const testCase of policyCases) await assertThreePages(trx, testCase.rkey, fixture.publisherUris, fixture.followedUris)
+      for (const testCase of policyCases) await assertExhaustion(trx, testCase.rkey)
       throw new Error('__ROLLBACK_PAGINATION_FIXTURE__')
     })
   } catch (error) {
