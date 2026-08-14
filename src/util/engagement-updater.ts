@@ -1,5 +1,8 @@
 import { Database } from '../db';
 import { sql } from 'kysely';
+import { cutoffFromHours } from '../algos/publisher-serving-window'
+import { resolveEngagementTimeHours } from '../algos/feed-builder'
+import { resolvePublisherDids } from './publisher-dids'
 
 const ENGAGEMENT_TYPE_REPOST = 1
 const ENGAGEMENT_TYPE_LIKE = 2
@@ -27,7 +30,7 @@ export function deriveEngagementRefreshPlan(rows: RefreshCatalogRow[], reference
   )
   const receiptPublisherRows = rows.filter((row) => row.publisher_time_clock === 'receipt_time')
   const contentPublisherRows = rows.filter((row) => row.publisher_time_clock === 'content_time_v1')
-  const receiptDays = maxDays(rows)
+  const receiptDays = maxDays(receiptPublisherRows)
   const contentDays = maxDays(contentPublisherRows)
   return {
     receiptPublisherRows,
@@ -39,13 +42,66 @@ export function deriveEngagementRefreshPlan(rows: RefreshCatalogRow[], reference
   }
 }
 
+export function selectRecentFollowedPosts(db: Database, cutoff: string) {
+  return db
+    .selectFrom('post')
+    .select(['post.uri', 'post.author'])
+    .where('post.indexedAt', '>=', cutoff)
+    .where((eb) => eb.exists(
+      eb.selectFrom('follows')
+        .select('follows.follows')
+        .whereRef('follows.follows', '=', 'post.author'),
+    ))
+}
+
+export function selectRecentPublisherPosts(
+  db: Database,
+  publishers: string[],
+  clock: 'receipt_time' | 'content_time_v1',
+  cutoff: string | null,
+) {
+  if (publishers.length === 0 || cutoff === null) return null
+  let query = db.selectFrom('post').where('post.author', 'in', publishers)
+  query = clock === 'content_time_v1'
+    ? query.where('post.content_time_status', '=', 'source_valid').where('post.content_time_utc', '>=', cutoff)
+    : query.where('post.indexedAt', '>=', cutoff)
+  return query.select(['post.uri', 'post.author'])
+}
+
+export async function selectEngagementRefreshPosts(
+  db: Database,
+  refreshPlan: ReturnType<typeof deriveEngagementRefreshPlan>,
+  referenceMs: number,
+) {
+  const followedCutoff = cutoffFromHours(referenceMs, resolveEngagementTimeHours())
+  const receiptPublisherQuery = selectRecentPublisherPosts(
+    db,
+    refreshPlan.receiptPublisherRows.map((row) => String(row.publisher_did)),
+    'receipt_time',
+    refreshPlan.receiptCutoff,
+  )
+  const contentPublisherQuery = selectRecentPublisherPosts(
+    db,
+    refreshPlan.contentPublisherRows.map((row) => String(row.publisher_did)),
+    'content_time_v1',
+    refreshPlan.contentCutoff,
+  )
+  const [followedPosts, receiptPosts, contentPosts] = await Promise.all([
+    selectRecentFollowedPosts(db, followedCutoff).execute(),
+    receiptPublisherQuery?.execute() ?? [],
+    contentPublisherQuery?.execute() ?? [],
+  ])
+  return [...new Map(
+    [...followedPosts, ...receiptPosts, ...contentPosts].map((post) => [post.uri, post]),
+  ).values()]
+}
+
 /**
  * Updates engagement counts (likes, reposts, comments) for recent posts
  * For publisher posts (from newsbots), only counts engagement from subscribers
  * For other posts, counts all engagement
  */
-export async function updateEngagement(db: Database): Promise<void> {
-  const referenceMs = Date.now()
+export async function updateEngagement(db: Database, referenceMs = Date.now()): Promise<void> {
   try {
     // Postgres supports at most 65535 bind params. Kysely binds one param per array element for `IN (...)`.
     // Chunk large URI lists to avoid protocol errors at scale.
@@ -61,12 +117,18 @@ export async function updateEngagement(db: Database): Promise<void> {
 
     const catalogRows = await db
       .selectFrom('feedgen_ops.feed_catalog')
-      .select(['rkey', 'publisher_did', 'publisher_post_max_age_days', 'publisher_time_clock'])
+      .select(['rkey', 'publisher_did', 'publisher_post_max_age_days', 'publisher_time_clock', 'algo_policy_id'])
       .where('enabled', '=', true)
-      .where('algo_policy_id', 'in', ['engagement-sorted', 'ranker-priority'])
       .execute()
-    const refreshPlan = deriveEngagementRefreshPlan(catalogRows, referenceMs)
-    const publisherDids = new Set(catalogRows.map((row) => String(row.publisher_did)))
+    const cachedConsumerRows = catalogRows.filter((row) =>
+      ['engagement-sorted', 'ranker-priority'].includes(row.algo_policy_id),
+    )
+    if (cachedConsumerRows.length === 0) throw new Error('engagement refresh requires active catalog consumers')
+    const refreshPlan = deriveEngagementRefreshPlan(
+      cachedConsumerRows.filter((row) => row.publisher_did),
+      referenceMs,
+    )
+    const publisherDids = new Set(await resolvePublisherDids(db))
 
     console.log(`[${new Date(referenceMs).toISOString()}] - Starting clock-matched engagement refresh...`);
 
@@ -77,41 +139,7 @@ export async function updateEngagement(db: Database): Promise<void> {
       .execute();
     const subscriberDids = subscribers.map(s => s.did);
 
-    const follows = await db
-      .selectFrom('follows')
-      .select('follows')
-      .execute();
-    const followsList = follows.map(f => f.follows);
-
-    console.log(`[${new Date().toISOString()}] - Found ${followsList.length} followed accounts to process.`);
-
-    const selectRecent = async (
-      authors: string[],
-      clock: 'receipt_time' | 'content_time_v1',
-      cutoff: string | null,
-    ) => {
-      if (authors.length === 0 || cutoff === null) return []
-      let query = db.selectFrom('post').where('post.author', 'in', [...new Set(authors)])
-      query = clock === 'content_time_v1'
-        ? query.where('post.content_time_status', '=', 'source_valid').where('post.content_time_utc', '>=', cutoff)
-        : query.where('post.indexedAt', '>=', cutoff)
-      return query.select(['post.uri', 'post.author']).execute()
-    }
-    const [receiptPosts, contentPosts] = await Promise.all([
-      selectRecent(
-        [...followsList, ...refreshPlan.receiptPublisherRows.map((row) => String(row.publisher_did))],
-        'receipt_time',
-        refreshPlan.receiptCutoff,
-      ),
-      selectRecent(
-        refreshPlan.contentPublisherRows.map((row) => String(row.publisher_did)),
-        'content_time_v1',
-        refreshPlan.contentCutoff,
-      ),
-    ])
-    const recentPosts = [...new Map(
-      [...receiptPosts, ...contentPosts].map((post) => [post.uri, post]),
-    ).values()]
+    const recentPosts = await selectEngagementRefreshPosts(db, refreshPlan, referenceMs)
 
     const postUris = recentPosts.map(post => post.uri);
 
@@ -339,7 +367,7 @@ export async function updateEngagement(db: Database): Promise<void> {
       event: 'engagement_refresh_complete',
       reference_time: new Date(referenceMs).toISOString(),
       receipt_clock_days: refreshPlan.receiptDays,
-      receipt_clock_feeds: catalogRows.map((row) => row.rkey).sort(),
+      receipt_clock_feeds: refreshPlan.receiptPublisherRows.map((row) => row.rkey).sort(),
       content_clock_days: refreshPlan.contentDays,
       content_clock_feeds: refreshPlan.contentPublisherRows.map((row) => row.rkey).sort(),
       updated_posts: postUris.length,
