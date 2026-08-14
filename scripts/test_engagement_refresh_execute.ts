@@ -106,7 +106,7 @@ async function main() {
       assert.equal(followedAuthorQueries.length, 1, 'followed authors must be selected once')
       assert.equal(followedPostQueries.length, 3, '2,001 distinct authors must use three sequential post selects')
       for (const query of followedPostQueries) {
-        assert.doesNotMatch(query.sql, /exists\s*\(|any\s*\(\s*array/i)
+        assert.doesNotMatch(query.sql, /exists\s*\(|\bany\s*\(/i)
         assert.match(query.sql, /"post"\."author" in \(/i)
         assert.equal(query.parameters[0], followedCutoff)
         assert.ok(query.parameters.length - 1 <= 1000, 'each post select must bind at most 1,000 authors')
