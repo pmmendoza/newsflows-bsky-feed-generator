@@ -42,12 +42,18 @@ export function deriveEngagementRefreshPlan(rows: RefreshCatalogRow[], reference
   }
 }
 
-export function selectRecentFollowedPosts(db: Database, cutoff: string) {
-  return db
-    .selectFrom('post')
-    .select(['post.uri', 'post.author'])
-    .where('post.indexedAt', '>=', cutoff)
-    .where(sql<boolean>`post.author = ANY (ARRAY(SELECT f.follows FROM follows AS f))`)
+export async function selectRecentFollowedPosts(db: Database, cutoff: string) {
+  const authors = (await db.selectFrom('follows').select('follows').distinct().execute()).map((row) => row.follows)
+  const posts: Array<{ uri: string, author: string }> = []
+  for (let index = 0; index < authors.length; index += 1000) {
+    posts.push(...await db
+      .selectFrom('post')
+      .select(['post.uri', 'post.author'])
+      .where('post.indexedAt', '>=', cutoff)
+      .where('post.author', 'in', authors.slice(index, index + 1000))
+      .execute())
+  }
+  return posts
 }
 
 export function selectRecentPublisherPosts(
@@ -83,7 +89,7 @@ export async function selectEngagementRefreshPosts(
     refreshPlan.contentCutoff,
   )
   const [followedPosts, receiptPosts, contentPosts] = await Promise.all([
-    selectRecentFollowedPosts(db, followedCutoff).execute(),
+    selectRecentFollowedPosts(db, followedCutoff),
     receiptPublisherQuery?.execute() ?? [],
     contentPublisherQuery?.execute() ?? [],
   ])
