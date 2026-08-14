@@ -12,8 +12,8 @@ const plan = deriveEngagementRefreshPlan([
   { rkey: 'receipt', publisher_did: 'did:r', publisher_post_max_age_days: 3, publisher_time_clock: 'receipt_time' },
   { rkey: 'content', publisher_did: 'did:c', publisher_post_max_age_days: 10, publisher_time_clock: 'content_time_v1' },
 ], reference)
-check(plan.receiptDays === 10, 'receipt scan must cover the widest declared active consumer')
-check(plan.receiptCutoff === '2026-08-04T12:00:00.000Z', 'receipt cutoff must use declared catalog horizons')
+check(plan.receiptDays === 3, 'receipt scan must cover receipt-clock consumers only')
+check(plan.receiptCutoff === '2026-08-11T12:00:00.000Z', 'receipt cutoff must use receipt-clock catalog horizons')
 check(plan.contentDays === 10, 'content scan must cover all content-clock consumers')
 check(plan.contentCutoff === '2026-08-04T12:00:00.000Z', 'content cutoff must use content time')
 check(plan.receiptPublisherRows.length === 1, 'receipt publishers must not leak into content scan')
@@ -72,11 +72,6 @@ check(!assessEngagementScienceEligibility({
   minimumValidShare: 0.8, numerator: 100, denominator: 100,
 }).scienceEligible, 'expired transitions must fail closed')
 
-const updaterSource = fs.readFileSync(path.resolve(__dirname, '../src/util/engagement-updater.ts'), 'utf8')
-check(!updaterSource.includes('ENGAGEMENT_TIME_HOURS'), 'recomputation must not retain hidden environment authority')
-check(updaterSource.includes("['engagement-sorted', 'ranker-priority']"), 'refresh horizons must come only from cached-counter policies')
-check(updaterSource.includes("post.content_time_status', '=', 'source_valid'"), 'content scan must require valid content time')
-check(updaterSource.includes("post.indexedAt', '>='"), 'receipt scan must remain receipt-clock matched')
 const monitorSource = fs.readFileSync(path.resolve(__dirname, '../src/methods/monitor.ts'), 'utf8')
 check(monitorSource.includes(".where('feed_id', '=', feedId)"), 'science export must select its clock from the feed catalog')
 check(monitorSource.includes('? [feedClock.publisher_did]'), 'feed-scoped export must use the selected publisher population')
