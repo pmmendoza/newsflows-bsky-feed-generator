@@ -17,7 +17,7 @@ function check(condition: unknown, message: string): asserts condition {
 
 async function main() {
   const scenario: Scenario = {
-    contract: 'newsflows-content-time/v1',
+    contract: 'newsflows-content-time/v2',
     expires: '2099-01-01T00:00:00Z',
     numerator: 80,
     denominator: 100,
@@ -78,7 +78,7 @@ async function main() {
     payload = await response.json()
     check(payload.science_eligible === false, 'unsupported contract must fail closed')
 
-    scenario.contract = 'newsflows-content-time/v1'
+    scenario.contract = 'newsflows-content-time/v2'
     scenario.expires = '2000-01-01T00:00:00Z'
     response = await fetch(base + query, { headers })
     payload = await response.json()
@@ -89,6 +89,17 @@ async function main() {
     response = await fetch(base + query, { headers })
     payload = await response.json()
     check(payload.science_eligible === false, 'below-threshold validity must fail closed')
+
+    scenario.numerator = 0
+    scenario.denominator = 0
+    response = await fetch(base + query.replace('scope=publisher', 'scope=subscriber_on_publisher'), { headers })
+    payload = await response.json()
+    check(payload.science_eligible === true, 'an exact empty cohort must be science eligible')
+    check(payload.validity.empty_population === true && payload.validity.observed_valid_share === null, 'empty cohort semantics must be explicit')
+
+    response = await fetch(base + query, { headers })
+    payload = await response.json()
+    check(payload.science_eligible === false && payload.validity.empty_population === false, 'empty publisher scope must remain fail closed')
 
     response = await fetch(base + '?since=2026-08-01T00:00:00Z&until=2026-08-02T00:00:00Z&scope=publisher&types=like,comment', { headers })
     payload = await response.json()

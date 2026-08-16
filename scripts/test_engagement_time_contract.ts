@@ -28,15 +28,16 @@ try {
 check(failedClosed, 'an unresolved catalog consumer must fail closed')
 
 const activeContract = {
-  expectedContractVersion: 'newsflows-content-time/v1',
+  expectedContractVersion: 'newsflows-content-time/v2',
   transitionExpiresAt: '2026-08-15T00:00:00Z',
   referenceMs: reference,
+  allowEmptyPopulation: false,
 }
 const eligible = assessEngagementScienceEligibility({
   ...activeContract,
   contentTime: true,
   explicitBounds: true,
-  contractVersion: 'newsflows-content-time/v1',
+  contractVersion: 'newsflows-content-time/v2',
   minimumValidShare: 0.8,
   numerator: 80,
   denominator: 100,
@@ -44,7 +45,7 @@ const eligible = assessEngagementScienceEligibility({
 check(eligible.scienceEligible && eligible.observedValidShare === 0.8, 'declared threshold must be inclusive')
 check(!assessEngagementScienceEligibility({
   ...activeContract,
-  contentTime: true, explicitBounds: true, contractVersion: 'newsflows-content-time/v1',
+  contentTime: true, explicitBounds: true, contractVersion: 'newsflows-content-time/v2',
   minimumValidShare: 0.8, numerator: 79, denominator: 100,
 }).scienceEligible, 'below-threshold validity must fail closed')
 check(!assessEngagementScienceEligibility({
@@ -54,21 +55,23 @@ check(!assessEngagementScienceEligibility({
 }).scienceEligible, 'receipt-time exports must be science-ineligible')
 check(!assessEngagementScienceEligibility({
   ...activeContract,
-  contentTime: true, explicitBounds: false, contractVersion: 'newsflows-content-time/v1',
+  contentTime: true, explicitBounds: false, contractVersion: 'newsflows-content-time/v2',
   minimumValidShare: 0.8, numerator: 100, denominator: 100,
 }).scienceEligible, 'implicit bounds must be science-ineligible')
-check(!assessEngagementScienceEligibility({
+const empty = assessEngagementScienceEligibility({
   ...activeContract,
-  contentTime: true, explicitBounds: true, contractVersion: 'newsflows-content-time/v1',
+  allowEmptyPopulation: true,
+  contentTime: true, explicitBounds: true, contractVersion: 'newsflows-content-time/v2',
   minimumValidShare: 0.8, numerator: 0, denominator: 0,
-}).scienceEligible, 'an empty denominator must fail closed')
+})
+check(empty.scienceEligible && empty.emptyPopulation && empty.observedValidShare === null, 'an exact empty cohort must be explicitly neutral')
 check(!assessEngagementScienceEligibility({
   ...activeContract, contentTime: true, explicitBounds: true, contractVersion: 'unsupported/v2',
   minimumValidShare: 0.8, numerator: 100, denominator: 100,
 }).scienceEligible, 'unsupported contract versions must fail closed')
 check(!assessEngagementScienceEligibility({
   ...activeContract, transitionExpiresAt: '2026-08-14T12:00:00Z',
-  contentTime: true, explicitBounds: true, contractVersion: 'newsflows-content-time/v1',
+  contentTime: true, explicitBounds: true, contractVersion: 'newsflows-content-time/v2',
   minimumValidShare: 0.8, numerator: 100, denominator: 100,
 }).scienceEligible, 'expired transitions must fail closed')
 

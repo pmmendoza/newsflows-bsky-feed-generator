@@ -1546,7 +1546,7 @@ export default function registerMonitorEndpoints(server: Server, ctx: AppContext
       const minimumValidShare = typeof feedClock?.content_time_cutover_min_valid_share === 'number'
         ? feedClock.content_time_cutover_min_valid_share
         : NaN
-      const { observedValidShare, scienceEligible } = assessEngagementScienceEligibility({
+      const { emptyPopulation, observedValidShare, scienceEligible } = assessEngagementScienceEligibility({
         contentTime,
         explicitBounds,
         contractVersion,
@@ -1556,6 +1556,7 @@ export default function registerMonitorEndpoints(server: Server, ctx: AppContext
         minimumValidShare,
         numerator: validity.numerator,
         denominator: validity.denominator,
+        allowEmptyPopulation: scope === 'subscriber_on_publisher',
       })
 
       const response: any = {
@@ -1573,6 +1574,7 @@ export default function registerMonitorEndpoints(server: Server, ctx: AppContext
         publisher_time_transition_expires_at: feedClock?.publisher_time_transition_expires_at ?? null,
         validity: {
           ...validity,
+          empty_population: emptyPopulation,
           observed_valid_share: observedValidShare,
           minimum_valid_share: Number.isFinite(minimumValidShare) ? minimumValidShare : null,
           denominator_clock: 'receipt_time',

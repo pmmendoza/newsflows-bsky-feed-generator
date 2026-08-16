@@ -97,7 +97,7 @@ async function main() {
           publisher_time_clock = 'content_time_v1',
           publisher_time_transition_expires_at = '2026-09-30T00:00:00Z',
           content_time_cutover_min_valid_share = 0.99,
-          content_time_contract_version = 'newsflows-content-time/v1'
+          content_time_contract_version = 'newsflows-content-time/v2'
       WHERE rkey = 'newsflow-be-k'
     `.execute(db)
     const notificationPayload = JSON.parse(await notification)
@@ -240,7 +240,7 @@ async function main() {
         content_time_status, content_time_validator_version)
       VALUES ('valid', '2026-08-02T00:00:00Z', '2026-08-12T00:00:00Z',
         convert_to('2026-08-02T00:00:00Z', 'UTF8'), '2026-08-02T00:00:00.000Z',
-        'source_valid', 'newsflows-content-time/v1')
+        'source_valid', 'newsflows-content-time/v2')
     `.execute(db)
     let rejectedContentPair = false
     try {
@@ -257,7 +257,7 @@ async function main() {
         INSERT INTO post(uri, createdAt, indexedAt, content_time_utc,
           content_time_status, content_time_validator_version)
         VALUES ('valid-no-raw', '2026-08-02T00:00:00Z', '2026-08-12T00:00:00Z',
-          '2026-08-02T00:00:00.000Z', 'source_valid', 'newsflows-content-time/v1')
+          '2026-08-02T00:00:00.000Z', 'source_valid', 'newsflows-content-time/v2')
       `.execute(db)
     } catch { rejectedValidRaw = true }
     check(rejectedValidRaw, 'database must reject source_valid without raw provenance')

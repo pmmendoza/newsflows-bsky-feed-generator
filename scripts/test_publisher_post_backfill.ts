@@ -43,7 +43,7 @@ async function main() {
     content_time_utc: '2026-06-05T00:00:00.000Z',
     content_time_status: 'source_valid',
     content_time_clamp_reason: null,
-    content_time_validator_version: 'newsflows-content-time/v1',
+    content_time_validator_version: 'newsflows-content-time/v2',
     text: 'hello world',
     rootUri: '',
     rootCid: '',
