@@ -8,9 +8,17 @@ export function assessEngagementScienceEligibility(input: {
   minimumValidShare: number
   numerator: number
   denominator: number
+  allowEmptyPopulation: boolean
 }) {
-  const observedValidShare = input.denominator > 0 ? input.numerator / input.denominator : 0
+  const emptyPopulation = input.allowEmptyPopulation && input.denominator === 0 && input.numerator === 0
+  const observedValidShare = input.denominator > 0 ? input.numerator / input.denominator : null
+  const validPopulation = emptyPopulation || (
+    input.denominator > 0
+    && observedValidShare !== null
+    && observedValidShare >= input.minimumValidShare
+  )
   return {
+    emptyPopulation,
     observedValidShare,
     scienceEligible: Boolean(
       input.contentTime
@@ -21,8 +29,7 @@ export function assessEngagementScienceEligibility(input: {
       && Date.parse(input.transitionExpiresAt) > input.referenceMs
       && Number.isFinite(input.minimumValidShare)
       && input.minimumValidShare > 0
-      && input.denominator > 0
-      && observedValidShare >= input.minimumValidShare,
+      && validPopulation,
     ),
   }
 }

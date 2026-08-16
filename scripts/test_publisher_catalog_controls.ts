@@ -36,7 +36,7 @@ const parsed = validateUpdate({
   publisher_time_clock: 'content_time_v1',
   publisher_time_transition_expires_at: '2026-09-30T00:00:00Z',
   content_time_cutover_min_valid_share: 0.99,
-  content_time_contract_version: 'newsflows-content-time/v1',
+  content_time_contract_version: 'newsflows-content-time/v2',
   if_current: {
     publisher_post_max_age_days: 7,
     publisher_post_max_age_source: 'feed_override',
@@ -72,7 +72,7 @@ const rollbackParsed = validateUpdate({
     publisher_time_clock: 'content_time_v1',
     publisher_time_transition_expires_at: '2026-09-30T00:00:00Z',
     content_time_cutover_min_valid_share: 0.99,
-    content_time_contract_version: 'newsflows-content-time/v1',
+    content_time_contract_version: 'newsflows-content-time/v2',
   },
 })
 check(rollbackParsed.ok, 'rollback update must parse through the same CAS path')

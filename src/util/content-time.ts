@@ -1,15 +1,15 @@
 import { ContentTimeClampReason, ContentTimeStatus } from '../db/schema'
 
-export const CONTENT_TIME_VALIDATOR_VERSION = 'newsflows-content-time/v1'
+export const CONTENT_TIME_VALIDATOR_VERSION = 'newsflows-content-time/v2'
 
 export type ContentTimePolicy = {
   maxFutureSkewMs: number
-  maxPastAgeMs: number
+  maxPastAgeMs: number | null
 }
 
-export const CONTENT_TIME_POLICY_V1: ContentTimePolicy = {
-  maxFutureSkewMs: 24 * 60 * 60 * 1000,
-  maxPastAgeMs: 2 * 365 * 24 * 60 * 60 * 1000,
+export const CONTENT_TIME_POLICY_V2: ContentTimePolicy = {
+  maxFutureSkewMs: 5 * 60 * 1000,
+  maxPastAgeMs: null,
 }
 
 export type ValidatedContentTime = {
@@ -24,7 +24,7 @@ export type ValidatedContentTime = {
 export function validateContentTime(
   raw: string | undefined | null,
   indexedAt: string,
-  policy: ContentTimePolicy = CONTENT_TIME_POLICY_V1,
+  policy: ContentTimePolicy = CONTENT_TIME_POLICY_V2,
 ): ValidatedContentTime {
   const receiptMs = Date.parse(indexedAt)
   if (!Number.isFinite(receiptMs)) throw new Error('indexedAt must be valid ISO time')
@@ -39,7 +39,7 @@ export function validateContentTime(
     contentMs = Date.parse(raw)
     if (!Number.isFinite(contentMs)) reason = 'unparseable'
     else if (contentMs > receiptMs + policy.maxFutureSkewMs) reason = 'future_skew'
-    else if (contentMs < receiptMs - policy.maxPastAgeMs) reason = 'past_bound'
+    else if (policy.maxPastAgeMs !== null && contentMs < receiptMs - policy.maxPastAgeMs) reason = 'past_bound'
   }
 
   const valid = reason === null

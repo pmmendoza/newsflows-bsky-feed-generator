@@ -9,12 +9,17 @@ const receipt = '2026-08-12T12:00:00.000Z'
 const valid = validateContentTime('2026-08-02T12:00:00+00:00', receipt)
 check(valid.content_time_status === 'source_valid', 'valid source must be accepted')
 check(valid.content_time_utc === '2026-08-02T12:00:00.000Z', 'valid source must normalize to UTC')
+check(valid.content_time_validator_version === 'newsflows-content-time/v2', 'new classifications must use validator v2')
+
+const toleratedSkew = validateContentTime('2026-08-12T12:05:00.000Z', receipt)
+check(toleratedSkew.content_time_status === 'source_valid', 'five minutes of future skew must be accepted')
+const oldButParseable = validateContentTime('2020-01-01T00:00:00Z', receipt)
+check(oldButParseable.content_time_status === 'source_valid', 'parseable old content must remain source-valid')
 
 for (const [raw, reason] of [
   [undefined, 'missing'],
   ['not-a-time', 'unparseable'],
-  ['2026-08-14T12:00:00Z', 'future_skew'],
-  ['2020-01-01T00:00:00Z', 'past_bound'],
+  ['2026-08-12T12:05:00.001Z', 'future_skew'],
 ] as const) {
   const result = validateContentTime(raw, receipt)
   check(result.content_time_status === 'source_invalid', `${reason} must be invalid`)
