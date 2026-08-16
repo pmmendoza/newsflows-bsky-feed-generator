@@ -1,5 +1,9 @@
-import dotenv from 'dotenv'
+import crypto from 'crypto'
+import fs from 'fs'
+import path from 'path'
+import { sql } from 'kysely'
 import { createDb } from '../db'
+import type { Database } from '../db'
 import { dualWriteLinkFields } from '../util/link-fields'
 import { validateContentTime } from '../util/content-time'
 
@@ -66,6 +70,7 @@ type CollectOptions = {
   until: Date
   fetchPage: FetchPage
   maxPagesPerActor?: number
+  deadlineMs?: number
 }
 
 type CliOptions = {
@@ -76,8 +81,56 @@ type CliOptions = {
   json: boolean
   apiBase: string
   maxPagesPerActor: number
-  dbUrl: string
+  dbUrl?: string
+  checkpointFile?: string
+  packetSha256?: string
 }
+
+export type PublisherPostRecoveryProgress = {
+  batch: number
+  scanned: number
+  inserted: number
+  recovered: number
+  already_current: number
+  cursor_sha256: string
+  elapsed_ms: number
+}
+
+export type PublisherPostRecoveryResult = PublisherPostRecoveryProgress & {
+  complete: boolean
+}
+
+export type PublisherPostRecoveryOptions = {
+  posts: BackfillPostRow[]
+  packetSha256: string
+  batchSize: number
+  afterUri?: string
+  planSha256?: string
+  maxBatches?: number
+  maxDurationMs: number
+  pauseMs: number
+  lockTimeoutMs: number
+  statementTimeoutMs: number
+  onProgress?: (progress: PublisherPostRecoveryProgress) => void
+  onCheckpoint?: (
+    checkpoint: PublisherPostRecoveryProgress & {
+      packet_sha256: string
+      plan_sha256: string
+      cursor_uri: string
+    },
+  ) => void
+}
+
+export const RECOVERY_LIMITS = {
+  batchSize: 500,
+  maxDurationMs: 30 * 60 * 1000,
+  pauseMs: 1000,
+  lockTimeoutMs: 5000,
+  statementTimeoutMs: 30_000,
+}
+
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
+const sha256 = (value: string) => crypto.createHash('sha256').update(value).digest('hex')
 
 function sanitizeForPostgres(text: string | null | undefined): string {
   if (text === null || text === undefined) return ''
@@ -138,6 +191,9 @@ export async function collectPublisherPosts(options: CollectOptions): Promise<Ba
   const byActor: BackfillPlan['by_actor'] = {}
 
   for (const actor of options.actors) {
+    if (options.deadlineMs !== undefined && Date.now() >= options.deadlineMs) {
+      throw new Error('publisher recovery collection exceeded its deadline')
+    }
     byActor[actor] = {
       scanned: 0,
       candidate_posts: 0,
@@ -146,6 +202,9 @@ export async function collectPublisherPosts(options: CollectOptions): Promise<Ba
     }
     let cursor: string | undefined
     for (let page = 0; page < maxPagesPerActor; page += 1) {
+      if (options.deadlineMs !== undefined && Date.now() >= options.deadlineMs) {
+        throw new Error('publisher recovery collection exceeded its deadline')
+      }
       const authorPage = await options.fetchPage(actor, cursor)
       if (!authorPage.posts.length) break
 
@@ -182,6 +241,255 @@ export async function collectPublisherPosts(options: CollectOptions): Promise<Ba
   }
 }
 
+type ExistingContentTime = {
+  uri: string
+  cid: string
+  author: string
+  indexedAt: string
+  created_at_source_raw: Buffer | null
+  content_time_utc: string | null
+  content_time_status: string | null
+  content_time_clamp_reason: string | null
+  content_time_validator_version: string | null
+}
+
+function recoveryPlanSha256(posts: BackfillPostRow[]): string {
+  return sha256(JSON.stringify(posts.map(({ created_at_source_raw, ...row }) => ({
+    ...row,
+    created_at_source_raw_hex: created_at_source_raw.toString('hex'),
+  }))))
+}
+
+function revalidateForExisting(
+  current: ExistingContentTime,
+  expected: BackfillPostRow,
+): BackfillPostRow {
+  if (current.cid !== expected.cid || current.author !== expected.author) {
+    throw new Error(`content-time recovery revision conflict uri_sha256=${sha256(expected.uri)}`)
+  }
+  const validated = validateContentTime(expected.created_at_source_raw.toString('utf8'), current.indexedAt)
+  return {
+    ...expected,
+    indexedAt: current.indexedAt,
+    created_at_source_raw: validated.created_at_source_raw,
+    content_time_utc: validated.content_time_utc,
+    content_time_status: validated.content_time_status,
+    content_time_clamp_reason: validated.content_time_clamp_reason,
+    content_time_validator_version: validated.content_time_validator_version,
+  }
+}
+
+function matchesRecovery(row: ExistingContentTime, expected: BackfillPostRow): boolean {
+  return (
+    row.created_at_source_raw?.equals(expected.created_at_source_raw) === true &&
+    row.content_time_utc === expected.content_time_utc &&
+    row.content_time_status === expected.content_time_status &&
+    row.content_time_clamp_reason === expected.content_time_clamp_reason &&
+    row.content_time_validator_version === expected.content_time_validator_version
+  )
+}
+
+function isUnclassified(row: ExistingContentTime): boolean {
+  return (
+    row.created_at_source_raw === null &&
+    row.content_time_utc === null &&
+    (row.content_time_status === null || row.content_time_status === 'legacy_unknown') &&
+    row.content_time_clamp_reason === null &&
+    row.content_time_validator_version === null
+  )
+}
+
+async function applyRecoveryBatch(
+  db: Database,
+  batch: BackfillPostRow[],
+  lockTimeoutMs: number,
+  statementTimeoutMs: number,
+  deadlineMs: number,
+) {
+  return db.transaction().execute(async (trx) => {
+    const remainingMs = deadlineMs - Date.now()
+    if (remainingMs <= 0) throw new Error('content-time recovery deadline reached')
+    await sql`SELECT set_config('transaction_timeout', ${`${remainingMs}ms`}, true)`.execute(trx)
+    await sql`SELECT set_config('lock_timeout', ${`${Math.min(lockTimeoutMs, remainingMs)}ms`}, true)`.execute(trx)
+    await sql`SELECT set_config('statement_timeout', ${`${Math.min(statementTimeoutMs, remainingMs)}ms`}, true)`.execute(trx)
+
+    const uris = batch.map((row) => row.uri)
+    const existingRows = (await sql<ExistingContentTime>`
+      SELECT uri, cid, author, "indexedAt", created_at_source_raw, content_time_utc, content_time_status,
+             content_time_clamp_reason, content_time_validator_version
+      FROM public.post
+      WHERE uri = ANY(${uris}::text[])
+      FOR UPDATE
+    `.execute(trx)).rows
+    const existing = new Map(existingRows.map((row) => [row.uri, row]))
+    const inserts: BackfillPostRow[] = []
+    const recoveries: BackfillPostRow[] = []
+    let alreadyCurrent = 0
+
+    for (const row of batch) {
+      const current = existing.get(row.uri)
+      if (!current) inserts.push(row)
+      else {
+        const expected = revalidateForExisting(current, row)
+        if (matchesRecovery(current, expected)) alreadyCurrent += 1
+        else if (isUnclassified(current)) recoveries.push(expected)
+        else throw new Error(`content-time recovery CAS conflict uri_sha256=${sha256(row.uri)}`)
+      }
+    }
+
+    if (inserts.length) {
+      const inserted = await trx
+        .insertInto('post')
+        .values(inserts)
+        .onConflict((oc) => oc.column('uri').doNothing())
+        .returning('uri')
+        .execute()
+      if (inserted.length !== inserts.length) {
+        throw new Error('content-time recovery insert CAS conflict')
+      }
+    }
+
+    if (recoveries.length) {
+      const payload = recoveries.map((row) => ({
+        uri: row.uri,
+        raw_hex: row.created_at_source_raw.toString('hex'),
+        content_time_utc: row.content_time_utc,
+        content_time_status: row.content_time_status,
+        content_time_clamp_reason: row.content_time_clamp_reason,
+        content_time_validator_version: row.content_time_validator_version,
+      }))
+      const recovered = await sql<{ uri: string }>`
+        UPDATE public.post AS target
+        SET created_at_source_raw = decode(batch.raw_hex, 'hex'),
+            content_time_utc = batch.content_time_utc,
+            content_time_status = batch.content_time_status,
+            content_time_clamp_reason = batch.content_time_clamp_reason,
+            content_time_validator_version = batch.content_time_validator_version
+        FROM jsonb_to_recordset(${JSON.stringify(payload)}::jsonb) AS batch(
+          uri text,
+          raw_hex text,
+          content_time_utc text,
+          content_time_status text,
+          content_time_clamp_reason text,
+          content_time_validator_version text
+        )
+        WHERE target.uri = batch.uri
+          AND target.created_at_source_raw IS NULL
+          AND target.content_time_utc IS NULL
+          AND (target.content_time_status IS NULL OR target.content_time_status = 'legacy_unknown')
+          AND target.content_time_clamp_reason IS NULL
+          AND target.content_time_validator_version IS NULL
+        RETURNING target.uri
+      `.execute(trx)
+      if (recovered.rows.length !== recoveries.length) {
+        throw new Error('content-time recovery update CAS conflict')
+      }
+    }
+
+    return {
+      inserted: inserts.length,
+      recovered: recoveries.length,
+      already_current: alreadyCurrent,
+    }
+  })
+}
+
+export async function runPublisherPostRecovery(
+  db: Database,
+  options: PublisherPostRecoveryOptions,
+): Promise<PublisherPostRecoveryResult> {
+  if (!/^[0-9a-f]{64}$/.test(options.packetSha256)) {
+    throw new Error('packetSha256 must be a lowercase SHA-256')
+  }
+  if (!Number.isInteger(options.batchSize) || options.batchSize < 1 || options.batchSize > 500) {
+    throw new Error('batchSize must be an integer from 1 to 500')
+  }
+  for (const [name, value] of [
+    ['maxDurationMs', options.maxDurationMs],
+    ['pauseMs', options.pauseMs],
+    ['lockTimeoutMs', options.lockTimeoutMs],
+    ['statementTimeoutMs', options.statementTimeoutMs],
+  ] as const) {
+    if (!Number.isInteger(value) || value < (name === 'pauseMs' ? 0 : 1)) {
+      throw new Error(`${name} must be a ${name === 'pauseMs' ? 'non-negative' : 'positive'} integer`)
+    }
+  }
+
+  const plan = [...options.posts].sort((left, right) => left.uri.localeCompare(right.uri))
+  if (new Set(plan.map((row) => row.uri)).size !== plan.length) {
+    throw new Error('recovery input contains duplicate URIs')
+  }
+  const planSha256 = recoveryPlanSha256(plan)
+  if (options.afterUri) {
+    if (options.planSha256 !== planSha256 || !plan.some((row) => row.uri === options.afterUri)) {
+      throw new Error('checkpoint does not match the immutable recovery plan')
+    }
+  }
+  const ordered = plan.filter((row) => !options.afterUri || row.uri > options.afterUri)
+
+  const startedAt = Date.now()
+  const deadlineMs = startedAt + options.maxDurationMs
+  let batch = 0
+  let scanned = 0
+  let inserted = 0
+  let recovered = 0
+  let alreadyCurrent = 0
+  let cursorUri = options.afterUri ?? ''
+  let complete = true
+
+  for (let offset = 0; offset < ordered.length; offset += options.batchSize) {
+    const remainingMs = deadlineMs - Date.now()
+    if (remainingMs <= 0 || (options.maxBatches !== undefined && batch >= options.maxBatches)) {
+      complete = false
+      break
+    }
+    const rows = ordered.slice(offset, offset + options.batchSize)
+    const result = await applyRecoveryBatch(
+      db,
+      rows,
+      options.lockTimeoutMs,
+      Math.min(options.statementTimeoutMs, remainingMs),
+      deadlineMs,
+    )
+    batch += 1
+    scanned += rows.length
+    inserted += result.inserted
+    recovered += result.recovered
+    alreadyCurrent += result.already_current
+    cursorUri = rows[rows.length - 1].uri
+    const progress: PublisherPostRecoveryProgress = {
+      batch,
+      scanned,
+      inserted,
+      recovered,
+      already_current: alreadyCurrent,
+      cursor_sha256: sha256(cursorUri),
+      elapsed_ms: Date.now() - startedAt,
+    }
+    options.onProgress?.(progress)
+    options.onCheckpoint?.({
+      ...progress,
+      packet_sha256: options.packetSha256,
+      plan_sha256: planSha256,
+      cursor_uri: cursorUri,
+    })
+    if (offset + rows.length < ordered.length && options.pauseMs > 0) {
+      await sleep(Math.min(options.pauseMs, Math.max(0, deadlineMs - Date.now())))
+    }
+  }
+
+  return {
+    batch,
+    scanned,
+    inserted,
+    recovered,
+    already_current: alreadyCurrent,
+    cursor_sha256: cursorUri ? sha256(cursorUri) : '',
+    elapsed_ms: Date.now() - startedAt,
+    complete,
+  }
+}
+
 function splitCsv(value: string | undefined): string[] {
   return (value || '')
     .split(',')
@@ -192,22 +500,6 @@ function splitCsv(value: string | undefined): string[] {
 function requireValue(value: string | undefined, message: string): string {
   if (!value) throw new Error(message)
   return value
-}
-
-function dbUrlFromEnv(): string {
-  if (process.env.FEEDGEN_POSTGRES_URL) return process.env.FEEDGEN_POSTGRES_URL
-
-  const host = process.env.FEEDGEN_DB_HOST || 'feedgen-db'
-  const port = process.env.FEEDGEN_DB_PORT || '5432'
-  const user = process.env.FEEDGEN_DB_USER || 'feedgen'
-  const password = process.env.FEEDGEN_DB_PASSWORD || process.env.FEEDGEN_DBPASSWORD || 'feedgen'
-  const database =
-    process.env.FEEDGEN_DB_DATABASE ||
-    process.env.FEEDGEN_DB_BASE ||
-    process.env.FEEDGEN_DBBASE ||
-    'feedgen-db'
-
-  return `postgresql://${encodeURIComponent(user)}:${encodeURIComponent(password)}@${host}:${port}/${database}`
 }
 
 function parseCliArgs(argv: string[]): CliOptions {
@@ -249,6 +541,11 @@ function parseCliArgs(argv: string[]): CliOptions {
   if (isNaN(until.getTime())) throw new Error('--until must be an ISO timestamp')
   if (until <= since) throw new Error('--until must be after --since')
 
+  const maxPagesPerActor = Number.parseInt(flags.get('max-pages-per-actor')?.at(-1) || '50', 10)
+  if (!Number.isInteger(maxPagesPerActor) || maxPagesPerActor < 1) {
+    throw new Error('--max-pages-per-actor must be a positive integer')
+  }
+
   return {
     actors,
     since,
@@ -256,8 +553,10 @@ function parseCliArgs(argv: string[]): CliOptions {
     apply,
     json,
     apiBase: flags.get('api-base')?.at(-1) || 'https://public.api.bsky.app',
-    maxPagesPerActor: Number.parseInt(flags.get('max-pages-per-actor')?.at(-1) || '50', 10),
-    dbUrl: flags.get('db-url')?.at(-1) || dbUrlFromEnv(),
+    maxPagesPerActor,
+    dbUrl: flags.get('db-url')?.at(-1) || process.env.FEEDGEN_POSTGRES_URL,
+    checkpointFile: flags.get('checkpoint-file')?.at(-1),
+    packetSha256: flags.get('packet-sha256')?.at(-1),
   }
 }
 
@@ -265,6 +564,7 @@ async function fetchAuthorFeedPage(
   apiBase: string,
   actor: string,
   cursor?: string,
+  timeoutMs = 30_000,
 ): Promise<AuthorFeedPage> {
   const url = new URL('/xrpc/app.bsky.feed.getAuthorFeed', apiBase)
   url.searchParams.set('actor', actor)
@@ -272,9 +572,11 @@ async function fetchAuthorFeedPage(
   url.searchParams.set('filter', 'posts_no_replies')
   if (cursor) url.searchParams.set('cursor', cursor)
 
-  const response = await fetch(url)
+  const response = await fetch(url, { signal: AbortSignal.timeout(timeoutMs) })
   if (!response.ok) {
-    throw new Error(`AppView request failed for ${actor}: ${response.status} ${response.statusText}`)
+    throw new Error(
+      `AppView request failed actor_sha256=${sha256(actor)}: ${response.status} ${response.statusText}`,
+    )
   }
   const body: any = await response.json()
   return {
@@ -283,58 +585,115 @@ async function fetchAuthorFeedPage(
   }
 }
 
-async function insertPosts(dbUrl: string, posts: BackfillPostRow[]): Promise<number> {
-  if (!posts.length) return 0
-  const db = createDb(dbUrl)
+function readCheckpoint(
+  file: string,
+  packetSha256: string,
+): { cursorUri: string; planSha256: string } | undefined {
+  if (!fs.existsSync(file)) return undefined
+  const checkpoint = JSON.parse(fs.readFileSync(file, 'utf8'))
+  if (
+    checkpoint.packet_sha256 !== packetSha256 ||
+    typeof checkpoint.plan_sha256 !== 'string' ||
+    typeof checkpoint.cursor_uri !== 'string'
+  ) {
+    throw new Error('checkpoint does not match the approved packet')
+  }
+  return { cursorUri: checkpoint.cursor_uri, planSha256: checkpoint.plan_sha256 }
+}
+
+function writeCheckpoint(file: string, checkpoint: object) {
+  fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 })
+  const temporary = `${file}.tmp`
+  const descriptor = fs.openSync(temporary, 'w', 0o600)
   try {
-    let inserted = 0
-    for (let i = 0; i < posts.length; i += 1000) {
-      const batch = posts.slice(i, i + 1000)
-      const result: any = await db
-        .insertInto('post')
-        .values(batch)
-        .onConflict((oc) => oc.column('uri').doNothing())
-        .executeTakeFirst()
-      inserted += Number(result?.numInsertedOrUpdatedRows ?? batch.length)
-    }
-    return inserted
+    fs.fchmodSync(descriptor, 0o600)
+    fs.writeFileSync(descriptor, `${JSON.stringify(checkpoint)}\n`)
+    fs.fsyncSync(descriptor)
   } finally {
-    await db.destroy()
+    fs.closeSync(descriptor)
+  }
+  fs.renameSync(temporary, file)
+  const directory = fs.openSync(path.dirname(file), 'r')
+  try {
+    fs.fsyncSync(directory)
+  } finally {
+    fs.closeSync(directory)
   }
 }
 
 async function main() {
-  dotenv.config()
+  const startedAt = Date.now()
   const options = parseCliArgs(process.argv.slice(2))
+  const deadlineMs = startedAt + RECOVERY_LIMITS.maxDurationMs
   const plan = await collectPublisherPosts({
     actors: options.actors,
     since: options.since,
     until: options.until,
     maxPagesPerActor: options.maxPagesPerActor,
-    fetchPage: (actor, cursor) => fetchAuthorFeedPage(options.apiBase, actor, cursor),
+    deadlineMs,
+    fetchPage: (actor, cursor) => fetchAuthorFeedPage(
+      options.apiBase,
+      actor,
+      cursor,
+      Math.max(1, Math.min(30_000, deadlineMs - Date.now())),
+    ),
   })
 
-  const inserted = options.apply ? await insertPosts(options.dbUrl, plan.posts) : 0
+  let recovery: PublisherPostRecoveryResult | null = null
+  if (options.apply) {
+    if (!options.checkpointFile) throw new Error('--checkpoint-file is required with --apply')
+    if (!options.packetSha256 || !/^[0-9a-f]{64}$/.test(options.packetSha256)) {
+      throw new Error('--packet-sha256 is required with --apply')
+    }
+    if (!options.dbUrl) {
+      throw new Error('FEEDGEN_POSTGRES_URL or --db-url is required with --apply')
+    }
+    const remainingMs = deadlineMs - Date.now()
+    if (remainingMs <= 0) throw new Error('publisher recovery collection exhausted the packet deadline')
+    const checkpoint = readCheckpoint(options.checkpointFile, options.packetSha256)
+    const db = createDb(options.dbUrl)
+    try {
+      recovery = await runPublisherPostRecovery(db, {
+        posts: plan.posts,
+        packetSha256: options.packetSha256,
+        batchSize: RECOVERY_LIMITS.batchSize,
+        afterUri: checkpoint?.cursorUri,
+        planSha256: checkpoint?.planSha256,
+        maxDurationMs: remainingMs,
+        pauseMs: RECOVERY_LIMITS.pauseMs,
+        lockTimeoutMs: RECOVERY_LIMITS.lockTimeoutMs,
+        statementTimeoutMs: Math.min(RECOVERY_LIMITS.statementTimeoutMs, remainingMs),
+        onProgress: (progress) => console.error(JSON.stringify({ event: 'recovery_batch', ...progress })),
+        onCheckpoint: (checkpoint) => writeCheckpoint(options.checkpointFile!, checkpoint),
+      })
+    } finally {
+      await db.destroy()
+    }
+  }
   const summary = {
     mode: options.apply ? 'apply' : 'dry-run',
-    actors: options.actors,
+    actor_count: options.actors.length,
+    actor_sha256: options.actors.map(sha256).sort(),
     since: options.since.toISOString(),
     until: options.until.toISOString(),
     scanned: plan.scanned,
     candidate_posts: plan.posts.length,
     skipped_out_of_window: plan.skipped_out_of_window,
     skipped_wrong_author: plan.skipped_wrong_author,
-    by_actor: plan.by_actor,
-    inserted,
+    by_actor: Object.fromEntries(
+      Object.entries(plan.by_actor).map(([actor, counts]) => [sha256(actor), counts]),
+    ),
+    recovery,
   }
 
   if (options.json) {
     console.log(JSON.stringify(summary, null, 2))
   } else {
     console.log(
-      `${summary.mode}: scanned=${summary.scanned} candidates=${summary.candidate_posts} inserted=${summary.inserted}`,
+      `${summary.mode}: scanned=${summary.scanned} candidates=${summary.candidate_posts} recovered=${recovery?.recovered ?? 0}`,
     )
   }
+  if (recovery && !recovery.complete) process.exitCode = 3
 }
 
 if (require.main === module) {
