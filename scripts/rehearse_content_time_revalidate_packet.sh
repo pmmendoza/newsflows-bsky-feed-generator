@@ -42,7 +42,7 @@ echo "status=seeded a=620 b=40"
 
 db_ip=$("${D[@]}" inspect "$container" --format '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}')
 envfile=$(mktemp); chmod 600 "$envfile"
-{ echo "FEEDGEN_DB_USER=feedgen"; echo "FEEDGEN_DB_PASSWORD=$rehearsal_pw"; echo "FEEDGEN_DB_HOST=$db_ip"; echo "FEEDGEN_DB_PORT=5432"; echo "FEEDGEN_DB_DATABASE=feedgen_revalidate_rehearsal"; } >"$envfile"
+{ echo "FEEDGEN_DB_USER=feedgen"; echo "FEEDGEN_DB_PASSWORD=$rehearsal_pw"; echo "FEEDGEN_DB_HOST=$db_ip"; echo "FEEDGEN_DB_PORT=5432"; echo "FEEDGEN_DB_DATABASE=feedgen_revalidate_rehearsal"; echo "SOME_HOSTNAME_CONFIG=$container"; echo "OTHER_APP_PASSWORD=decoy-secret-value-not-in-evidence-91c3"; } >"$envfile"
 IMG=${REHEARSAL_IMG:-pmmendoza/bsky-feedgen@sha256:928c15aac77a8a842f60053eff8953e70cc9e4117c2fbe86f548e345c1a34711}
 img_ct=$("${D[@]}" run --rm --entrypoint sh "$IMG" -c 'sha256sum /app/dist/util/content-time.js' | cut -d' ' -f1)
 
@@ -55,7 +55,9 @@ export E TREE="$repo_root" RUNNER=container IMG NETWORK=bridge ENV_FILE="$envfil
   MAIN_DIDS="$pub_a" BE_DID="$pub_b" HORIZON_MAIN_DAYS=10 HORIZON_BE_DAYS=10 \
   RANKED_RKEYS="'newsflow-zz-1a','newsflow-zz-1b'" MAIN_RKEY_PATTERN='newsflow-zz-1a' BE_RKEY_PATTERN='newsflow-zz-1b' \
   PREREG_MAIN="v1_valid_to_v2_valid=600,v1_invalid_to_v2_valid=10,v1_to_v2_invalid=10" PREREG_BE="v1_valid_to_v2_valid=30,v1_invalid_to_v2_valid=5,v1_to_v2_invalid=5" \
-  READBACK_JSON=/nonexistent PACKET_SHA="$(printf '1%.0s' $(seq 1 64))"
+  PACKET_SHA="$(printf '1%.0s' $(seq 1 64))"
+rb=$(mktemp); now=$(date -u +%s); printf '{"schema_version":"bsr.ops.effective_config.readback.v1","raw_values_in_output":false,"artifact_metadata":{"generated_at":%s,"stale_at":%s},"bindings":{"reh-a":{"feed_ids":["newsflow-zz-1a"],"push_window_days":10,"time_column":"createdAt"},"reh-b":{"feed_ids":["newsflow-zz-1b"],"push_window_days":10,"time_column":"createdAt"}}}\n' "$now" "$((now+3600))" >"$rb"
+export READBACK_JSON="$rb"
 
 step() { echo "status=$1"; shift; "$@"; }
 step preflight bash "$runner" preflight
@@ -72,18 +74,29 @@ step apply_be_full bash "$runner" apply be full
 [[ -f "$E/step1-main-checkpoint.json" && -f "$E/step1-be-checkpoint.json" ]] || { echo "checkpoints not written into the 0750 evidence root by the container"; exit 1; }
 step readback bash "$runner" readback
 grep -q "prestate_missing_in_poststate=0" "$E/step1-main-diff.txt" || { echo "readback diff main not closed"; exit 1; }
-# forced mid-restore stop after batch 1, then resume: batch numbering must continue (batch-2), batch-1 receipt untouched
-set +e; RESTORE_STOP_AFTER_BATCH=1 bash "$runner" restore main; rc=$?; set -e
-[[ $rc -eq 3 && -f "$E/restore-main-batch-1.txt" && ! -f "$E/restore-main-batch-2.txt" ]] || { echo "forced restore stop did not behave (rc=$rc)"; exit 1; }
+# genuine mid-restore failure: hold a row lock on a row of batch 2 (rows 501-620) so lock_timeout=5s fires, then resume after release
+lock_uri=$(sed -n '510p' "$E/step1-main-prestate-rows.tsv" | cut -f1)
+( "${D[@]}" exec -i "$container" psql -U feedgen -d feedgen_revalidate_rehearsal -X -q -v ON_ERROR_STOP=1 -c "BEGIN; SELECT uri FROM post WHERE uri='$lock_uri' FOR UPDATE; SELECT pg_sleep(25); COMMIT;" >/dev/null 2>&1 & ) ; sleep 2
+set +e; bash "$runner" restore main; rc=$?; set -e
+[[ $rc -ne 0 ]] || { echo "restore should have failed on the held lock"; exit 1; }
+[[ -f "$E/restore-main-rows-1-500-attempt-1.txt" && -f "$E/restore-main-rows-501-620-attempt-1.txt" ]] || { echo "restore receipts by row range missing after failure"; ls "$E" | grep restore || true; exit 1; }
+[[ "$(cat "$E/restore-main-cursor.txt")" == "501" ]] || { echo "cursor should point at 501 after the failed batch"; exit 1; }
+sleep 26
 step restore_main_resume bash "$runner" restore main
-[[ -f "$E/restore-main-batch-2.txt" ]] || { echo "resume did not produce batch 2"; exit 1; }
+[[ -f "$E/restore-main-rows-501-620-attempt-2.txt" ]] || { echo "resume did not produce attempt-2 receipt for rows 501-620"; exit 1; }
 step restore_be bash "$runner" restore be
 grep -q "identical_to_prestate" "$E/restore-main-result.txt" && grep -q "identical_to_prestate" "$E/restore-be-result.txt" || { echo "restore not identical"; exit 1; }
 step control bash "$runner" control
 [[ -f "$E/pg-control-2.txt" ]] || { echo "second control read missing"; exit 1; }
 step secret_scan bash "$runner" secret-scan
 grep -q "^hits=0$" "$E/secret-scan.txt" || { echo "secret scan not clean"; exit 1; }
+grep -q "SOME_HOSTNAME_CONFIG" "$E/secret-scan.txt" && { echo "secret scan must not treat config keys as secrets"; exit 1; }
+# negative test: a scratch evidence root containing the real DB password must FAIL the scan
+E2=$(mktemp -d); sudo -n install -d -o root -g newsflows -m 750 "$E2/leak"; echo "leak $rehearsal_pw" | sudo -n tee "$E2/leak/step1-x.err" >/dev/null
+set +e; E="$E2/leak" bash "$runner" secret-scan >/dev/null 2>&1; rc=$?; set -e
+[[ $rc -ne 0 ]] || { echo "secret scan failed to detect a leaked password"; exit 1; }
+sudo -n rm -rf "$E2"; echo "status=secret_scan_negative_test ok"
 step finalize bash "$runner" finalize 2026-08-17T00:00:00Z 2026-08-17T00:30:00Z
 sudo -n grep -q "RESULT.txt" "$E/SHA256SUMS" || { echo "SHA256SUMS incomplete"; exit 1; }
-rm -f "$envfile"
+rm -f "$envfile" "$rb"
 echo "status=ok evidence=$E"
