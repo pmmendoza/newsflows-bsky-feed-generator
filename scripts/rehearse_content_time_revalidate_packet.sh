@@ -1,15 +1,17 @@
 #!/usr/bin/env bash
-# Rehearses scripts/content_time_revalidate_packet.sh end-to-end against a
-# disposable postgres:17 container previously prepared by
+# Rehearses scripts/content_time_revalidate_packet.sh end-to-end, in the
+# PRODUCTION runner mode (RUNNER=container: the live feedgen image as node
+# runtime, DSN composed in-container by scripts/compose_feedgen_dsn.js from a
+# scratch env-file, /evidence mounted from a 0750 root:newsflows evidence root),
+# against a disposable postgres:17 container previously prepared by
 # scripts/rehearse_content_time_revalidate.sh with
-# FEEDGEN_REVALIDATE_REHEARSAL_KEEP=1 (that script bootstraps feed_catalog,
-# applies the migrations and leaves the container up). Runs the packet runner in
-# RUNNER=host mode (same tool flags/argv as the container path; only the DSN
-# source differs) and asserts every gate: preflight, preview gate, batch-gated
-# apply (--max-batches 1 then full), readback, bounded restore, secret-scan,
-# finalize.
+# FEEDGEN_REVALIDATE_REHEARSAL_KEEP=1. Asserts every gate: preflight (hashes,
+# scope, horizons, NULL-raw, pre-registration cells), preview gates, batch-gated
+# apply (--max-batches 1 then full), readback, forced mid-restore stop + resume,
+# bounded restore, an extra control read, secret-scan, finalize.
 #
-# Usage (server, from the built feedgen tree):
+# Usage (server, from the built feedgen tree; the running production feedgen
+# container is only READ (inspect + env echo) for the live-image checks):
 #   bash scripts/rehearse_content_time_revalidate_packet.sh <container> <port> [evidence_root]
 set -euo pipefail
 container=${1:?container}; port=${2:?port}
@@ -19,10 +21,13 @@ runner="$repo_root/scripts/content_time_revalidate_packet.sh"
 DOCKER=${FEEDGEN_REVALIDATE_REHEARSAL_DOCKER:-sudo -n docker}
 read -r -a D <<<"$DOCKER"
 pub_a="did:plc:revalidate-rehearsal-publisher-a"; pub_b="did:plc:revalidate-rehearsal-publisher-b"
+rehearsal_pw="rehearsal-not-a-real-secret-8f2c"
 psql() { "${D[@]}" exec -i "$container" psql -U feedgen -d feedgen_revalidate_rehearsal -X -A -F '|' -v ON_ERROR_STOP=1 "$@"; }
 
-# Seed fresh in-window v1 rows: 620 for publisher A (600 valid + 10 past_bound + 10 future-skew), 40 for publisher B (30/5/5).
+# Seed fresh in-window v1 rows: 620 for publisher A (600 valid + 10 past_bound + 10 future-skew), 40 for publisher B (30/5/5);
+# give the disposable DB a distinct password so the secret scan is meaningful.
 psql <<SQL >/dev/null
+ALTER USER feedgen PASSWORD '$rehearsal_pw';
 DELETE FROM public.post WHERE uri LIKE 'at://%/app.bsky.feed.post/pk-%';
 INSERT INTO public.post (uri,cid,"indexedAt","createdAt",author,text,"rootUri","rootCid",link_uri,link_title,link_description,"linkUrl","linkTitle","linkDescription",created_at_source_raw,content_time_utc,content_time_status,content_time_clamp_reason,content_time_validator_version)
 SELECT 'at://'||a||'/app.bsky.feed.post/pk-'||lpad(g::text,4,'0'),'cid-pk-'||a||g::text,'2026-08-13T10:00:00.000Z',
@@ -35,30 +40,50 @@ FROM (SELECT '$pub_a' AS a, g, CASE WHEN g<=600 THEN 'v' WHEN g<=610 THEN 'pb' E
 SQL
 echo "status=seeded a=620 b=40"
 
-envfile=$(mktemp); echo 'FEEDGEN_DB_PASSWORD=rehearsal-not-a-real-secret-8f2c' >"$envfile"
-export E TREE="$repo_root" RUNNER=host HOST_DSN="postgresql://feedgen:feedgen@127.0.0.1:$port/feedgen_revalidate_rehearsal" \
-  DB_CONTAINER="$container" PSQL_DB=feedgen_revalidate_rehearsal PSQL_USER=feedgen ENV_FILE="$envfile" DOCKER="$DOCKER" \
+db_ip=$("${D[@]}" inspect "$container" --format '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}')
+envfile=$(mktemp); chmod 600 "$envfile"
+{ echo "FEEDGEN_DB_USER=feedgen"; echo "FEEDGEN_DB_PASSWORD=$rehearsal_pw"; echo "FEEDGEN_DB_HOST=$db_ip"; echo "FEEDGEN_DB_PORT=5432"; echo "FEEDGEN_DB_DATABASE=feedgen_revalidate_rehearsal"; } >"$envfile"
+IMG=${REHEARSAL_IMG:-pmmendoza/bsky-feedgen@sha256:928c15aac77a8a842f60053eff8953e70cc9e4117c2fbe86f548e345c1a34711}
+img_ct=$("${D[@]}" run --rm --entrypoint sh "$IMG" -c 'sha256sum /app/dist/util/content-time.js' | cut -d' ' -f1)
+
+export E TREE="$repo_root" RUNNER=container IMG NETWORK=bridge ENV_FILE="$envfile" \
+  DB_CONTAINER="$container" PSQL_DB=feedgen_revalidate_rehearsal PSQL_USER=feedgen DOCKER="$DOCKER" \
+  EXPECTED_SHA="$(git -C "$repo_root" rev-parse HEAD)" \
+  EXPECTED_DIST_SHA256="$(sha256sum "$repo_root/dist/tools/backfill-publisher-posts.js" | cut -d' ' -f1)" \
+  EXPECTED_CT_SHA256="$(sha256sum "$repo_root/dist/util/content-time.js" | cut -d' ' -f1)" \
+  EXPECTED_IMAGE_CT_SHA256="$img_ct" \
   MAIN_DIDS="$pub_a" BE_DID="$pub_b" HORIZON_MAIN_DAYS=10 HORIZON_BE_DAYS=10 \
   RANKED_RKEYS="'newsflow-zz-1a','newsflow-zz-1b'" MAIN_RKEY_PATTERN='newsflow-zz-1a' BE_RKEY_PATTERN='newsflow-zz-1b' \
-  PACKET_SHA="$(printf '1%.0s' $(seq 1 64))"
+  PREREG_MAIN="v1_valid_to_v2_valid=600,v1_invalid_to_v2_valid=10,v1_to_v2_invalid=10" PREREG_BE="v1_valid_to_v2_valid=30,v1_invalid_to_v2_valid=5,v1_to_v2_invalid=5" \
+  READBACK_JSON=/nonexistent PACKET_SHA="$(printf '1%.0s' $(seq 1 64))"
 
 step() { echo "status=$1"; shift; "$@"; }
 step preflight bash "$runner" preflight
-[[ -s "$E/step1-main-prestate-rows.tsv" && $(wc -l <"$E/step1-main-prestate-rows.tsv") -ge 620 ]] || { echo "preflight main snapshot rows < 620"; exit 1; }
+[[ $(wc -l <"$E/step1-main-prestate-rows.tsv") -eq 620 && $(wc -l <"$E/step1-be-prestate-rows.tsv") -eq 40 ]] || { echo "prestate snapshot counts unexpected"; exit 1; }
+grep -q "^feedgen_retention_enabled=unset$\|^feedgen_retention_enabled=false$\|^feedgen_retention_enabled=0$" "$E/source-set.txt" || { echo "retention gate not recorded as disabled"; exit 1; }
 step preview_main bash "$runner" preview main
 step preview_be bash "$runner" preview be
 step apply_main_b1 bash "$runner" apply main b1 1
 grep -q "batches=1 exit=3" "$E/ceiling-main-b1.txt" || { echo "b1 did not stop after one batch with exit 3"; exit 1; }
+grep -q "wal_source=tool_in_transaction" "$E/ceiling-main-b1.txt" || { echo "b1 verdict not from the tool's in-transaction WAL"; exit 1; }
 step apply_main_full bash "$runner" apply main full
 grep -q "exit=0" "$E/ceiling-main-full.txt" || { echo "full apply did not exit 0"; exit 1; }
 step apply_be_full bash "$runner" apply be full
+[[ -f "$E/step1-main-checkpoint.json" && -f "$E/step1-be-checkpoint.json" ]] || { echo "checkpoints not written into the 0750 evidence root by the container"; exit 1; }
 step readback bash "$runner" readback
 grep -q "prestate_missing_in_poststate=0" "$E/step1-main-diff.txt" || { echo "readback diff main not closed"; exit 1; }
-step restore_main bash "$runner" restore main
+# forced mid-restore stop after batch 1, then resume: batch numbering must continue (batch-2), batch-1 receipt untouched
+set +e; RESTORE_STOP_AFTER_BATCH=1 bash "$runner" restore main; rc=$?; set -e
+[[ $rc -eq 3 && -f "$E/restore-main-batch-1.txt" && ! -f "$E/restore-main-batch-2.txt" ]] || { echo "forced restore stop did not behave (rc=$rc)"; exit 1; }
+step restore_main_resume bash "$runner" restore main
+[[ -f "$E/restore-main-batch-2.txt" ]] || { echo "resume did not produce batch 2"; exit 1; }
 step restore_be bash "$runner" restore be
 grep -q "identical_to_prestate" "$E/restore-main-result.txt" && grep -q "identical_to_prestate" "$E/restore-be-result.txt" || { echo "restore not identical"; exit 1; }
-# after restore, a fresh preview must again see the full v1 population (restore is exact)
+step control bash "$runner" control
+[[ -f "$E/pg-control-2.txt" ]] || { echo "second control read missing"; exit 1; }
 step secret_scan bash "$runner" secret-scan
+grep -q "^hits=0$" "$E/secret-scan.txt" || { echo "secret scan not clean"; exit 1; }
 step finalize bash "$runner" finalize 2026-08-17T00:00:00Z 2026-08-17T00:30:00Z
+sudo -n grep -q "RESULT.txt" "$E/SHA256SUMS" || { echo "SHA256SUMS incomplete"; exit 1; }
 rm -f "$envfile"
 echo "status=ok evidence=$E"
