@@ -268,8 +268,8 @@ SQL
 }
 cmd_secret_scan() {
   local hits=0 out
-  out=$( ( set +e; pw=$(sudo -n grep -m1 '^FEEDGEN_DB_PASSWORD=' "$ENV_FILE" | cut -d= -f2- | tr -d "\"'"); [[ -n "$pw" ]] && sudo -n grep -rlF -- "$pw" "$E" ; sudo -n grep -rlE 'postgresql://[^ ]+:[^ ]+@|FEEDGEN_DB_PASSWORD=|app_password' "$E" | grep -v '/secret-scan.txt$' ) | sort -u )
-  [[ -n "$out" ]] && hits=$(echo "$out" | wc -l)
+  out=$( ( set +e; pw=$(sudo -n grep -m1 '^FEEDGEN_DB_PASSWORD=' "$ENV_FILE" | cut -d= -f2- | tr -d "\"'"); [[ -n "$pw" ]] && sudo -n grep -rlF -- "$pw" "$E" ; sudo -n grep -rlE 'postgresql://[^ ]+:[^ ]+@|FEEDGEN_DB_PASSWORD=|app_password' "$E" | grep -v '/secret-scan.txt$' ) | sort -u ) || true   # pipefail: an empty grep result is the GOOD case
+  if [[ -n "$out" ]]; then hits=$(echo "$out" | wc -l); fi
   { echo "generated_at=$(ts)"; echo "hits=$hits"; [[ -n "$out" ]] && echo "$out"; } | emit secret-scan.txt
   (( hits == 0 )) || die "secret scan found $hits file(s) with secret markers; do NOT append the ledger row"
   log "secret scan clean"
