@@ -76,11 +76,11 @@ emit() {
   log "wrote $name"
 }
 psql_ro() {  # read-only psql, pipe-separated, no header decorations
-  "${DOCKER[@]}" exec -i "$DB_CONTAINER" psql -U "$PSQL_USER" -d "$PSQL_DB" -X -A -F '|' -v ON_ERROR_STOP=1 \
+  "${DOCKER[@]}" exec -i "$DB_CONTAINER" psql -U "$PSQL_USER" -d "$PSQL_DB" -X -q -A -F '|' -v ON_ERROR_STOP=1 \
     -c "SET default_transaction_read_only = on; SET statement_timeout = '120s';" "$@"
 }
 psql_copy() {  # \copy (query) TO STDOUT
-  "${DOCKER[@]}" exec -i "$DB_CONTAINER" psql -U "$PSQL_USER" -d "$PSQL_DB" -X -v ON_ERROR_STOP=1 \
+  "${DOCKER[@]}" exec -i "$DB_CONTAINER" psql -U "$PSQL_USER" -d "$PSQL_DB" -X -q -v ON_ERROR_STOP=1 \
     -c "SET default_transaction_read_only = on; SET statement_timeout = '120s';" -c "\\copy ($1) TO STDOUT WITH (FORMAT text)"
 }
 group_dids() { case "$1" in main) echo "$MAIN_DIDS";; be) echo "$BE_DID";; *) die "group must be main|be";; esac; }
@@ -104,7 +104,8 @@ run_tool() {  # run_tool <outname> <tool args...>  -> $E/<outname>.json + .err
   local so se; so=$(mktemp); se=$(mktemp); local rc=0
   if [[ "$RUNNER" == "host" ]]; then
     : "${HOST_DSN:?HOST_DSN required for RUNNER=host}"
-    ( export FEEDGEN_POSTGRES_URL="$HOST_DSN"; node "$TREE/dist/tools/backfill-publisher-posts.js" "$@" ) >"$so" 2>"$se" || rc=$?
+    # host mode (rehearsal): run as root like the production container does, so the checkpoint in $E (root:newsflows 0750) is writable
+    sudo -n env FEEDGEN_POSTGRES_URL="$HOST_DSN" node "$TREE/dist/tools/backfill-publisher-posts.js" "$@" >"$so" 2>"$se" || rc=$?
   else
     "${DOCKER[@]}" run --rm --network "$NETWORK" --env-file "$ENV_FILE" \
       -v "$TREE:/src:ro" -v "$E:/evidence" -w /src "$IMG" \
