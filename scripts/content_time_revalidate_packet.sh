@@ -199,7 +199,7 @@ cmd_preflight() {
   fi
   psql_ro -c "$CATALOG_SQL" | emit catalog-readback.tsv
   local cat_dids cfg_dids
-  cat_dids=$(awk -F'|' 'NR>1{print $2}' "$E/catalog-readback.tsv" | sort -u | tr '\n' ',' | sed 's/,$//')
+  cat_dids=$(awk -F'|' 'NR>1 && $2!="" {print $2}' "$E/catalog-readback.tsv" | sort -u | tr '\n' ',' | sed 's/,$//')
   cfg_dids=$(echo "$MAIN_DIDS,$BE_DID" | tr ',' '\n' | sort -u | tr '\n' ',' | sed 's/,$//')
   [[ "$cat_dids" == "$cfg_dids" ]] || die "catalog publisher DIDs ($cat_dids) != configured MAIN_DIDS+BE_DID ($cfg_dids)"
   local max_main max_be; max_main=$(awk -F'|' -v pat="$MAIN_RKEY_PATTERN" 'NR>1 && $1 ~ "^"pat"$" {if($3+0>m)m=$3+0} END{print m+0}' "$E/catalog-readback.tsv"); max_be=$(awk -F'|' -v pat="$BE_RKEY_PATTERN" 'NR>1 && $1 ~ "^"pat"$" {if($3+0>m)m=$3+0} END{print m+0}' "$E/catalog-readback.tsv")
