@@ -27,6 +27,7 @@ import {
   REVALIDATION_LIMITS,
   contentTimeRevalidationConfigSha256,
   revalidateContentTimeCandidate,
+  parseRevalidateCliArgs,
 } from '../src/tools/backfill-publisher-posts'
 
 function check(condition: unknown, message: string): asserts condition {
@@ -136,7 +137,9 @@ check(CONTENT_TIME_VALIDATOR_VERSION_V1 === 'newsflows-content-time/v1', 'histor
 
 console.log('bounded-contract constant checks passed')
 
-// --- receipt/checkpoint shape must be raw-free ----------------------------
+// --- receipt/checkpoint shape must be raw-free (except the packet hash,
+// which is an operator-approved identifier, and the per-batch cursor,
+// which is deliberately a raw publisher URI/DID -- see below) -----------
 
 {
   const syntheticProgress = {
@@ -153,19 +156,102 @@ console.log('bounded-contract constant checks passed')
     cursor_author_sha256: 'a'.repeat(64),
     cursor_uri_sha256: 'b'.repeat(64),
     elapsed_ms: 4200,
+    packet_sha256: 'c'.repeat(64),
   }
   const serialized = JSON.stringify(syntheticProgress)
   check(!/at:\/\//.test(serialized), 'progress receipt must never contain a raw at:// post/publisher URI')
   check(!/did:plc:/.test(serialized), 'progress receipt must never contain a raw DID')
   check(!/\d{4}-\d{2}-\d{2}T\d{2}:\d{2}/.test(serialized), 'progress receipt must never contain a raw content/receipt timestamp (only elapsed_ms and counts)')
+  check(/^[0-9a-f]{64}$/.test(syntheticProgress.packet_sha256), 'packet_sha256 must be a lowercase sha256 hex digest, not raw packet content')
   const allowedKeys = new Set([
-    'batch', 'scanned', 'updated', 'skipped_cas', 'counts', 'cursor_author_sha256', 'cursor_uri_sha256', 'elapsed_ms',
+    'batch', 'scanned', 'updated', 'skipped_cas', 'counts', 'cursor_author_sha256', 'cursor_uri_sha256', 'elapsed_ms', 'packet_sha256',
   ])
   for (const key of Object.keys(syntheticProgress)) {
     check(allowedKeys.has(key), `unexpected key in progress receipt: ${key}`)
   }
 }
 
+// The per-batch `batches[]` breakdown is a deliberate, narrower exception:
+// the mission explicitly allows raw publisher URIs/DIDs as the per-batch
+// cursor (an operator correlating a batch against pg_stat_wal/relation-size/
+// dead-tuple deltas needs to know exactly where that batch stopped), but
+// nothing else about a row -- no post text, no participant data.
+{
+  const syntheticBatch = {
+    batch: 1,
+    candidates: 500,
+    updated: 495,
+    skipped_cas: 0,
+    counts: {
+      v1_valid_to_v2_valid: 480,
+      v1_invalid_to_v2_valid: 5,
+      v1_to_v2_invalid: 10,
+      by_v2_invalid_reason: { future_skew: 10 },
+    },
+    cursor_author: 'did:plc:example-publisher',
+    cursor_uri: 'at://did:plc:example-publisher/app.bsky.feed.post/abc123',
+    elapsed_ms: 72,
+  }
+  const allowedKeys = new Set([
+    'batch', 'candidates', 'updated', 'skipped_cas', 'counts', 'cursor_author', 'cursor_uri', 'elapsed_ms',
+  ])
+  for (const key of Object.keys(syntheticBatch)) {
+    check(allowedKeys.has(key), `unexpected key in per-batch summary: ${key}`)
+  }
+  check(syntheticBatch.cursor_author.startsWith('did:'), 'cursor_author is deliberately a raw publisher DID, not hashed')
+  check(syntheticBatch.cursor_uri.startsWith('at://'), 'cursor_uri is deliberately a raw publisher post URI, not hashed')
+}
+
 console.log('receipt raw-free shape checks passed')
+
+// --- parseRevalidateCliArgs: --packet-sha256 / --max-batches parsing -----
+
+{
+  const validSha = '1'.repeat(64)
+
+  // Neither flag is required for a bare dry-run/preview invocation.
+  const bare = parseRevalidateCliArgs([])
+  check(bare.packetSha256 === undefined, 'packet-sha256 is optional (only required with --apply, enforced in mainRevalidate)')
+  check(bare.maxBatches === undefined, 'max-batches defaults to unlimited (undefined)')
+
+  // Preview "may accept it optionally and echo it": a well-formed hash parses through untouched.
+  const withPacket = parseRevalidateCliArgs(['--packet-sha256', validSha])
+  check(withPacket.packetSha256 === validSha, '--packet-sha256 must be captured verbatim')
+
+  for (const bad of ['not-a-sha', '1'.repeat(63), '1'.repeat(65), 'A'.repeat(64), '']) {
+    check(
+      throws(() => parseRevalidateCliArgs(bad === '' ? ['--packet-sha256'] : ['--packet-sha256', bad])),
+      `--packet-sha256 must reject malformed hash: ${JSON.stringify(bad)}`,
+    )
+  }
+
+  const withMaxBatches = parseRevalidateCliArgs(['--max-batches', '3'])
+  check(withMaxBatches.maxBatches === 3, '--max-batches must be captured as a number')
+
+  // Leading/trailing whitespace around an otherwise-valid integer (e.g. ' 3 ')
+  // is deliberately accepted (trimmed) -- only genuinely non-integer input
+  // is rejected here.
+  for (const bad of ['0', '-1', '1.5', 'abc', ' ', '3abc']) {
+    check(
+      throws(() => parseRevalidateCliArgs(['--max-batches', bad])),
+      `--max-batches must reject non-positive-integer input: ${JSON.stringify(bad)}`,
+    )
+  }
+
+  // Both flags combine cleanly with the rest of the existing surface.
+  const combined = parseRevalidateCliArgs(['--apply', '--packet-sha256', validSha, '--max-batches', '1', '--json'])
+  check(combined.apply === true && combined.json === true && combined.packetSha256 === validSha && combined.maxBatches === 1, 'flags must combine without interference')
+}
+
+function throws(fn: () => unknown): boolean {
+  try {
+    fn()
+    return false
+  } catch {
+    return true
+  }
+}
+
+console.log('parseRevalidateCliArgs --packet-sha256 / --max-batches checks passed')
 
 console.log('content-time revalidate contract tests passed')

@@ -18,16 +18,26 @@
 #      publisher DID, plus a transition matrix of public.post rows (v1-valid,
 #      v1-invalid/past_bound, v1-valid/future_skew-under-v2, an
 #      already-v2 control, a legacy_unknown control, a disabled-publisher
-#      control, and an out-of-window control).
+#      control, and an out-of-window control), plus 502 cheap generated
+#      v1-valid rows so the CLI phase has more than one 500-row batch of work.
 #   4. Exercises the *built CLI* end-to-end: dry-run preview (default
-#      publisher-DID resolution from feed_catalog), apply, and an idempotent
-#      second apply -- proving the catalog-driven selection and the
-#      checkpoint/receipt contract exactly as an operator would invoke them.
+#      publisher-DID resolution from feed_catalog, --packet-sha256 accepted
+#      and echoed), apply --max-batches 1 (stops after exactly one 500-row
+#      batch, exit 3, WAL bytes / relation growth / dead tuples captured
+#      around that single bounded call -- the "one batch, check the D4
+#      ceilings, continue" workflow), apply resume with the same
+#      --checkpoint-file and no --max-batches (finishes the remaining rows,
+#      exit 0), a packet-hash-mismatch rejection against that checkpoint, a
+#      missing---packet-sha256 rejection, and an idempotent re-apply --
+#      proving the catalog-driven selection and the checkpoint/receipt/
+#      packet-binding contract exactly as an operator would invoke them.
 #   5. Runs scripts/test_content_time_revalidate_execute.ts against the same
 #      container for the parts that need direct control over batch size/
-#      timing: forced-stop + resume, checkpoint-mismatch rejection, the CAS
-#      predicate proof, duration stop, inter-batch pause, lock timeout, and
-#      the WAL bytes / relation growth / dead tuple capture at 500-row scale.
+#      timing: forced-stop + resume, checkpoint-mismatch rejection, packet-
+#      sha256 format/binding rejection, the CAS predicate proof, duration
+#      stop, inter-batch pause, lock timeout, the per-batch `batches[]`
+#      breakdown, and the WAL bytes / relation growth / dead tuple capture
+#      at 500-row scale.
 #   6. Tears the container down.
 #
 # NOTE on feedgen_ops.feed_catalog: no migration in src/db/migrations.ts
@@ -93,6 +103,10 @@ db_password="feedgen"
 dsn="postgresql://${db_user}:${db_password}@127.0.0.1:${port}/${db_name}"
 workdir="$(mktemp -d "${TMPDIR:-/tmp}/feedgen-revalidate-rehearsal-XXXXXX")"
 checkpoint_file="${workdir}/checkpoint.json"
+# Fixed dummy packet hash for rehearsal, same convention as the V7 rehearsal's
+# PACKET_SHA = '1'.repeat(64) in test_content_time_recovery_execute.ts. Not a
+# real approved production packet -- this script never touches production.
+packet_sha256="$(printf '1%.0s' $(seq 1 64))"
 
 cleanup() {
   if [[ "${FEEDGEN_REVALIDATE_REHEARSAL_KEEP:-}" == "1" ]]; then
@@ -220,13 +234,42 @@ INSERT INTO public.post (
    convert_to('2026-06-01T12:00:00+00:00', 'UTF8'), '2026-06-01T12:00:00.000Z', 'source_valid',
    NULL, 'newsflows-content-time/v1');
 SQL
+
+# 502 extra cheap v1-valid in-window rows for publisher A, generated instead
+# of listed, so the CLI phase below has more than one batch's worth of work
+# (REVALIDATION_LIMITS.batchSize=500 is not CLI-overridable) and can prove
+# --max-batches 1 stopping with real work remaining, then resuming with the
+# same --checkpoint-file. Combined with the 3-row transition matrix above,
+# this brings the total in-window v1 candidate count to 505 (500 + 5).
+"${DOCKER[@]}" exec -i "$container" psql -U "$db_user" -d "$db_name" -v ON_ERROR_STOP=1 >/dev/null <<SQL
+INSERT INTO public.post (
+  uri, cid, "indexedAt", "createdAt", author, text, "rootUri", "rootCid",
+  link_uri, link_title, link_description, "linkUrl", "linkTitle", "linkDescription",
+  created_at_source_raw, content_time_utc, content_time_status,
+  content_time_clamp_reason, content_time_validator_version
+)
+SELECT
+  'at://${publisher_a}/app.bsky.feed.post/bulk-cli-' || lpad(g::text, 4, '0'),
+  'cid-bulk-cli-' || g::text,
+  '2026-08-12T12:00:00.000Z',
+  '2026-08-02T12:00:00.000Z',
+  '${publisher_a}',
+  'bulk-cli-' || g::text,
+  '', '', '', '', '', '', '', '',
+  convert_to('2026-08-02T12:00:00+00:00', 'UTF8'),
+  '2026-08-02T12:00:00.000Z',
+  'source_valid',
+  NULL,
+  'newsflows-content-time/v1'
+FROM generate_series(1, 502) AS g;
+SQL
 echo "status=seed_complete"
 
 # --- Step 4: exercise the built CLI end-to-end -----------------------------
 
 preview_json="${workdir}/preview.json"
 FEEDGEN_POSTGRES_URL="$dsn" node dist/tools/backfill-publisher-posts.js --mode revalidate \
-  --since 2026-08-01T00:00:00.000Z --json \
+  --since 2026-08-01T00:00:00.000Z --json --packet-sha256 "$packet_sha256" \
   >"$preview_json" 2>"${workdir}/preview.err"
 
 scanned="$(node -e "console.log(JSON.parse(require('fs').readFileSync(process.argv[1],'utf8')).preview.scanned)" "$preview_json")"
@@ -234,26 +277,100 @@ valid_to_valid="$(node -e "console.log(JSON.parse(require('fs').readFileSync(pro
 invalid_to_valid="$(node -e "console.log(JSON.parse(require('fs').readFileSync(process.argv[1],'utf8')).preview.counts.v1_invalid_to_v2_valid)" "$preview_json")"
 to_invalid="$(node -e "console.log(JSON.parse(require('fs').readFileSync(process.argv[1],'utf8')).preview.counts.v1_to_v2_invalid)" "$preview_json")"
 actor_count="$(node -e "console.log(JSON.parse(require('fs').readFileSync(process.argv[1],'utf8')).actor_count)" "$preview_json")"
+preview_packet_echo="$(node -e "console.log(JSON.parse(require('fs').readFileSync(process.argv[1],'utf8')).packet_sha256)" "$preview_json")"
 
 preview_ok=false
-if [[ "$scanned" == "3" && "$valid_to_valid" == "1" && "$invalid_to_valid" == "1" && "$to_invalid" == "1" && "$actor_count" == "2" ]]; then
+if [[ "$scanned" == "505" && "$valid_to_valid" == "503" && "$invalid_to_valid" == "1" && "$to_invalid" == "1" \
+  && "$actor_count" == "2" && "$preview_packet_echo" == "$packet_sha256" ]]; then
   preview_ok=true
 fi
-echo "status=cli_preview scanned=${scanned} v1_valid_to_v2_valid=${valid_to_valid} v1_invalid_to_v2_valid=${invalid_to_valid} v1_to_v2_invalid=${to_invalid} actor_count=${actor_count} preview_ok=${preview_ok}"
+echo "status=cli_preview scanned=${scanned} v1_valid_to_v2_valid=${valid_to_valid} v1_invalid_to_v2_valid=${invalid_to_valid} v1_to_v2_invalid=${to_invalid} actor_count=${actor_count} packet_echoed=$([ "$preview_packet_echo" == "$packet_sha256" ] && echo true || echo false) preview_ok=${preview_ok}"
 
-apply_json="${workdir}/apply.json"
+# --max-batches 1: apply must stop after exactly one 500-row batch, report
+# complete=false, and exit 3 -- with 5 rows still pending. This is the
+# "run one batch, measure deltas against the D4 ceilings" workflow: capture
+# WAL bytes / relation growth / dead tuples around this single bounded call.
+"${DOCKER[@]}" exec -i "$container" psql -U "$db_user" -d "$db_name" -v ON_ERROR_STOP=1 >/dev/null <<'SQL'
+ANALYZE public.post;
+SQL
+batch1_stats_before="$("${DOCKER[@]}" exec -i "$container" psql -U "$db_user" -d "$db_name" -At <<'SQL'
+SELECT pg_current_wal_lsn()::text || '|' || pg_total_relation_size('public.post')::text || '|' || n_dead_tup::text
+FROM pg_stat_user_tables WHERE schemaname = 'public' AND relname = 'post';
+SQL
+)"
+batch1_wal_before="${batch1_stats_before%%|*}"
+batch1_rest="${batch1_stats_before#*|}"
+batch1_bytes_before="${batch1_rest%%|*}"
+batch1_dead_before="${batch1_rest#*|}"
+
+apply1_json="${workdir}/apply_batch1.json"
+set +e
+FEEDGEN_POSTGRES_URL="$dsn" node dist/tools/backfill-publisher-posts.js --mode revalidate --apply \
+  --since 2026-08-01T00:00:00.000Z --json --packet-sha256 "$packet_sha256" \
+  --checkpoint-file "$checkpoint_file" --max-batches 1 \
+  >"$apply1_json" 2>"${workdir}/apply_batch1.err"
+apply1_exit=$?
+set -e
+
+"${DOCKER[@]}" exec -i "$container" psql -U "$db_user" -d "$db_name" -v ON_ERROR_STOP=1 >/dev/null <<'SQL'
+SELECT pg_stat_force_next_flush();
+ANALYZE public.post;
+SQL
+batch1_stats_after="$("${DOCKER[@]}" exec -i "$container" psql -U "$db_user" -d "$db_name" -At <<SQL
+SELECT pg_wal_lsn_diff(pg_current_wal_lsn(), '${batch1_wal_before}')::text || '|' || pg_total_relation_size('public.post')::text || '|' || n_dead_tup::text
+FROM pg_stat_user_tables WHERE schemaname = 'public' AND relname = 'post';
+SQL
+)"
+batch1_wal_bytes="${batch1_stats_after%%|*}"
+batch1_rest_after="${batch1_stats_after#*|}"
+batch1_bytes_after="${batch1_rest_after%%|*}"
+batch1_dead_after="${batch1_rest_after#*|}"
+
+apply1_updated="$(node -e "console.log(JSON.parse(require('fs').readFileSync(process.argv[1],'utf8')).revalidation.updated)" "$apply1_json")"
+apply1_complete="$(node -e "console.log(JSON.parse(require('fs').readFileSync(process.argv[1],'utf8')).revalidation.complete)" "$apply1_json")"
+apply1_batches_len="$(node -e "console.log(JSON.parse(require('fs').readFileSync(process.argv[1],'utf8')).revalidation.batches.length)" "$apply1_json")"
+apply1_packet="$(node -e "console.log(JSON.parse(require('fs').readFileSync(process.argv[1],'utf8')).revalidation.packet_sha256)" "$apply1_json")"
+echo "status=cli_apply_batch1 exit=${apply1_exit} updated=${apply1_updated} complete=${apply1_complete} batches_len=${apply1_batches_len} packet=$([ "$apply1_packet" == "$packet_sha256" ] && echo ok || echo mismatch) wal_bytes=${batch1_wal_bytes} relation_bytes_before=${batch1_bytes_before} relation_bytes_after=${batch1_bytes_after} dead_tuples_before=${batch1_dead_before} dead_tuples_after=${batch1_dead_after}"
+
+# Resume with the SAME checkpoint file, no --max-batches (unlimited): must
+# finish the remaining 5 rows, complete=true, exit 0.
+apply2_json="${workdir}/apply_batch2.json"
+FEEDGEN_POSTGRES_URL="$dsn" node dist/tools/backfill-publisher-posts.js --mode revalidate --apply \
+  --since 2026-08-01T00:00:00.000Z --json --packet-sha256 "$packet_sha256" \
+  --checkpoint-file "$checkpoint_file" \
+  >"$apply2_json" 2>"${workdir}/apply_batch2.err"
+apply2_exit=$?
+apply2_updated="$(node -e "console.log(JSON.parse(require('fs').readFileSync(process.argv[1],'utf8')).revalidation.updated)" "$apply2_json")"
+apply2_complete="$(node -e "console.log(JSON.parse(require('fs').readFileSync(process.argv[1],'utf8')).revalidation.complete)" "$apply2_json")"
+echo "status=cli_apply_resume exit=${apply2_exit} updated=${apply2_updated} complete=${apply2_complete}"
+
+# Mismatched packet against the same checkpoint file must be rejected.
+mismatch_err=0
+FEEDGEN_POSTGRES_URL="$dsn" node dist/tools/backfill-publisher-posts.js --mode revalidate --apply \
+  --since 2026-08-01T00:00:00.000Z --json --packet-sha256 "$(printf '2%.0s' $(seq 1 64))" \
+  --checkpoint-file "$checkpoint_file" \
+  >"${workdir}/apply_packet_mismatch.json" 2>"${workdir}/apply_packet_mismatch.err" || mismatch_err=$?
+packet_mismatch_rejected=false
+if [[ "$mismatch_err" -ne 0 ]] && grep -q 'does not match the approved revalidation packet' "${workdir}/apply_packet_mismatch.err"; then
+  packet_mismatch_rejected=true
+fi
+echo "status=cli_packet_mismatch rejected=${packet_mismatch_rejected}"
+
+# Apply without --packet-sha256 at all must be rejected outright.
+missing_packet_err=0
 FEEDGEN_POSTGRES_URL="$dsn" node dist/tools/backfill-publisher-posts.js --mode revalidate --apply \
   --since 2026-08-01T00:00:00.000Z --json \
-  --checkpoint-file "$checkpoint_file" \
-  >"$apply_json" 2>"${workdir}/apply.err"
-
-apply_updated="$(node -e "console.log(JSON.parse(require('fs').readFileSync(process.argv[1],'utf8')).revalidation.updated)" "$apply_json")"
-apply_complete="$(node -e "console.log(JSON.parse(require('fs').readFileSync(process.argv[1],'utf8')).revalidation.complete)" "$apply_json")"
-echo "status=cli_apply updated=${apply_updated} complete=${apply_complete}"
+  --checkpoint-file "${workdir}/no-packet-checkpoint.json" \
+  >"${workdir}/apply_missing_packet.json" 2>"${workdir}/apply_missing_packet.err" || missing_packet_err=$?
+missing_packet_rejected=false
+if [[ "$missing_packet_err" -ne 0 ]] && grep -q -- '--packet-sha256 is required with --apply' "${workdir}/apply_missing_packet.err"; then
+  missing_packet_rejected=true
+fi
+echo "status=cli_missing_packet rejected=${missing_packet_rejected}"
 
 rerun_json="${workdir}/rerun.json"
 FEEDGEN_POSTGRES_URL="$dsn" node dist/tools/backfill-publisher-posts.js --mode revalidate --apply \
-  --since 2026-08-01T00:00:00.000Z --json \
+  --since 2026-08-01T00:00:00.000Z --json --packet-sha256 "$packet_sha256" \
   --checkpoint-file "${workdir}/rerun-checkpoint.json" \
   >"$rerun_json" 2>"${workdir}/rerun.err"
 rerun_updated="$(node -e "console.log(JSON.parse(require('fs').readFileSync(process.argv[1],'utf8')).revalidation.updated)" "$rerun_json")"
@@ -261,7 +378,11 @@ rerun_scanned="$(node -e "console.log(JSON.parse(require('fs').readFileSync(proc
 echo "status=cli_idempotent_rerun updated=${rerun_updated} scanned=${rerun_scanned}"
 
 cli_ok=false
-if [[ "$preview_ok" == true && "$apply_updated" == "3" && "$apply_complete" == "true" && "$rerun_updated" == "0" && "$rerun_scanned" == "0" ]]; then
+if [[ "$preview_ok" == true \
+  && "$apply1_exit" == "3" && "$apply1_updated" == "500" && "$apply1_complete" == "false" && "$apply1_batches_len" == "1" \
+  && "$apply2_exit" == "0" && "$apply2_updated" == "5" && "$apply2_complete" == "true" \
+  && "$packet_mismatch_rejected" == true && "$missing_packet_rejected" == true \
+  && "$rerun_updated" == "0" && "$rerun_scanned" == "0" ]]; then
   cli_ok=true
 fi
 

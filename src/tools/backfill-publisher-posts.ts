@@ -626,10 +626,29 @@ export type ContentTimeRevalidationProgress = {
   cursor_author_sha256: string
   cursor_uri_sha256: string
   elapsed_ms: number
+  packet_sha256: string
+}
+
+// One entry per committed batch transaction, in order. cursor_author/
+// cursor_uri are the raw publisher DID / post URI the batch advanced to --
+// deliberately not hashed here (unlike the cumulative cursor_*_sha256
+// fields above): an operator comparing this array against pg_stat_wal /
+// relation-size / dead-tuple deltas per batch needs the actual cursor to
+// know where to look, and publisher URIs are not participant data.
+export type ContentTimeRevalidationBatchSummary = {
+  batch: number
+  candidates: number
+  updated: number
+  skipped_cas: number
+  counts: ContentTimeRevalidationCounts
+  cursor_author: string
+  cursor_uri: string
+  elapsed_ms: number
 }
 
 export type ContentTimeRevalidationResult = ContentTimeRevalidationProgress & {
   complete: boolean
+  batches: ContentTimeRevalidationBatchSummary[]
 }
 
 export type ContentTimeRevalidationCheckpoint = ContentTimeRevalidationProgress & {
@@ -642,6 +661,7 @@ export type ContentTimeRevalidationOptions = {
   actors: string[]
   since: Date
   batchSize: number
+  packetSha256: string
   afterAuthor?: string
   afterUri?: string
   configSha256?: string
@@ -828,6 +848,9 @@ export async function runContentTimeRevalidation(
   db: Database,
   options: ContentTimeRevalidationOptions,
 ): Promise<ContentTimeRevalidationResult> {
+  if (!/^[0-9a-f]{64}$/.test(options.packetSha256)) {
+    throw new Error('packetSha256 must be a lowercase SHA-256')
+  }
   const actors = [...new Set(options.actors)].sort()
   if (actors.length === 0) {
     throw new Error('content-time revalidation requires at least one publisher DID')
@@ -844,6 +867,9 @@ export async function runContentTimeRevalidation(
     if (!Number.isInteger(value) || value < (name === 'pauseMs' ? 0 : 1)) {
       throw new Error(`${name} must be a ${name === 'pauseMs' ? 'non-negative' : 'positive'} integer`)
     }
+  }
+  if (options.maxBatches !== undefined && (!Number.isInteger(options.maxBatches) || options.maxBatches < 1)) {
+    throw new Error('maxBatches must be a positive integer')
   }
 
   const sinceIso = options.since.toISOString()
@@ -864,6 +890,7 @@ export async function runContentTimeRevalidation(
   let cursorAuthor = options.afterAuthor ?? ''
   let cursorUri = options.afterUri ?? ''
   let complete = false
+  const batches: ContentTimeRevalidationBatchSummary[] = []
 
   while (true) {
     const remainingMs = deadlineMs - Date.now()
@@ -875,6 +902,7 @@ export async function runContentTimeRevalidation(
       complete = false
       break
     }
+    const batchStartedAt = Date.now()
     const result = await applyRevalidationBatch(
       db,
       actors,
@@ -897,6 +925,17 @@ export async function runContentTimeRevalidation(
     counts = mergeRevalidationCounts(counts, result.counts)
     cursorAuthor = result.cursorAuthor
     cursorUri = result.cursorUri
+    const batchElapsedMs = Date.now() - batchStartedAt
+    batches.push({
+      batch,
+      candidates: result.candidates,
+      updated: result.updated,
+      skipped_cas: result.skipped_cas,
+      counts: result.counts,
+      cursor_author: cursorAuthor,
+      cursor_uri: cursorUri,
+      elapsed_ms: batchElapsedMs,
+    })
 
     const progress: ContentTimeRevalidationProgress = {
       batch,
@@ -907,6 +946,7 @@ export async function runContentTimeRevalidation(
       cursor_author_sha256: sha256(cursorAuthor),
       cursor_uri_sha256: sha256(cursorUri),
       elapsed_ms: Date.now() - startedAt,
+      packet_sha256: options.packetSha256,
     }
     options.onProgress?.(progress)
     options.onCheckpoint?.({
@@ -937,7 +977,9 @@ export async function runContentTimeRevalidation(
     cursor_author_sha256: cursorAuthor ? sha256(cursorAuthor) : '',
     cursor_uri_sha256: cursorUri ? sha256(cursorUri) : '',
     elapsed_ms: Date.now() - startedAt,
+    packet_sha256: options.packetSha256,
     complete,
+    batches,
   }
 }
 
@@ -1103,7 +1145,7 @@ function readCheckpoint(
   return { cursorUri: checkpoint.cursor_uri, planSha256: checkpoint.plan_sha256 }
 }
 
-function writeCheckpoint(file: string, checkpoint: object) {
+export function writeCheckpoint(file: string, checkpoint: object) {
   fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 })
   const temporary = `${file}.tmp`
   const descriptor = fs.openSync(temporary, 'w', 0o600)
@@ -1125,7 +1167,7 @@ function writeCheckpoint(file: string, checkpoint: object) {
 
 // --- mode: revalidate CLI wiring ------------------------------------------
 
-type RevalidateCliOptions = {
+export type RevalidateCliOptions = {
   actors?: string[]
   since: Date
   apply: boolean
@@ -1133,9 +1175,11 @@ type RevalidateCliOptions = {
   dbUrl?: string
   checkpointFile?: string
   maxPreviewRows: number
+  packetSha256?: string
+  maxBatches?: number
 }
 
-function parseRevalidateCliArgs(argv: string[]): RevalidateCliOptions {
+export function parseRevalidateCliArgs(argv: string[]): RevalidateCliOptions {
   const flags = new Map<string, string[]>()
   let apply = false
   let json = false
@@ -1176,6 +1220,20 @@ function parseRevalidateCliArgs(argv: string[]): RevalidateCliOptions {
     throw new Error('--max-preview-rows must be a positive integer')
   }
 
+  const packetSha256 = flags.get('packet-sha256')?.at(-1)
+  if (packetSha256 !== undefined && !/^[0-9a-f]{64}$/.test(packetSha256)) {
+    throw new Error('--packet-sha256 must be a lowercase 64-character hex SHA-256')
+  }
+
+  const maxBatchesRaw = flags.get('max-batches')?.at(-1)
+  let maxBatches: number | undefined
+  if (maxBatchesRaw !== undefined) {
+    maxBatches = Number.parseInt(maxBatchesRaw, 10)
+    if (!Number.isInteger(maxBatches) || String(maxBatches) !== maxBatchesRaw.trim() || maxBatches < 1) {
+      throw new Error('--max-batches must be a positive integer')
+    }
+  }
+
   return {
     actors: actorsCsv.length ? actorsCsv : undefined,
     since,
@@ -1184,21 +1242,25 @@ function parseRevalidateCliArgs(argv: string[]): RevalidateCliOptions {
     dbUrl: flags.get('db-url')?.at(-1) || process.env.FEEDGEN_POSTGRES_URL,
     checkpointFile: flags.get('checkpoint-file')?.at(-1),
     maxPreviewRows,
+    packetSha256,
+    maxBatches,
   }
 }
 
-function readRevalidationCheckpoint(
+export function readRevalidationCheckpoint(
   file: string,
   configSha256: string,
+  packetSha256: string,
 ): { cursorAuthor: string; cursorUri: string } | undefined {
   if (!fs.existsSync(file)) return undefined
   const checkpoint = JSON.parse(fs.readFileSync(file, 'utf8'))
   if (
     checkpoint.config_sha256 !== configSha256 ||
+    checkpoint.packet_sha256 !== packetSha256 ||
     typeof checkpoint.cursor_author !== 'string' ||
     typeof checkpoint.cursor_uri !== 'string'
   ) {
-    throw new Error('checkpoint does not match the approved revalidation config (actors, since, or validator versions changed)')
+    throw new Error('checkpoint does not match the approved revalidation packet (actors, since, validator versions, or packet-sha256 changed)')
   }
   return { cursorAuthor: checkpoint.cursor_author, cursorUri: checkpoint.cursor_uri }
 }
@@ -1224,8 +1286,11 @@ async function mainRevalidate(argv: string[]) {
 
     if (options.apply) {
       if (!options.checkpointFile) throw new Error('--checkpoint-file is required with --apply')
+      if (!options.packetSha256 || !/^[0-9a-f]{64}$/.test(options.packetSha256)) {
+        throw new Error('--packet-sha256 is required with --apply')
+      }
       const configSha256 = contentTimeRevalidationConfigSha256(actors, options.since.toISOString())
-      const checkpoint = readRevalidationCheckpoint(options.checkpointFile, configSha256)
+      const checkpoint = readRevalidationCheckpoint(options.checkpointFile, configSha256, options.packetSha256)
       const deadlineMs = startedAt + REVALIDATION_LIMITS.maxDurationMs
       const remainingMs = deadlineMs - Date.now()
       if (remainingMs <= 0) throw new Error('content-time revalidation exhausted its own startup deadline')
@@ -1233,9 +1298,11 @@ async function mainRevalidate(argv: string[]) {
         actors,
         since: options.since,
         batchSize: REVALIDATION_LIMITS.batchSize,
+        packetSha256: options.packetSha256,
         afterAuthor: checkpoint?.cursorAuthor,
         afterUri: checkpoint?.cursorUri,
         configSha256: checkpoint ? configSha256 : undefined,
+        maxBatches: options.maxBatches,
         maxDurationMs: remainingMs,
         pauseMs: REVALIDATION_LIMITS.pauseMs,
         lockTimeoutMs: REVALIDATION_LIMITS.lockTimeoutMs,
@@ -1261,6 +1328,7 @@ async function mainRevalidate(argv: string[]) {
       since: options.since.toISOString(),
       from_validator_version: CONTENT_TIME_VALIDATOR_VERSION_V1,
       to_validator_version: CONTENT_TIME_VALIDATOR_VERSION,
+      packet_sha256: options.packetSha256 ?? null,
       preview,
       revalidation,
     }
