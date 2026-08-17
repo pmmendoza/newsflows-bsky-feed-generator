@@ -16,12 +16,18 @@
  * public schema.
  */
 import assert from 'assert'
+import fs from 'fs'
+import os from 'os'
+import path from 'path'
 import { Kysely, PostgresDialect, sql } from 'kysely'
 import { Pool } from 'pg'
 import {
   REVALIDATION_LIMITS,
   runContentTimeRevalidation,
   previewContentTimeRevalidation,
+  contentTimeRevalidationConfigSha256,
+  writeCheckpoint,
+  readRevalidationCheckpoint,
   type ContentTimeRevalidationCheckpoint,
 } from '../src/tools/backfill-publisher-posts'
 import {
@@ -32,6 +38,11 @@ import {
 const PUBLISHER_A = 'did:plc:publisher-a'
 const PUBLISHER_B = 'did:plc:publisher-b'
 const OTHER_AUTHOR = 'did:plc:not-a-target-publisher'
+
+// Same fixed-dummy-hex convention as the V7 rehearsal (PACKET_SHA =
+// '1'.repeat(64) in test_content_time_recovery_execute.ts).
+const PACKET_SHA = '1'.repeat(64)
+const OTHER_PACKET_SHA = '2'.repeat(64)
 
 type SeedRow = {
   rkey: string
@@ -241,6 +252,7 @@ async function main() {
     let checkpoint: ContentTimeRevalidationCheckpoint | undefined
     const first = await runContentTimeRevalidation(db, {
       actors,
+      packetSha256: PACKET_SHA,
       since,
       batchSize: 1,
       maxBatches: 1,
@@ -254,9 +266,22 @@ async function main() {
     assert.equal(first.batch, 1)
     assert.equal(first.scanned, 1)
     assert.equal(first.updated, 1)
+    assert.equal(first.packet_sha256, PACKET_SHA, 'result must echo the packet hash the run was bound to')
+    // --max-batches 1 stop: exactly one batch summary, raw cursor present
+    // (publisher URIs are allowed in the per-batch breakdown), and the
+    // per-batch totals must sum to the cumulative totals above.
+    assert.equal(first.batches.length, 1)
+    assert.equal(first.batches[0].batch, 1)
+    assert.equal(first.batches[0].candidates, 1)
+    assert.equal(first.batches[0].updated, 1)
+    assert.equal(first.batches[0].skipped_cas, 0)
+    assert(first.batches[0].cursor_author.startsWith('did:plc:'), 'per-batch cursor_author must be the raw DID, not a hash')
+    assert(first.batches[0].cursor_uri.startsWith('at://'), 'per-batch cursor_uri must be the raw URI, not a hash')
+    assert(typeof first.batches[0].elapsed_ms === 'number' && first.batches[0].elapsed_ms >= 0)
 
     const resumed = await runContentTimeRevalidation(db, {
       actors,
+      packetSha256: PACKET_SHA,
       since,
       batchSize: 1,
       afterAuthor: checkpoint!.cursor_author,
@@ -269,11 +294,16 @@ async function main() {
     })
     assert.equal(resumed.complete, true)
     assert.equal(resumed.scanned, 2, 'resume must pick up exactly the remaining 2 in-window rows')
+    assert.equal(resumed.batches.length, 2, 'batchSize=1 over 2 remaining rows must produce 2 per-batch summaries')
+    assert.equal(resumed.packet_sha256, PACKET_SHA)
+    const resumedBatchTotal = resumed.batches.reduce((sum, b) => sum + b.updated, 0)
+    assert.equal(resumedBatchTotal, resumed.updated, 'per-batch updated counts must sum to the cumulative total')
 
     // Mismatched checkpoint (config changed) must be rejected, not silently resumed.
     await assert.rejects(
       runContentTimeRevalidation(db, {
         actors: [PUBLISHER_A], // different actor set than the checkpoint was taken under
+        packetSha256: PACKET_SHA,
         since,
         batchSize: 1,
         afterAuthor: checkpoint!.cursor_author,
@@ -328,6 +358,7 @@ async function main() {
 
     const rerun = await runContentTimeRevalidation(db, {
       actors,
+      packetSha256: PACKET_SHA,
       since,
       batchSize: REVALIDATION_LIMITS.batchSize,
       maxDurationMs: 30_000,
@@ -388,6 +419,7 @@ async function main() {
     // via the real run (proves the guard is precise, not just always-false).
     const guardCleanup = await runContentTimeRevalidation(db, {
       actors,
+      packetSha256: PACKET_SHA,
       since,
       batchSize: REVALIDATION_LIMITS.batchSize,
       maxDurationMs: 30_000,
@@ -417,7 +449,7 @@ async function main() {
       })
     }
     const durationLimited = await runContentTimeRevalidation(db, {
-      actors, since, batchSize: 1, maxDurationMs: 1000, pauseMs: 2000,
+      actors, packetSha256: PACKET_SHA, since, batchSize: 1, maxDurationMs: 1000, pauseMs: 2000,
       lockTimeoutMs: 5000, statementTimeoutMs: 30_000,
     })
     assert.equal(durationLimited.complete, false)
@@ -425,7 +457,7 @@ async function main() {
     assert(durationLimited.elapsed_ms < 1500, 'duration stop did not fire promptly')
 
     const pauseLimited = await runContentTimeRevalidation(db, {
-      actors, since, batchSize: 1, maxDurationMs: 5000, pauseMs: 1000,
+      actors, packetSha256: PACKET_SHA, since, batchSize: 1, maxDurationMs: 5000, pauseMs: 1000,
       lockTimeoutMs: 5000, statementTimeoutMs: 30_000,
     })
     assert.equal(pauseLimited.complete, true)
@@ -433,11 +465,54 @@ async function main() {
 
     await assert.rejects(
       runContentTimeRevalidation(db, {
-        actors, since, batchSize: 501, maxDurationMs: 30_000, pauseMs: 0,
+        actors, packetSha256: PACKET_SHA, since, batchSize: 501, maxDurationMs: 30_000, pauseMs: 0,
         lockTimeoutMs: 5000, statementTimeoutMs: 30_000,
       }),
       /batchSize must be an integer from 1 to 500/,
     )
+
+    // -- packet-sha256 binding: apply always requires a valid packet hash,
+    // and a checkpoint recorded under a different packet must be rejected
+    // (mirrors the recover mode's readCheckpoint / packetSha256 contract).
+
+    await assert.rejects(
+      runContentTimeRevalidation(db, {
+        actors, packetSha256: 'not-a-sha256', since, batchSize: 1, maxDurationMs: 30_000,
+        pauseMs: 0, lockTimeoutMs: 5000, statementTimeoutMs: 30_000,
+      }),
+      /packetSha256 must be a lowercase SHA-256/,
+    )
+    await assert.rejects(
+      runContentTimeRevalidation(db, {
+        actors, packetSha256: PACKET_SHA.toUpperCase(), since, batchSize: 1, maxDurationMs: 30_000,
+        pauseMs: 0, lockTimeoutMs: 5000, statementTimeoutMs: 30_000,
+      }),
+      /packetSha256 must be a lowercase SHA-256/,
+      'uppercase hex must be rejected -- the packet hash contract is lowercase-only',
+    )
+
+    {
+      const checkpointFile = path.join(os.tmpdir(), `feedgen-revalidate-rehearsal-checkpoint-${process.pid}-${Date.now()}.json`)
+      try {
+        const configSha256 = contentTimeRevalidationConfigSha256(actors, since.toISOString())
+        writeCheckpoint(checkpointFile, {
+          config_sha256: configSha256,
+          packet_sha256: PACKET_SHA,
+          cursor_author: PUBLISHER_A,
+          cursor_uri: uri(PUBLISHER_A, 'valid-stays-valid'),
+        })
+        // Same packet -> checkpoint is accepted.
+        const accepted = readRevalidationCheckpoint(checkpointFile, configSha256, PACKET_SHA)
+        assert.deepEqual(accepted, { cursorAuthor: PUBLISHER_A, cursorUri: uri(PUBLISHER_A, 'valid-stays-valid') })
+        // Different packet -> checkpoint must be rejected, not silently resumed.
+        assert.throws(
+          () => readRevalidationCheckpoint(checkpointFile, configSha256, OTHER_PACKET_SHA),
+          /checkpoint does not match the approved revalidation packet/,
+        )
+      } finally {
+        fs.rmSync(checkpointFile, { force: true })
+      }
+    }
 
     // -- Lock timeout: a row locked by another session must surface the
     // Postgres lock-timeout error, not hang or silently skip.
@@ -461,7 +536,7 @@ async function main() {
       const lockStarted = Date.now()
       await assert.rejects(
         runContentTimeRevalidation(db, {
-          actors: [PUBLISHER_A], since, batchSize: REVALIDATION_LIMITS.batchSize,
+          actors: [PUBLISHER_A], packetSha256: PACKET_SHA, since, batchSize: REVALIDATION_LIMITS.batchSize,
           maxDurationMs: 30_000, pauseMs: 0, lockTimeoutMs: 5000, statementTimeoutMs: 30_000,
         }),
         /canceling statement due to lock timeout/,
@@ -476,7 +551,7 @@ async function main() {
     // Clean up the still-v1 rows left by the lock/duration-stop probes so
     // the WAL/dead-tuple bulk measurement below starts from a known state.
     const cleanup = await runContentTimeRevalidation(db, {
-      actors, since, batchSize: REVALIDATION_LIMITS.batchSize, maxDurationMs: 30_000,
+      actors, packetSha256: PACKET_SHA, since, batchSize: REVALIDATION_LIMITS.batchSize, maxDurationMs: 30_000,
       pauseMs: 0, lockTimeoutMs: 5000, statementTimeoutMs: 30_000,
     })
     assert.equal(cleanup.complete, true)
@@ -506,10 +581,13 @@ async function main() {
     `.execute(db)
 
     const bulkResult = await runContentTimeRevalidation(db, {
-      actors, since, batchSize: REVALIDATION_LIMITS.batchSize, maxDurationMs: 30_000,
+      actors, packetSha256: PACKET_SHA, since, batchSize: REVALIDATION_LIMITS.batchSize, maxDurationMs: 30_000,
       pauseMs: 0, lockTimeoutMs: 5000, statementTimeoutMs: 30_000,
     })
     assert.equal(bulkResult.updated, 500)
+    assert.equal(bulkResult.batches.length, 1, '500 candidates at batchSize=500 must be exactly one batch summary')
+    assert.equal(bulkResult.batches[0].updated, 500)
+    assert.equal(bulkResult.packet_sha256, PACKET_SHA)
 
     await sql`SELECT pg_stat_force_next_flush()`.execute(db)
     await sql`ANALYZE public.post`.execute(db)
@@ -537,6 +615,10 @@ async function main() {
       idempotent_rerun_proven: true,
       resume_proven: true,
       checkpoint_mismatch_rejected: true,
+      packet_sha256_required_proven: true,
+      packet_sha256_checkpoint_binding_proven: true,
+      max_batches_stop_and_resume_proven: true,
+      batches_breakdown_proven: true,
       cas_guard_proven: true,
       duration_stop_proven: true,
       pause_proven: true,
