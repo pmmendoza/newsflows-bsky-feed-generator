@@ -37,7 +37,12 @@
 #
 # Required env (the runner refuses to start without them):
 #   E TREE EXPECTED_SHA EXPECTED_DIST_SHA256 EXPECTED_CT_SHA256 EXPECTED_IMAGE_CT_SHA256 PACKET_SHA
-#   PREREG_MAIN PREREG_BE (pre-registered cells "v1_valid_to_v2_valid=N,v1_invalid_to_v2_valid=N,v1_to_v2_invalid=N")
+#   SINCE_MAIN SINCE_BE (ABSOLUTE receipt-time lower bounds, ISO-8601 Z, bound in the ledger approval; the candidate set
+#     {v1 rows with raw, indexedAt >= SINCE} is then stable because no v1 producer exists any more)
+#   PREREG_MAIN PREREG_BE (pre-registered cells "v1_valid_to_v2_valid=N,v1_invalid_to_v2_valid=N,v1_to_v2_invalid=N",
+#     computed by `prereg` at the same SINCE bounds; gated EXACTLY by preflight/preview/readback)
+#   EXPECTED_TOOL_REFS ("bsky-ops=<sha>,blueskyranker=<sha>,newsflows-bskyhealth=<sha>": installed operator tools must match)
+# `prereg` (read-only) prints the SINCE bounds for the current horizons plus the cells, for the ledger approval entry.
 # Optional env (production defaults): IMG NETWORK ENV_FILE DB_CONTAINER PSQL_DB PSQL_USER
 #   MAIN_DIDS BE_DID HORIZON_MAIN_DAYS HORIZON_BE_DAYS DOCKER FEEDGEN_CONTAINER RUNNER
 #   (container|host; host = rehearsal with HOST_DSN) CEIL_WAL_BYTES CEIL_REL_BYTES CEIL_DEAD
@@ -56,6 +61,9 @@ set -euo pipefail
 : "${PACKET_SHA:?PACKET_SHA (approved packet SHA-256) is required}"
 : "${PREREG_MAIN:?PREREG_MAIN (pre-registered cells) is required}"
 : "${PREREG_BE:?PREREG_BE (pre-registered cells) is required}"
+: "${SINCE_MAIN:?SINCE_MAIN (absolute receipt-time lower bound, ISO Z, from the ledger approval) is required}"
+: "${SINCE_BE:?SINCE_BE (absolute receipt-time lower bound, ISO Z, from the ledger approval) is required}"
+: "${EXPECTED_TOOL_REFS:?EXPECTED_TOOL_REFS (bsky-ops=<sha>,blueskyranker=<sha>,newsflows-bskyhealth=<sha>) is required}"
 [[ "$PACKET_SHA" =~ ^[0-9a-f]{64}$ ]] || { echo "PACKET_SHA must be 64 lowercase hex" >&2; exit 2; }
 IMG="${IMG:-pmmendoza/bsky-feedgen@sha256:928c15aac77a8a842f60053eff8953e70cc9e4117c2fbe86f548e345c1a34711}"
 NETWORK="${NETWORK:-newsflows-bsky-feed-generator-v2_default}"
@@ -73,7 +81,6 @@ CEIL_WAL_BYTES="${CEIL_WAL_BYTES:-614400}"
 CEIL_REL_BYTES="${CEIL_REL_BYTES:-409600}"
 CEIL_DEAD="${CEIL_DEAD:-1000}"
 READBACK_JSON="${READBACK_JSON:-/opt/newsflows/blueskyranker_v2/logs/effective_config_readback.json}"
-PREREG_TOLERANCE_PCT="${PREREG_TOLERANCE_PCT:-5}"
 SKIP_LIVE_IMAGE_CHECKS="${SKIP_LIVE_IMAGE_CHECKS:-0}"
 SECRET_KEY_REGEX="${SECRET_KEY_REGEX:-(PASSWORD|SECRET|TOKEN|_KEY|APIKEY|PASS)}"
 read -r -a DOCKER <<<"${DOCKER:-sudo -n docker}"
@@ -105,7 +112,8 @@ psql_copy() {
 }
 group_dids() { case "$1" in main) echo "$MAIN_DIDS";; be) echo "$BE_DID";; *) die "group must be main|be";; esac; }
 group_horizon() { case "$1" in main) echo "$HORIZON_MAIN_DAYS";; be) echo "$HORIZON_BE_DAYS";; esac; }
-group_since() { date -u -d "$(group_horizon "$1") days ago" +%Y-%m-%dT%H:%M:%S.000Z; }
+group_since() { case "$1" in main) echo "$SINCE_MAIN";; be) echo "$SINCE_BE";; esac; }
+horizon_since() { date -u -d "$(group_horizon "$1") days ago" +%Y-%m-%dT%H:%M:%S.000Z; }   # rolling boundary at this instant
 since_file() { local g=$1; [[ -f "$E/since-$g.txt" ]] && cat "$E/since-$g.txt" || die "since-$g.txt missing: run preflight first"; }
 sql_array() { echo "'{$1}'"; }
 pgstat_read() {  # wal_bytes|relation_bytes|n_dead_tup|n_live_tup|epoch_seconds
@@ -148,18 +156,22 @@ run_tool() {  # run_tool <outname> <tool args...>  -> $E/<outname>.json + .err ;
 }
 jsonq() { node -e 'const j=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8"));const v=process.argv[2].split(".").reduce((a,k)=>a==null?a:a[k],j);console.log(v===undefined||v===null?"":(typeof v==="object"?JSON.stringify(v):v))' "$1" "$2"; }
 
-POP_SQL="WITH t AS (SELECT c.rkey, c.publisher_did, GREATEST(c.publisher_post_max_age_days, CASE WHEN c.rkey LIKE 'newsflow-be-%' THEN $HORIZON_BE_DAYS ELSE $HORIZON_MAIN_DAYS END) AS h FROM feedgen_ops.feed_catalog c WHERE c.enabled AND c.rkey IN ($RANKED_RKEYS))
-SELECT t.rkey, t.h AS horizon_days, count(*) AS total,
+POP_SQL="WITH t AS (SELECT c.rkey, c.publisher_did, CASE WHEN c.rkey LIKE 'newsflow-be-%' THEN '$SINCE_BE' ELSE '$SINCE_MAIN' END AS since FROM feedgen_ops.feed_catalog c WHERE c.enabled AND c.rkey IN ($RANKED_RKEYS))
+SELECT t.rkey, t.since AS since, count(*) AS total,
  count(*) FILTER (WHERE p.content_time_status='source_valid' AND p.content_time_validator_version='$V2') AS v2_valid,
  count(*) FILTER (WHERE p.content_time_status='source_invalid' AND p.content_time_validator_version='$V2') AS v2_invalid,
  count(*) FILTER (WHERE p.content_time_validator_version='$V1' AND p.created_at_source_raw IS NOT NULL) AS v1_rows_with_raw,
  count(*) FILTER (WHERE p.content_time_validator_version='$V1' AND p.created_at_source_raw IS NULL) AS v1_rows_null_raw,
  count(*) FILTER (WHERE p.content_time_status IS NULL OR p.content_time_status='legacy_unknown') AS legacy
-FROM t JOIN post p ON p.author=t.publisher_did AND p.\"indexedAt\" >= to_char(now() AT TIME ZONE 'UTC' - make_interval(days=>t.h), 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"')
+FROM t JOIN post p ON p.author=t.publisher_did AND p.\"indexedAt\" >= t.since
 GROUP BY 1,2 ORDER BY 1;"
-TRANS_SQL="WITH t AS (SELECT c.rkey, c.publisher_did, GREATEST(c.publisher_post_max_age_days, CASE WHEN c.rkey LIKE 'newsflow-be-%' THEN $HORIZON_BE_DAYS ELSE $HORIZON_MAIN_DAYS END) AS h FROM feedgen_ops.feed_catalog c WHERE c.enabled AND c.rkey IN ($RANKED_RKEYS)),
+# v1 rows of the six publishers OUTSIDE the recorded bounds (must be unchanged by the apply) and their all-time v1 total
+SCOPE_SQL="WITH t AS (SELECT c.rkey, c.publisher_did, CASE WHEN c.rkey LIKE 'newsflow-be-%' THEN '$SINCE_BE' ELSE '$SINCE_MAIN' END AS since FROM feedgen_ops.feed_catalog c WHERE c.enabled AND c.rkey IN ($RANKED_RKEYS))
+SELECT 'v1_outside_since', count(*) FROM (SELECT DISTINCT p.uri FROM t JOIN post p ON p.author=t.publisher_did AND p.\"indexedAt\" < t.since WHERE p.content_time_validator_version='$V1') x
+UNION ALL SELECT 'v1_total_six_publishers', count(*) FROM (SELECT DISTINCT p.uri FROM t JOIN post p ON p.author=t.publisher_did WHERE p.content_time_validator_version='$V1') y;"
+TRANS_SQL="WITH t AS (SELECT c.rkey, c.publisher_did, CASE WHEN c.rkey LIKE 'newsflow-be-%' THEN '$SINCE_BE' ELSE '$SINCE_MAIN' END AS since FROM feedgen_ops.feed_catalog c WHERE c.enabled AND c.rkey IN ($RANKED_RKEYS)),
 v1 AS (SELECT t.rkey, p.content_time_status AS s1, convert_from(p.created_at_source_raw,'UTF8') AS raw, p.\"indexedAt\" AS ia
- FROM t JOIN post p ON p.author=t.publisher_did AND p.\"indexedAt\" >= to_char(now() AT TIME ZONE 'UTC' - make_interval(days=>t.h), 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"')
+ FROM t JOIN post p ON p.author=t.publisher_did AND p.\"indexedAt\" >= t.since
  WHERE p.content_time_validator_version='$V1' AND p.created_at_source_raw IS NOT NULL),
 pred AS (SELECT rkey, CASE
   WHEN raw IS NULL OR raw='' OR raw !~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}T' THEN 'v1_to_v2_invalid'
@@ -201,7 +213,16 @@ cmd_preflight() {
     local img_id run_img; img_id=$("${DOCKER[@]}" image inspect "$IMG" --format '{{.Id}}'); run_img=$("${DOCKER[@]}" inspect "$FEEDGEN_CONTAINER" --format '{{.Image}}')
     [[ "$img_id" == "$run_img" ]] || die "running $FEEDGEN_CONTAINER image ID $run_img != pinned IMG image ID $img_id"
     { "${DOCKER[@]}" inspect "$FEEDGEN_CONTAINER" --format '{{.Id}} {{.Image}} {{.Config.Image}} {{.State.StartedAt}} {{.RestartCount}}'; echo "pinned_image_id=$img_id"; } | emit feedgen-prestate.txt
-    { for t in bsky-ops blueskyranker newsflows-bskyhealth; do f=$(ls /opt/newsflows/tools/uv/$t/lib/python3.*/site-packages/*.dist-info/direct_url.json 2>/dev/null | head -1); echo "$t $(grep -o '"commit_id":"[0-9a-f]*"' "$f" 2>/dev/null | head -1)"; done; } | emit tools.txt
+    local t exp got tline=""
+    for t in bsky-ops blueskyranker newsflows-bskyhealth; do
+      exp=$(echo "$EXPECTED_TOOL_REFS" | tr ',' '\n' | awk -F= -v k="$t" '$1==k{print $2}')
+      [[ -n "$exp" ]] || die "EXPECTED_TOOL_REFS lacks $t"
+      got=$(sudo -n node -e 'const fs=require("fs");const g=require("path");const base=process.argv[1];let out="";for(const py of fs.readdirSync(base+"/lib").filter(d=>d.startsWith("python3"))){const sp=base+"/lib/"+py+"/site-packages";for(const d of fs.readdirSync(sp).filter(d=>d.endsWith(".dist-info")&&d.toLowerCase().replace(/-/g,"_").startsWith(process.argv[2].toLowerCase().replace(/-/g,"_")))){try{const j=JSON.parse(fs.readFileSync(sp+"/"+d+"/direct_url.json"));out=(j.vcs_info||{}).commit_id||"";}catch(e){}}}console.log(out)' "/opt/newsflows/tools/uv/$t" "$t" 2>/dev/null || true)
+      [[ -n "$got" ]] || die "installed tool $t: commit id not found under /opt/newsflows/tools/uv/$t"
+      [[ "$got" == "$exp" ]] || die "installed tool $t is at $got, expected $exp"
+      tline+="$t $got"$'\n'
+    done
+    printf '%s' "$tline" | emit tools.txt
   fi
   psql_ro -c "$CATALOG_SQL" | emit catalog-readback.tsv
   local cat_dids cfg_dids
@@ -213,22 +234,28 @@ cmd_preflight() {
   local rb_main="n/a" rb_be="n/a"
   if [[ "$SKIP_LIVE_IMAGE_CHECKS" != "1" ]]; then
     [[ -f "$READBACK_JSON" ]] || die "READBACK_JSON $READBACK_JSON missing — BSR effective-config readback is a prerequisite"
-    local rb_stale rb_now; rb_stale=$(sudo -n node -e 'const j=JSON.parse(require("fs").readFileSync(process.argv[1]));console.log((j.artifact_metadata||{}).stale_at||0)' "$READBACK_JSON"); rb_now=$(date -u +%s)
+    local rb_stale rb_now; rb_stale=$(sudo -n node -e 'const j=JSON.parse(require("fs").readFileSync(process.argv[1]));const v=(j.artifact_metadata||{}).stale_at;const n=typeof v==="number"?v:(typeof v==="string"&&/^\d+$/.test(v)?Number(v):(typeof v==="string"?Math.floor(Date.parse(v)/1000):NaN));console.log(Number.isFinite(n)?n:"unparseable")' "$READBACK_JSON"); rb_now=$(date -u +%s)
+    [[ "$rb_stale" =~ ^[0-9]+$ ]] || die "BSR effective-config readback stale_at is unparseable ($rb_stale)"
     (( rb_stale > rb_now )) || die "BSR effective-config readback is stale (stale_at=$rb_stale now=$rb_now); the 5-min producer must be running"
     rb_main=$(sudo -n node -e 'const j=JSON.parse(require("fs").readFileSync(process.argv[1]));let m=0;for(const b of Object.values(j.bindings||{})){if((b.feed_ids||[]).some(f=>/newsflow-(nl|fr|cz|ir)-2/.test(f)))m=Math.max(m,b.push_window_days||0)}console.log(m)' "$READBACK_JSON")
     rb_be=$(sudo -n node -e 'const j=JSON.parse(require("fs").readFileSync(process.argv[1]));let m=0;for(const b of Object.values(j.bindings||{})){if((b.feed_ids||[]).some(f=>/newsflow-be-/.test(f)))m=Math.max(m,b.push_window_days||0)}console.log(m)' "$READBACK_JSON")
+    [[ "$rb_main" =~ ^[0-9]+$ && "$rb_be" =~ ^[0-9]+$ ]] && (( rb_main > 0 && rb_be > 0 )) || die "BSR readback did not yield positive push windows for both groups (main '$rb_main' be '$rb_be'): bindings/feed_ids shape mismatch"
     (( HORIZON_MAIN_DAYS >= rb_main && HORIZON_BE_DAYS >= rb_be )) || die "horizon below BSR push window (readback main $rb_main / be $rb_be)"
     sudo -n sha256sum "$READBACK_JSON" | emit effective-config-readback.sha256
   fi
-  { echo "generated_at=$(ts)"; echo "tree=$TREE"; echo "source_sha=$sha"; echo "runner_script_sha256=$runner_sha"; echo "dsn_helper_sha256=$helper_sha"; echo "dist_backfill_sha256=$EXPECTED_DIST_SHA256"; echo "dist_content_time_sha256=$EXPECTED_CT_SHA256"; echo "image=$IMG"; echo "image_validator_sha256=$img_ct"; echo "feedgen_retention_enabled=$ret"; echo "runner=$RUNNER"; echo "packet_sha256=$PACKET_SHA"; echo "network=$NETWORK"; echo "env_file=$ENV_FILE"; echo "db_container=$DB_CONTAINER"; echo "main_dids=$MAIN_DIDS"; echo "be_did=$BE_DID"; echo "horizon_main_days=$HORIZON_MAIN_DAYS"; echo "horizon_be_days=$HORIZON_BE_DAYS"; echo "catalog_max_age_main=$max_main catalog_max_age_be=$max_be readback_push_main=$rb_main readback_push_be=$rb_be"; echo "ceilings wal<=$CEIL_WAL_BYTES relation<=$CEIL_REL_BYTES dead<=$CEIL_DEAD"; echo "prereg_main=${PREREG_MAIN:-none} prereg_be=${PREREG_BE:-none} prereg_tolerance_pct=$PREREG_TOLERANCE_PCT"; } | emit source-set.txt
+  { echo "generated_at=$(ts)"; echo "tree=$TREE"; echo "source_sha=$sha"; echo "runner_script_sha256=$runner_sha"; echo "dsn_helper_sha256=$helper_sha"; echo "dist_backfill_sha256=$EXPECTED_DIST_SHA256"; echo "dist_content_time_sha256=$EXPECTED_CT_SHA256"; echo "image=$IMG"; echo "image_validator_sha256=$img_ct"; echo "feedgen_retention_enabled=$ret"; echo "runner=$RUNNER"; echo "packet_sha256=$PACKET_SHA"; echo "network=$NETWORK"; echo "env_file=$ENV_FILE"; echo "db_container=$DB_CONTAINER"; echo "main_dids=$MAIN_DIDS"; echo "be_did=$BE_DID"; echo "horizon_main_days=$HORIZON_MAIN_DAYS"; echo "horizon_be_days=$HORIZON_BE_DAYS"; echo "catalog_max_age_main=$max_main catalog_max_age_be=$max_be readback_push_main=$rb_main readback_push_be=$rb_be"; echo "ceilings wal<=$CEIL_WAL_BYTES relation<=$CEIL_REL_BYTES dead<=$CEIL_DEAD"; echo "since_main=$SINCE_MAIN since_be=$SINCE_BE"; echo "prereg_main=$PREREG_MAIN prereg_be=$PREREG_BE (exact)"; echo "expected_tool_refs=$EXPECTED_TOOL_REFS"; } | emit source-set.txt
+  # the absolute bounds must be at or before the rolling horizon boundary of this instant (a fixed older bound is a superset)
+  local g; for g in main be; do [[ "$(group_since "$g")" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{3}Z$ ]] || die "SINCE_${g^^} must be ISO-8601 with milliseconds and Z"; [[ "$(group_since "$g")" < "$(horizon_since "$g")" || "$(group_since "$g")" == "$(horizon_since "$g")" ]] || die "SINCE_${g^^}=$(group_since "$g") is later than the rolling $(group_horizon "$g")-day boundary $(horizon_since "$g")"; done
   echo "$(group_since main)" | emit since-main.txt
   echo "$(group_since be)" | emit since-be.txt
+  psql_ro -c "$SCOPE_SQL" | emit prestate-scope.tsv
   psql_ro -c "$POP_SQL" | emit prestate-populations.tsv
   psql_ro -c "$TRANS_SQL" | emit prestate-transitions.tsv
   local nullraw; nullraw=$(awk -F'|' 'NR>1 && $1 !~ /^rkey$/ {s+=$7} END{print s+0}' "$E/prestate-populations.tsv")
   [[ "$nullraw" == "0" ]] || die "in-horizon v1 rows with NULL raw: $nullraw (expected 0)"
   local g o exp act
-  for g in main be; do for o in "${OUTCOMES[@]}"; do exp=$(prereg_value "$g" "$o"); act=$(predicted_outcome "$g" "$o"); gate_cell "prereg $g/$o" "$exp" "$act" "$PREREG_TOLERANCE_PCT"; done; done
+  # the candidate set is stable at absolute bounds (no v1 producer exists), so pre-registered cells must match EXACTLY
+  for g in main be; do for o in "${OUTCOMES[@]}"; do exp=$(prereg_value "$g" "$o"); act=$(predicted_outcome "$g" "$o"); [[ "$exp" == "$act" ]] || die "prereg $g/$o: pre-registered $exp, live prediction $act (candidate set must be stable at the bound SINCE)"; log "prereg $g/$o ok ($exp)"; done; done
   psql_copy "$(snapshot_sql "$MAIN_DIDS" "$(since_file main)" "$V1")" | emit step1-main-prestate-rows.tsv
   psql_copy "$(snapshot_sql "$BE_DID" "$(since_file be)" "$V1")" | emit step1-be-prestate-rows.tsv
   take_control pg-control-1.txt
@@ -245,7 +272,7 @@ cmd_preview() {
   local keys; keys=$(node -e 'const j=JSON.parse(require("fs").readFileSync(process.argv[1]));console.log(Object.keys(j.preview.counts).filter(k=>k!=="by_v2_invalid_reason").join(" "))' "$f")
   local k known sum=0
   for k in $keys; do known=0; for o in "${OUTCOMES[@]}"; do [[ "$k" == "$o" ]] && known=1; done; (( known )) || die "preview $g reports unpredicted outcome class '$k'"; sum=$(( sum + $(jsonq "$f" "preview.counts.$k") )); done
-  local o; for o in "${OUTCOMES[@]}"; do gate_cell "$g/$o" "$(predicted_outcome "$g" "$o")" "$(jsonq "$f" "preview.counts.$o")"; done
+  local o; for o in "${OUTCOMES[@]}"; do [[ "$(predicted_outcome "$g" "$o")" == "$(jsonq "$f" "preview.counts.$o")" ]] || die "preview $g/$o: predicted $(predicted_outcome "$g" "$o"), tool reports $(jsonq "$f" "preview.counts.$o")"; log "gate $g/$o ok"; done
   local scanned rows; scanned=$(jsonq "$f" preview.scanned); rows=$(wc -l <"$E/step1-$g-prestate-rows.tsv")
   [[ "$scanned" == "$sum" && "$scanned" == "$rows" ]] || die "preview $g: scanned=$scanned sum(counts)=$sum prestate_rows=$rows must all be equal"
   log "preview $g ok: scanned=$scanned"
@@ -278,38 +305,53 @@ cmd_apply() {
   [[ "$verdict" == "ok" ]] || die "ceiling breach on $g/$label (see ceiling-$g-$label.txt): run '$0 control', then re-measure once with '$0 apply $g ${label}r 1'; a second breach = stop for good + escalation"
   log "apply $g/$label exit=$rc batches=$nb verdict=$verdict"
 }
-cmd_readback() {
-  local g rc
+cmd_readback() {  # re-runnable: every attempt gets its own suffix
+  local g rc a=1; while [[ -e "$E/readback-attempt-$a.txt" ]]; do a=$(( a + 1 )); done; local sfx="attempt-$a"
+  local summary=""
   for g in main be; do
-    rc=$(run_tool "step1-$g-preview-after" --mode revalidate --actors "$(group_dids "$g")" --since "$(since_file "$g")" --json --packet-sha256 "$PACKET_SHA")
-    [[ "$rc" == "0" && "$(jsonq "$E/step1-$g-preview-after.json" preview.scanned)" == "0" ]] || die "post-apply preview $g not empty (exit=$rc)"
-    psql_copy "$(snapshot_sql "$(group_dids "$g")" "$(since_file "$g")" "$V2")" | emit "step1-$g-poststate-rows.tsv"
+    rc=$(run_tool "step1-$g-preview-after-$sfx" --mode revalidate --actors "$(group_dids "$g")" --since "$(since_file "$g")" --json --packet-sha256 "$PACKET_SHA")
+    [[ "$rc" == "0" && "$(jsonq "$E/step1-$g-preview-after-$sfx.json" preview.scanned)" == "0" ]] || die "post-apply preview $g not empty (exit=$rc)"
+    psql_copy "$(snapshot_sql "$(group_dids "$g")" "$(since_file "$g")" "$V2")" | emit "step1-$g-poststate-rows-$sfx.tsv"
     node -e '
 const fs=require("fs");const [pre,post]=[process.argv[1],process.argv[2]].map(p=>fs.readFileSync(p,"utf8").split("\n").filter(Boolean).map(l=>l.split("\t")));
-const m=new Map(post.map(r=>[r[0],r]));let missing=0,createdChanged=0,statusChanged=0,rawMismatch=0;
-for(const r of pre){const q=m.get(r[0]);if(!q){missing++;continue;}if(q[3]!==r[3])createdChanged++;if(q[5]!==r[5])statusChanged++;if(q[8]!==r[8])rawMismatch++;}
+const m=new Map(post.map(r=>[r[0],r]));let missing=0,createdChanged=0,statusChanged=0,rawMismatch=0;const byAuthor={};
+for(const r of pre){const q=m.get(r[0]);if(!q){missing++;continue;}const A=byAuthor[r[1]]||(byAuthor[r[1]]={rows:0,to_invalid:0,to_valid:0});A.rows++;
+ if(q[3]!==r[3])createdChanged++;if(q[5]!==r[5]){statusChanged++;if(q[5]==="source_invalid")A.to_invalid++;else A.to_valid++;}if(q[8]!==r[8])rawMismatch++;}
 console.log(`prestate_rows=${pre.length} poststate_rows_v2=${post.length} prestate_missing_in_poststate=${missing} createdAt_changed=${createdChanged} status_changed=${statusChanged} raw_mismatch=${rawMismatch}`);
-process.exit(missing===0&&rawMismatch===0?0:2)' "$E/step1-$g-prestate-rows.tsv" "$E/step1-$g-poststate-rows.tsv" | emit "step1-$g-diff.txt" || die "readback $g: prestate rows missing from poststate or raw mismatch"
-    # realized outcome vs pre-registration: rows whose status/createdAt changed == past_bound->valid + valid->invalid
+for(const [a,v] of Object.entries(byAuthor))console.log(`author=${a} rows=${v.rows} to_invalid=${v.to_invalid} to_valid=${v.to_valid}`);
+process.exit(missing===0&&rawMismatch===0?0:2)' "$E/step1-$g-prestate-rows.tsv" "$E/step1-$g-poststate-rows-$sfx.tsv" | emit "step1-$g-diff-$sfx.txt" || die "readback $g: prestate rows missing from poststate or raw mismatch"
     local exp_changed act_status act_created
     exp_changed=$(( $(prereg_value "$g" v1_invalid_to_v2_valid) + $(prereg_value "$g" v1_to_v2_invalid) ))
-    act_status=$(sed -n 's/.*status_changed=\([0-9]*\).*/\1/p' "$E/step1-$g-diff.txt"); act_created=$(sed -n 's/.*createdAt_changed=\([0-9]*\).*/\1/p' "$E/step1-$g-diff.txt")
-    gate_cell "realized $g/status_changed" "$exp_changed" "$act_status" "$PREREG_TOLERANCE_PCT"
-    gate_cell "realized $g/createdAt_changed" "$exp_changed" "$act_created" "$PREREG_TOLERANCE_PCT"
+    act_status=$(sed -n 's/^prestate_rows=.*status_changed=\([0-9]*\).*/\1/p' "$E/step1-$g-diff-$sfx.txt"); act_created=$(sed -n 's/^prestate_rows=.*createdAt_changed=\([0-9]*\).*/\1/p' "$E/step1-$g-diff-$sfx.txt")
+    [[ "$act_status" == "$exp_changed" && "$act_created" == "$exp_changed" ]] || die "realized $g: status_changed=$act_status createdAt_changed=$act_created, pre-registered $exp_changed"
+    # per publisher (= per feed for main; the shared BE publisher counts once): realized to_invalid / to_valid == predicted per rkey
+    local line author rk pi pv ai av
+    while read -r line; do
+      author=$(echo "$line" | sed -n 's/^author=\([^ ]*\).*/\1/p'); [[ -n "$author" ]] || continue
+      rk=$(awk -F'|' -v a="$author" 'NR>1 && $2==a {print $1; exit}' "$E/catalog-readback.tsv")
+      pi=$(awk -F'|' -v r="$rk" '$1==r && $2=="v1_to_v2_invalid"{s+=$3} END{print s+0}' "$E/prestate-transitions.tsv"); pv=$(awk -F'|' -v r="$rk" '$1==r && $2=="v1_invalid_to_v2_valid"{s+=$3} END{print s+0}' "$E/prestate-transitions.tsv")
+      ai=$(echo "$line" | sed -n 's/.*to_invalid=\([0-9]*\).*/\1/p'); av=$(echo "$line" | sed -n 's/.*to_valid=\([0-9]*\).*/\1/p')
+      [[ "$ai" == "$pi" && "$av" == "$pv" ]] || die "realized per-publisher $rk: to_invalid=$ai (pred $pi) to_valid=$av (pred $pv)"
+    done <"$E/step1-$g-diff-$sfx.txt"
+    # every row the apply wrote is a prestate row: sum(updated) over this group's apply receipts == prestate rows
+    local upd rows; upd=$(for f in "$E"/step1-$g-apply-*.json; do jsonq "$f" revalidation.updated; done | awk '{s+=$1} END{print s+0}'); rows=$(wc -l <"$E/step1-$g-prestate-rows.tsv")
+    [[ "$upd" == "$rows" ]] || die "blast radius $g: apply receipts report updated=$upd, prestate rows=$rows"
+    summary+="$g updated=$upd prestate_rows=$rows status_changed=$act_status"$'\n'
   done
-  psql_ro -c "$POP_SQL" | emit poststate-populations.tsv
-  pgstat_read | emit pg-poststate.txt
-  local rem; rem=$(awk -F'|' 'NR>1 && $1 !~ /^rkey$/ {s+=$6} END{print s+0}' "$E/poststate-populations.tsv")
+  psql_ro -c "$POP_SQL" | emit "poststate-populations-$sfx.tsv"
+  psql_ro -c "$SCOPE_SQL" | emit "poststate-scope-$sfx.tsv"
+  pgstat_read | emit "pg-poststate-$sfx.txt"
+  local rem; rem=$(awk -F'|' 'NR>1 && $1 !~ /^rkey$/ {s+=$6} END{print s+0}' "$E/poststate-populations-$sfx.tsv")
   [[ "$rem" == "0" ]] || die "v1_rows_with_raw remaining after apply: $rem"
-  # per-feed post-state v2_invalid must equal prestate v2_invalid + predicted v1_to_v2_invalid (per rkey; exact <50, else +/-2%)
-  local rk pre_inv pred_inv post_inv
-  while IFS='|' read -r rk _h _t _v pre_inv _rest; do
-    [[ "$rk" =~ ^newsflow ]] || continue
-    pred_inv=$(awk -F'|' -v r="$rk" '$1==r && $2=="v1_to_v2_invalid"{s+=$3} END{print s+0}' "$E/prestate-transitions.tsv")
-    post_inv=$(awk -F'|' -v r="$rk" '$1==r{print $5}' "$E/poststate-populations.tsv")
-    gate_cell "poststate $rk/v2_invalid" $(( pre_inv + pred_inv )) "${post_inv:-0}"
-  done <"$E/prestate-populations.tsv"
-  log "readback ok: v1_rows_with_raw=0 for all ranked feeds"
+  # out-of-scope v1 rows of the six publishers unchanged; all-time v1 total decreased by exactly the rows updated
+  local pre_out post_out pre_tot post_tot tot_upd
+  pre_out=$(awk -F'|' '$1=="v1_outside_since"{print $2}' "$E/prestate-scope.tsv"); post_out=$(awk -F'|' '$1=="v1_outside_since"{print $2}' "$E/poststate-scope-$sfx.tsv")
+  pre_tot=$(awk -F'|' '$1=="v1_total_six_publishers"{print $2}' "$E/prestate-scope.tsv"); post_tot=$(awk -F'|' '$1=="v1_total_six_publishers"{print $2}' "$E/poststate-scope-$sfx.tsv")
+  tot_upd=$(( $(wc -l <"$E/step1-main-prestate-rows.tsv") + $(wc -l <"$E/step1-be-prestate-rows.tsv") ))
+  [[ "$pre_out" == "$post_out" ]] || die "blast radius: v1 rows outside the bounds changed ($pre_out -> $post_out)"
+  [[ $(( pre_tot - post_tot )) == "$tot_upd" ]] || die "blast radius: six-publisher v1 total moved by $(( pre_tot - post_tot )), expected $tot_upd"
+  { echo "readback=$sfx"; printf '%s' "$summary"; echo "v1_outside_since before=$pre_out after=$post_out"; echo "v1_total_six_publishers before=$pre_tot after=$post_tot"; } | emit "readback-$sfx.txt"
+  log "readback ok ($sfx): v1_rows_with_raw=0, realized outcome == pre-registration, blast radius bounded"
 }
 cmd_restore() {  # bounded CAS restore from the prestate snapshot; keyset batches of 500; resumable; batch index derived from the cursor
   local g=$1
@@ -366,13 +408,22 @@ cmd_finalize() {
   local wstart=${1:-unset} wend=${2:-unset}
   { [[ -f "$E/secret-scan.txt" ]] && grep -q '^hits=0$' "$E/secret-scan.txt"; } || die "finalize requires a clean secret-scan first"
   local rtmp; rtmp=$(mktemp)
-  { echo "status=complete"; echo "generated_at=$(ts)"; cat "$E/source-set.txt"; echo "window_start_utc=$wstart"; echo "window_end_utc=$wend"; for f in "$E"/ceiling-*.txt; do if [[ -f "$f" ]]; then echo "--- $(basename "$f")"; cat "$f"; fi; done; echo "--- diffs"; cat "$E"/step1-*-diff.txt 2>/dev/null || true; echo "--- populations after"; cat "$E/poststate-populations.tsv" 2>/dev/null || true; } >"$rtmp"
+  { echo "status=complete"; echo "generated_at=$(ts)"; cat "$E/source-set.txt"; echo "window_start_utc=$wstart"; echo "window_end_utc=$wend"; for f in "$E"/ceiling-*.txt; do if [[ -f "$f" ]]; then echo "--- $(basename "$f")"; cat "$f"; fi; done; echo "--- diffs"; cat "$E"/step1-*-diff-*.txt "$E"/readback-*.txt 2>/dev/null || true; echo "--- populations after"; cat "$E/poststate-populations.tsv" 2>/dev/null || true; } >"$rtmp"
   emit RESULT.txt <"$rtmp"; rm -f "$rtmp"
   ( cd "$E" && sudo -n sh -c 'find . -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS && chown root:newsflows SHA256SUMS && chmod 640 SHA256SUMS' )
   log "finalized: $E"
 }
 
+cmd_prereg() {  # read-only helper for the ledger approval: cells at the given SINCE bounds
+  local g o; echo "since_main=$SINCE_MAIN since_be=$SINCE_BE"
+  local tmp; tmp=$(mktemp); psql_ro -c "$TRANS_SQL" >"$tmp"
+  for g in main be; do local pat; case "$g" in main) pat="$MAIN_RKEY_PATTERN";; be) pat="$BE_RKEY_PATTERN";; esac
+    local cells=""; for o in "${OUTCOMES[@]}"; do cells+="$o=$(awk -F'|' -v pat="$pat" -v o="$o" '$1 ~ "^"pat"$" && $2==o {s+=$3} END{print s+0}' "$tmp"),"; done; echo "PREREG_${g^^}=${cells%,}"; done
+  psql_ro -c "$SCOPE_SQL"; rm -f "$tmp"
+}
+
 case "${1:-}" in
+  prereg) cmd_prereg;;
   preflight) cmd_preflight;;
   control) cmd_control;;
   preview) cmd_preview "${2:?group}";;
@@ -381,5 +432,5 @@ case "${1:-}" in
   restore) cmd_restore "${2:?group}";;
   secret-scan) cmd_secret_scan;;
   finalize) cmd_finalize "${2:-}" "${3:-}";;
-  *) echo "usage: $0 preflight|control|preview <group>|apply <group> <label> [max_batches]|readback|restore <group>|secret-scan|finalize <start> <end>" >&2; exit 2;;
+  *) echo "usage: $0 prereg|preflight|control|preview <group>|apply <group> <label> [max_batches]|readback|restore <group>|secret-scan|finalize <start> <end>" >&2; exit 2;;
 esac

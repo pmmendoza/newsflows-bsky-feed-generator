@@ -54,8 +54,17 @@ export E TREE="$repo_root" RUNNER=container IMG NETWORK=bridge ENV_FILE="$envfil
   EXPECTED_IMAGE_CT_SHA256="$img_ct" \
   MAIN_DIDS="$pub_a" BE_DID="$pub_b" HORIZON_MAIN_DAYS=10 HORIZON_BE_DAYS=10 \
   RANKED_RKEYS="'newsflow-zz-1a','newsflow-zz-1b'" MAIN_RKEY_PATTERN='newsflow-zz-1a' BE_RKEY_PATTERN='newsflow-zz-1b' \
-  PREREG_MAIN="v1_valid_to_v2_valid=600,v1_invalid_to_v2_valid=10,v1_to_v2_invalid=10" PREREG_BE="v1_valid_to_v2_valid=30,v1_invalid_to_v2_valid=5,v1_to_v2_invalid=5" \
+  SINCE_MAIN=2026-08-07T00:00:00.000Z SINCE_BE=2026-08-07T00:00:00.000Z \
   PACKET_SHA="$(printf '1%.0s' $(seq 1 64))"
+# installed operator tool refs (the runner gates against them): read them the same way the runner does
+tool_ref() { sudo -n node -e 'const fs=require("fs");const base=process.argv[1];let out="";for(const py of fs.readdirSync(base+"/lib").filter(d=>d.startsWith("python3"))){const sp=base+"/lib/"+py+"/site-packages";for(const d of fs.readdirSync(sp).filter(d=>d.endsWith(".dist-info")&&d.toLowerCase().replace(/-/g,"_").startsWith(process.argv[2].toLowerCase().replace(/-/g,"_")))){try{const j=JSON.parse(fs.readFileSync(sp+"/"+d+"/direct_url.json"));out=(j.vcs_info||{}).commit_id||"";}catch(e){}}}console.log(out)' "/opt/newsflows/tools/uv/$1" "$1"; }
+export EXPECTED_TOOL_REFS="bsky-ops=$(tool_ref bsky-ops),blueskyranker=$(tool_ref blueskyranker),newsflows-bskyhealth=$(tool_ref newsflows-bskyhealth)"
+# pre-registration flow: read-only prereg at the bound SINCE, then bind the cells (as the ledger approval would)
+export PREREG_MAIN=placeholder PREREG_BE=placeholder
+prereg_out=$(bash "$runner" prereg); echo "$prereg_out" | sed 's/^/prereg: /'
+export PREREG_MAIN="$(echo "$prereg_out" | sed -n 's/^PREREG_MAIN=//p')" PREREG_BE="$(echo "$prereg_out" | sed -n 's/^PREREG_BE=//p')"
+[[ "$PREREG_MAIN" == "v1_valid_to_v2_valid=600,v1_invalid_to_v2_valid=10,v1_to_v2_invalid=10" ]] || { echo "prereg main cells unexpected: $PREREG_MAIN"; exit 1; }
+[[ "$PREREG_BE" == "v1_valid_to_v2_valid=30,v1_invalid_to_v2_valid=5,v1_to_v2_invalid=5" ]] || { echo "prereg be cells unexpected: $PREREG_BE"; exit 1; }
 rb=$(mktemp); now=$(date -u +%s); printf '{"schema_version":"bsr.ops.effective_config.readback.v1","raw_values_in_output":false,"artifact_metadata":{"generated_at":%s,"stale_at":%s},"bindings":{"reh-a":{"feed_ids":["newsflow-zz-1a"],"push_window_days":10,"time_column":"createdAt"},"reh-b":{"feed_ids":["newsflow-zz-1b"],"push_window_days":10,"time_column":"createdAt"}}}\n' "$now" "$((now+3600))" >"$rb"
 export READBACK_JSON="$rb"
 
@@ -73,7 +82,10 @@ grep -q "exit=0" "$E/ceiling-main-full.txt" || { echo "full apply did not exit 0
 step apply_be_full bash "$runner" apply be full
 [[ -f "$E/step1-main-checkpoint.json" && -f "$E/step1-be-checkpoint.json" ]] || { echo "checkpoints not written into the 0750 evidence root by the container"; exit 1; }
 step readback bash "$runner" readback
-grep -q "prestate_missing_in_poststate=0" "$E/step1-main-diff.txt" || { echo "readback diff main not closed"; exit 1; }
+grep -q "prestate_missing_in_poststate=0" "$E/step1-main-diff-attempt-1.txt" || { echo "readback diff main not closed"; exit 1; }
+# readback must be re-runnable (attempt-2) without editing $E
+step readback_again bash "$runner" readback
+[[ -f "$E/readback-attempt-2.txt" ]] || { echo "readback attempt-2 receipt missing"; exit 1; }
 # genuine mid-restore failure: hold a row lock on a row of batch 2 (rows 501-620) so lock_timeout=5s fires, then resume after release
 lock_uri=$(sed -n '510p' "$E/step1-main-prestate-rows.tsv" | cut -f1)
 ( "${D[@]}" exec -i "$container" psql -U feedgen -d feedgen_revalidate_rehearsal -X -q -v ON_ERROR_STOP=1 -c "BEGIN; SELECT uri FROM post WHERE uri='$lock_uri' FOR UPDATE; SELECT pg_sleep(25); COMMIT;" >/dev/null 2>&1 & ) ; sleep 2
