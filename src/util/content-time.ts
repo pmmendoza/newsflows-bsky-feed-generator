@@ -2,6 +2,12 @@ import { ContentTimeClampReason, ContentTimeStatus } from '../db/schema'
 
 export const CONTENT_TIME_VALIDATOR_VERSION = 'newsflows-content-time/v2'
 
+// Historical validator id. Rows classified before the 2026-08-16T14:57Z v1->v2
+// cutover carry this value in content_time_validator_version. Kept as a named
+// constant (rather than inlined literals) so the recovery tool's revalidation
+// mode has one place to point at when selecting stale-validator rows.
+export const CONTENT_TIME_VALIDATOR_VERSION_V1 = 'newsflows-content-time/v1'
+
 export type ContentTimePolicy = {
   maxFutureSkewMs: number
   maxPastAgeMs: number | null
