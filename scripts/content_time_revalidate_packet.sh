@@ -251,15 +251,16 @@ cmd_restore() {  # bounded CAS restore from the prestate snapshot; keyset batche
   local start=1; [[ -f "$cur" ]] && start=$(cat "$cur")
   while (( start <= total )); do
     local end=$(( start + 499 )); (( end > total )) && end=$total; batch=$(( batch + 1 ))
+    local rtmp; rtmp=$(mktemp)
     { echo "BEGIN; SET lock_timeout='5s'; SET statement_timeout='30s';"; echo "CREATE TEMP TABLE prestate(uri text, author text, indexed_at text, created_at text, content_time_utc text, status text, reason text, version text, raw_hex text);"; echo "COPY prestate FROM STDIN WITH (FORMAT text);"; sed -n "${start},${end}p" "$pre"; echo '\.'; cat <<'SQL'
 UPDATE public.post AS t SET "createdAt"=s.created_at, content_time_utc=s.content_time_utc, content_time_status=s.status, content_time_clamp_reason=s.reason, content_time_validator_version=s.version
 FROM prestate s WHERE t.uri=s.uri AND t.content_time_validator_version='newsflows-content-time/v2' AND encode(t.created_at_source_raw,'hex')=s.raw_hex;
 SELECT 'restored_in_batch', count(*) FROM post p JOIN prestate s ON s.uri=p.uri WHERE p."createdAt"=s.created_at AND p.content_time_utc IS NOT DISTINCT FROM s.content_time_utc AND p.content_time_status=s.status AND p.content_time_clamp_reason IS NOT DISTINCT FROM s.reason AND p.content_time_validator_version=s.version;
 COMMIT;
 SQL
-    } | "${DOCKER[@]}" exec -i "$DB_CONTAINER" psql -U "$PSQL_USER" -d "$PSQL_DB" -X -A -F '|' -v ON_ERROR_STOP=1 >"$E/.restore-$g-batch-$batch.tmp" 2>&1 || die "restore $g batch $batch failed (see .restore-$g-batch-$batch.tmp)"
-    sudo -n install -o root -g newsflows -m 640 "$E/.restore-$g-batch-$batch.tmp" "$E/restore-$g-batch-$batch.txt"; rm -f "$E/.restore-$g-batch-$batch.tmp"
-    done_rows=$end; echo $(( end + 1 )) >"$cur"; sleep 1; start=$(( end + 1 ))
+    } | "${DOCKER[@]}" exec -i "$DB_CONTAINER" psql -U "$PSQL_USER" -d "$PSQL_DB" -X -A -F '|' -v ON_ERROR_STOP=1 >"$rtmp" 2>&1 || { emit "restore-$g-batch-$batch.txt" <"$rtmp"; die "restore $g batch $batch failed (see restore-$g-batch-$batch.txt)"; }
+    emit "restore-$g-batch-$batch.txt" <"$rtmp"; rm -f "$rtmp"
+    done_rows=$end; echo $(( end + 1 )) | sudo -n tee "$cur" >/dev/null; sleep 1; start=$(( end + 1 ))
   done
   psql_copy "$(snapshot_sql "$(group_dids "$g")" "$(since_file "$g")" "$V1")" | emit "restore-$g-after-rows.tsv"
   cmp -s "$pre" "$E/restore-$g-after-rows.tsv" && echo "restore_$g=identical_to_prestate rows=$total batches=$batch" | emit "restore-$g-result.txt" || { diff "$pre" "$E/restore-$g-after-rows.tsv" | head -20 | emit "restore-$g-result.txt"; die "restore $g: after-restore snapshot differs from prestate"; }
