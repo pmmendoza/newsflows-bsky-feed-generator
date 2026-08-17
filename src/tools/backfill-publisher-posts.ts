@@ -5,7 +5,13 @@ import { sql } from 'kysely'
 import { createDb } from '../db'
 import type { Database } from '../db'
 import { dualWriteLinkFields } from '../util/link-fields'
-import { validateContentTime } from '../util/content-time'
+import {
+  CONTENT_TIME_VALIDATOR_VERSION,
+  CONTENT_TIME_VALIDATOR_VERSION_V1,
+  validateContentTime,
+} from '../util/content-time'
+import type { ContentTimeClampReason } from '../db/schema'
+import { resolvePublisherDids } from '../util/publisher-dids'
 
 type AppViewPost = {
   uri?: string
@@ -490,6 +496,502 @@ export async function runPublisherPostRecovery(
   }
 }
 
+// --- Content-time revalidation mode -------------------------------------
+//
+// Re-validates existing public.post rows that were classified by validator
+// v1 (`newsflows-content-time/v1`) against the current v2 policy
+// (`CONTENT_TIME_POLICY_V2` in ../util/content-time). Unlike the AppView
+// recovery mode above, this mode never touches the network: it reads
+// created_at_source_raw + indexedAt already stored in Postgres and
+// recomputes content_time_utc/status/clamp_reason/validator_version purely
+// in-process. It reuses the same bounded-batch contract (batch size,
+// lock/statement timeouts, inter-batch pause, 30-minute hard stop, durable
+// resumable checkpoint) established by runPublisherPostRecovery, but the
+// batch loop and CAS predicate are specific to a DB-only "recompute in
+// place" operation, so they are implemented as sibling functions rather than
+// forced through the AppView-shaped `posts: BackfillPostRow[]` API.
+//
+// engagement rows are out of scope for this mode; only public.post is
+// touched. legacy_unknown rows (created_at_source_raw IS NULL) and rows
+// already on CONTENT_TIME_VALIDATOR_VERSION (v2) are never selected.
+
+export const REVALIDATION_LIMITS = {
+  batchSize: 500,
+  maxDurationMs: 30 * 60 * 1000,
+  pauseMs: 1000,
+  lockTimeoutMs: 5000,
+  statementTimeoutMs: 30_000,
+}
+
+export type ContentTimeRevalidationOutcome =
+  | 'v1_valid_to_v2_valid'
+  | 'v1_invalid_to_v2_valid'
+  | 'v1_to_v2_invalid'
+
+export type ContentTimeRevalidationCandidate = {
+  uri: string
+  author: string
+  indexedAt: string
+  created_at_source_raw: Buffer
+  content_time_status: string
+}
+
+export type RevalidatedContentTime = {
+  createdAt: string
+  content_time_utc: string | null
+  content_time_status: 'source_valid' | 'source_invalid'
+  content_time_clamp_reason: ContentTimeClampReason | null
+  outcome: ContentTimeRevalidationOutcome
+}
+
+// Pure transform: given a v1-classified row's stored raw source time and
+// receipt time (indexedAt), recompute against the *current* content-time
+// policy (imported validateContentTime always uses CONTENT_TIME_POLICY_V2
+// unless a caller overrides the policy argument, which this tool never
+// does). No DB or network access — fully unit-testable.
+export function revalidateContentTimeCandidate(
+  candidate: Pick<ContentTimeRevalidationCandidate, 'indexedAt' | 'created_at_source_raw' | 'content_time_status'>,
+): RevalidatedContentTime {
+  const validated = validateContentTime(
+    candidate.created_at_source_raw.toString('utf8'),
+    candidate.indexedAt,
+  )
+  const outcome: ContentTimeRevalidationOutcome =
+    validated.content_time_status === 'source_invalid'
+      ? 'v1_to_v2_invalid'
+      : candidate.content_time_status === 'source_valid'
+        ? 'v1_valid_to_v2_valid'
+        : 'v1_invalid_to_v2_valid'
+  return {
+    // Mirrors src/subscription.ts exactly: the live firehose ingestion path
+    // always sets createdAt = validateContentTime(...).legacy_created_at for
+    // both post and engagement rows (checked 2026-08-17). Revalidation must
+    // therefore also rewrite the legacy createdAt column so a v1 row looks
+    // identical to a row ingestion would produce today. This is a
+    // deliberate divergence from applyRecoveryBatch()'s legacy_unknown
+    // recovery path above, which intentionally leaves createdAt untouched
+    // for old-app compatibility: those rows' createdAt predates the
+    // content-time columns entirely and was never derived from
+    // legacy_created_at, so preserving it is the correct old-app-compat
+    // choice there. v1 rows' createdAt *was* already derived from
+    // legacy_created_at (v1 policy), so recomputing it under v2 is a
+    // like-for-like refresh, not a compatibility break.
+    createdAt: validated.legacy_created_at,
+    content_time_utc: validated.content_time_utc,
+    content_time_status: validated.content_time_status,
+    content_time_clamp_reason: validated.content_time_clamp_reason,
+    outcome,
+  }
+}
+
+export type ContentTimeRevalidationCounts = {
+  v1_valid_to_v2_valid: number
+  v1_invalid_to_v2_valid: number
+  v1_to_v2_invalid: number
+  by_v2_invalid_reason: Partial<Record<ContentTimeClampReason, number>>
+}
+
+function emptyRevalidationCounts(): ContentTimeRevalidationCounts {
+  return {
+    v1_valid_to_v2_valid: 0,
+    v1_invalid_to_v2_valid: 0,
+    v1_to_v2_invalid: 0,
+    by_v2_invalid_reason: {},
+  }
+}
+
+function mergeRevalidationCounts(
+  a: ContentTimeRevalidationCounts,
+  b: ContentTimeRevalidationCounts,
+): ContentTimeRevalidationCounts {
+  const reasons: Partial<Record<ContentTimeClampReason, number>> = { ...a.by_v2_invalid_reason }
+  for (const [reason, count] of Object.entries(b.by_v2_invalid_reason)) {
+    const key = reason as ContentTimeClampReason
+    reasons[key] = (reasons[key] ?? 0) + (count ?? 0)
+  }
+  return {
+    v1_valid_to_v2_valid: a.v1_valid_to_v2_valid + b.v1_valid_to_v2_valid,
+    v1_invalid_to_v2_valid: a.v1_invalid_to_v2_valid + b.v1_invalid_to_v2_valid,
+    v1_to_v2_invalid: a.v1_to_v2_invalid + b.v1_to_v2_invalid,
+    by_v2_invalid_reason: reasons,
+  }
+}
+
+export type ContentTimeRevalidationProgress = {
+  batch: number
+  scanned: number
+  updated: number
+  skipped_cas: number
+  counts: ContentTimeRevalidationCounts
+  cursor_author_sha256: string
+  cursor_uri_sha256: string
+  elapsed_ms: number
+}
+
+export type ContentTimeRevalidationResult = ContentTimeRevalidationProgress & {
+  complete: boolean
+}
+
+export type ContentTimeRevalidationCheckpoint = ContentTimeRevalidationProgress & {
+  config_sha256: string
+  cursor_author: string
+  cursor_uri: string
+}
+
+export type ContentTimeRevalidationOptions = {
+  actors: string[]
+  since: Date
+  batchSize: number
+  afterAuthor?: string
+  afterUri?: string
+  configSha256?: string
+  maxBatches?: number
+  maxDurationMs: number
+  pauseMs: number
+  lockTimeoutMs: number
+  statementTimeoutMs: number
+  onProgress?: (progress: ContentTimeRevalidationProgress) => void
+  onCheckpoint?: (checkpoint: ContentTimeRevalidationCheckpoint) => void
+}
+
+export function contentTimeRevalidationConfigSha256(actors: string[], sinceIso: string): string {
+  const sortedActors = [...new Set(actors)].sort()
+  return sha256(JSON.stringify({
+    actors: sortedActors,
+    since: sinceIso,
+    from_validator_version: CONTENT_TIME_VALIDATOR_VERSION_V1,
+    to_validator_version: CONTENT_TIME_VALIDATOR_VERSION,
+  }))
+}
+
+type RevalidationSelectRow = {
+  uri: string
+  author: string
+  indexedAt: string
+  created_at_source_raw: Buffer
+  content_time_status: string
+}
+
+// Selects up to `limit` v1-validator rows for the given publisher DIDs whose
+// indexedAt is at or after `since`, ordered by (author, uri) starting
+// strictly after the (afterAuthor, afterUri) cursor. author is indexed
+// (post_author_index); indexedAt and content_time_validator_version are not,
+// so this is an index scan over author = ANY(actors) with indexedAt/
+// validator_version applied as a residual filter, bounded to publisher-
+// authored rows only (never a scan of the full public.post table, which
+// also holds every followed-account post). See AGENTS-facing notes in the
+// deploy runbook / final report for the cost estimate and the smallest
+// available mitigation if this ever needs a dedicated index.
+async function selectRevalidationBatch(
+  db: Database,
+  actors: string[],
+  sinceIso: string,
+  afterAuthor: string,
+  afterUri: string,
+  limit: number,
+  forUpdate: boolean,
+): Promise<RevalidationSelectRow[]> {
+  const rows = forUpdate
+    ? (await sql<RevalidationSelectRow>`
+        SELECT uri, author, "indexedAt", created_at_source_raw, content_time_status
+        FROM public.post
+        WHERE author = ANY(${actors}::text[])
+          AND "indexedAt" >= ${sinceIso}
+          AND content_time_validator_version = ${CONTENT_TIME_VALIDATOR_VERSION_V1}
+          AND (author, uri) > (${afterAuthor}, ${afterUri})
+        ORDER BY author, uri
+        LIMIT ${limit}
+        FOR UPDATE
+      `.execute(db)).rows
+    : (await sql<RevalidationSelectRow>`
+        SELECT uri, author, "indexedAt", created_at_source_raw, content_time_status
+        FROM public.post
+        WHERE author = ANY(${actors}::text[])
+          AND "indexedAt" >= ${sinceIso}
+          AND content_time_validator_version = ${CONTENT_TIME_VALIDATOR_VERSION_V1}
+          AND (author, uri) > (${afterAuthor}, ${afterUri})
+        ORDER BY author, uri
+        LIMIT ${limit}
+      `.execute(db)).rows
+  return rows
+}
+
+type RevalidationBatchResult = {
+  candidates: number
+  updated: number
+  skipped_cas: number
+  counts: ContentTimeRevalidationCounts
+  cursorAuthor: string
+  cursorUri: string
+}
+
+async function applyRevalidationBatch(
+  db: Database,
+  actors: string[],
+  sinceIso: string,
+  afterAuthor: string,
+  afterUri: string,
+  batchSize: number,
+  lockTimeoutMs: number,
+  statementTimeoutMs: number,
+  deadlineMs: number,
+): Promise<RevalidationBatchResult> {
+  return db.transaction().execute(async (trx) => {
+    const remainingMs = deadlineMs - Date.now()
+    if (remainingMs <= 0) throw new Error('content-time revalidation deadline reached')
+    await sql`SELECT set_config('transaction_timeout', ${`${remainingMs}ms`}, true)`.execute(trx)
+    await sql`SELECT set_config('lock_timeout', ${`${Math.min(lockTimeoutMs, remainingMs)}ms`}, true)`.execute(trx)
+    await sql`SELECT set_config('statement_timeout', ${`${Math.min(statementTimeoutMs, remainingMs)}ms`}, true)`.execute(trx)
+
+    const rows = await selectRevalidationBatch(trx, actors, sinceIso, afterAuthor, afterUri, batchSize, true)
+    if (rows.length === 0) {
+      return {
+        candidates: 0,
+        updated: 0,
+        skipped_cas: 0,
+        counts: emptyRevalidationCounts(),
+        cursorAuthor: afterAuthor,
+        cursorUri: afterUri,
+      }
+    }
+
+    const payload = rows.map((row) => {
+      const revalidated = revalidateContentTimeCandidate(row)
+      return {
+        uri: row.uri,
+        raw_hex: row.created_at_source_raw.toString('hex'),
+        created_at: revalidated.createdAt,
+        content_time_utc: revalidated.content_time_utc,
+        content_time_status: revalidated.content_time_status,
+        content_time_clamp_reason: revalidated.content_time_clamp_reason,
+        outcome: revalidated.outcome,
+      }
+    })
+
+    // Single atomic UPDATE ... WHERE is the compare-and-swap: it only
+    // touches a row if content_time_validator_version is still v1 AND
+    // created_at_source_raw still equals the bytes we just read inside this
+    // same locked transaction. Any row a concurrent writer changed between
+    // our SELECT and here (impossible under the FOR UPDATE lock from another
+    // transaction touching the same row, but defended anyway) simply will
+    // not appear in RETURNING and is counted as skipped_cas below, never
+    // clobbered.
+    const updateResult = await sql<{
+      uri: string
+      outcome: string
+      content_time_clamp_reason: string | null
+    }>`
+      UPDATE public.post AS target
+      SET "createdAt" = batch.created_at,
+          content_time_utc = batch.content_time_utc,
+          content_time_status = batch.content_time_status,
+          content_time_clamp_reason = batch.content_time_clamp_reason,
+          content_time_validator_version = ${CONTENT_TIME_VALIDATOR_VERSION}
+      FROM jsonb_to_recordset(${JSON.stringify(payload)}::jsonb) AS batch(
+        uri text,
+        raw_hex text,
+        created_at text,
+        content_time_utc text,
+        content_time_status text,
+        content_time_clamp_reason text,
+        outcome text
+      )
+      WHERE target.uri = batch.uri
+        AND target.content_time_validator_version = ${CONTENT_TIME_VALIDATOR_VERSION_V1}
+        AND target.created_at_source_raw = decode(batch.raw_hex, 'hex')
+      RETURNING target.uri, batch.outcome AS outcome, batch.content_time_clamp_reason AS content_time_clamp_reason
+    `.execute(trx)
+
+    const counts = emptyRevalidationCounts()
+    for (const row of updateResult.rows) {
+      const outcome = row.outcome as ContentTimeRevalidationOutcome
+      counts[outcome] += 1
+      if (outcome === 'v1_to_v2_invalid' && row.content_time_clamp_reason) {
+        const reason = row.content_time_clamp_reason as ContentTimeClampReason
+        counts.by_v2_invalid_reason[reason] = (counts.by_v2_invalid_reason[reason] ?? 0) + 1
+      }
+    }
+
+    const last = rows[rows.length - 1]
+    return {
+      candidates: rows.length,
+      updated: updateResult.rows.length,
+      skipped_cas: rows.length - updateResult.rows.length,
+      counts,
+      cursorAuthor: last.author,
+      cursorUri: last.uri,
+    }
+  })
+}
+
+export async function runContentTimeRevalidation(
+  db: Database,
+  options: ContentTimeRevalidationOptions,
+): Promise<ContentTimeRevalidationResult> {
+  const actors = [...new Set(options.actors)].sort()
+  if (actors.length === 0) {
+    throw new Error('content-time revalidation requires at least one publisher DID')
+  }
+  if (!Number.isInteger(options.batchSize) || options.batchSize < 1 || options.batchSize > REVALIDATION_LIMITS.batchSize) {
+    throw new Error(`batchSize must be an integer from 1 to ${REVALIDATION_LIMITS.batchSize}`)
+  }
+  for (const [name, value] of [
+    ['maxDurationMs', options.maxDurationMs],
+    ['pauseMs', options.pauseMs],
+    ['lockTimeoutMs', options.lockTimeoutMs],
+    ['statementTimeoutMs', options.statementTimeoutMs],
+  ] as const) {
+    if (!Number.isInteger(value) || value < (name === 'pauseMs' ? 0 : 1)) {
+      throw new Error(`${name} must be a ${name === 'pauseMs' ? 'non-negative' : 'positive'} integer`)
+    }
+  }
+
+  const sinceIso = options.since.toISOString()
+  const configSha256 = contentTimeRevalidationConfigSha256(actors, sinceIso)
+  if (options.afterAuthor || options.afterUri) {
+    if (options.configSha256 !== configSha256) {
+      throw new Error('checkpoint does not match the immutable revalidation config (actors, since, or validator versions changed)')
+    }
+  }
+
+  const startedAt = Date.now()
+  const deadlineMs = startedAt + options.maxDurationMs
+  let batch = 0
+  let scanned = 0
+  let updated = 0
+  let skippedCas = 0
+  let counts = emptyRevalidationCounts()
+  let cursorAuthor = options.afterAuthor ?? ''
+  let cursorUri = options.afterUri ?? ''
+  let complete = false
+
+  while (true) {
+    const remainingMs = deadlineMs - Date.now()
+    if (remainingMs <= 0) {
+      complete = false
+      break
+    }
+    if (options.maxBatches !== undefined && batch >= options.maxBatches) {
+      complete = false
+      break
+    }
+    const result = await applyRevalidationBatch(
+      db,
+      actors,
+      sinceIso,
+      cursorAuthor,
+      cursorUri,
+      options.batchSize,
+      options.lockTimeoutMs,
+      Math.min(options.statementTimeoutMs, remainingMs),
+      deadlineMs,
+    )
+    if (result.candidates === 0) {
+      complete = true
+      break
+    }
+    batch += 1
+    scanned += result.candidates
+    updated += result.updated
+    skippedCas += result.skipped_cas
+    counts = mergeRevalidationCounts(counts, result.counts)
+    cursorAuthor = result.cursorAuthor
+    cursorUri = result.cursorUri
+
+    const progress: ContentTimeRevalidationProgress = {
+      batch,
+      scanned,
+      updated,
+      skipped_cas: skippedCas,
+      counts,
+      cursor_author_sha256: sha256(cursorAuthor),
+      cursor_uri_sha256: sha256(cursorUri),
+      elapsed_ms: Date.now() - startedAt,
+    }
+    options.onProgress?.(progress)
+    options.onCheckpoint?.({
+      ...progress,
+      config_sha256: configSha256,
+      cursor_author: cursorAuthor,
+      cursor_uri: cursorUri,
+    })
+
+    if (result.candidates < options.batchSize) {
+      // Fewer rows than requested means the (author, uri) tail is exhausted
+      // for this window: there is nothing left matching the WHERE clause
+      // beyond the cursor we just advanced to.
+      complete = true
+      break
+    }
+    if (options.pauseMs > 0) {
+      await sleep(Math.min(options.pauseMs, Math.max(0, deadlineMs - Date.now())))
+    }
+  }
+
+  return {
+    batch,
+    scanned,
+    updated,
+    skipped_cas: skippedCas,
+    counts,
+    cursor_author_sha256: cursorAuthor ? sha256(cursorAuthor) : '',
+    cursor_uri_sha256: cursorUri ? sha256(cursorUri) : '',
+    elapsed_ms: Date.now() - startedAt,
+    complete,
+  }
+}
+
+// Read-only preview: reports the outcome distribution the apply pass would
+// produce, without ever issuing an UPDATE or taking row locks. Used by the
+// CLI's --mode revalidate --dry-run path. Bounded by the same batch size so
+// a preview over a large window cannot run unbounded, but has no 30-minute
+// stop (each iteration is a fast plain SELECT, and callers may re-run it).
+export async function previewContentTimeRevalidation(
+  db: Database,
+  actors: string[],
+  since: Date,
+  batchSize: number = REVALIDATION_LIMITS.batchSize,
+  maxRows: number = 50_000,
+): Promise<{ scanned: number; counts: ContentTimeRevalidationCounts; truncated: boolean }> {
+  const sortedActors = [...new Set(actors)].sort()
+  const sinceIso = since.toISOString()
+  let cursorAuthor = ''
+  let cursorUri = ''
+  let scanned = 0
+  let counts = emptyRevalidationCounts()
+  let truncated = false
+
+  while (scanned < maxRows) {
+    const limit = Math.min(batchSize, maxRows - scanned)
+    const rows = await selectRevalidationBatch(
+      db,
+      sortedActors,
+      sinceIso,
+      cursorAuthor,
+      cursorUri,
+      limit,
+      false,
+    )
+    if (rows.length === 0) break
+    for (const row of rows) {
+      const revalidated = revalidateContentTimeCandidate(row)
+      counts[revalidated.outcome] += 1
+      if (revalidated.outcome === 'v1_to_v2_invalid' && revalidated.content_time_clamp_reason) {
+        const reason = revalidated.content_time_clamp_reason
+        counts.by_v2_invalid_reason[reason] = (counts.by_v2_invalid_reason[reason] ?? 0) + 1
+      }
+    }
+    scanned += rows.length
+    const last = rows[rows.length - 1]
+    cursorAuthor = last.author
+    cursorUri = last.uri
+    if (rows.length < limit) break
+  }
+  if (scanned >= maxRows) truncated = true
+
+  return { scanned, counts, truncated }
+}
+
 function splitCsv(value: string | undefined): string[] {
   return (value || '')
     .split(',')
@@ -621,9 +1123,166 @@ function writeCheckpoint(file: string, checkpoint: object) {
   }
 }
 
-async function main() {
+// --- mode: revalidate CLI wiring ------------------------------------------
+
+type RevalidateCliOptions = {
+  actors?: string[]
+  since: Date
+  apply: boolean
+  json: boolean
+  dbUrl?: string
+  checkpointFile?: string
+  maxPreviewRows: number
+}
+
+function parseRevalidateCliArgs(argv: string[]): RevalidateCliOptions {
+  const flags = new Map<string, string[]>()
+  let apply = false
+  let json = false
+
+  for (let i = 0; i < argv.length; i += 1) {
+    const arg = argv[i]
+    if (arg === '--apply') {
+      apply = true
+      continue
+    }
+    if (arg === '--dry-run') {
+      apply = false
+      continue
+    }
+    if (arg === '--json') {
+      json = true
+      continue
+    }
+    if (!arg.startsWith('--')) throw new Error(`Unexpected positional argument: ${arg}`)
+    const value = argv[i + 1]
+    if (!value || value.startsWith('--')) throw new Error(`Missing value for ${arg}`)
+    i += 1
+    const key = arg.slice(2)
+    flags.set(key, [...(flags.get(key) || []), value])
+  }
+
+  const actorsCsv = [
+    ...splitCsv(flags.get('actors')?.join(',')),
+    ...splitCsv(flags.get('dids')?.join(',')),
+  ]
+
+  const sinceRaw = flags.get('since')?.at(-1)
+  const since = sinceRaw ? new Date(sinceRaw) : new Date(Date.now() - 14 * 24 * 60 * 60 * 1000)
+  if (isNaN(since.getTime())) throw new Error('--since must be an ISO timestamp')
+
+  const maxPreviewRows = Number.parseInt(flags.get('max-preview-rows')?.at(-1) || '50000', 10)
+  if (!Number.isInteger(maxPreviewRows) || maxPreviewRows < 1) {
+    throw new Error('--max-preview-rows must be a positive integer')
+  }
+
+  return {
+    actors: actorsCsv.length ? actorsCsv : undefined,
+    since,
+    apply,
+    json,
+    dbUrl: flags.get('db-url')?.at(-1) || process.env.FEEDGEN_POSTGRES_URL,
+    checkpointFile: flags.get('checkpoint-file')?.at(-1),
+    maxPreviewRows,
+  }
+}
+
+function readRevalidationCheckpoint(
+  file: string,
+  configSha256: string,
+): { cursorAuthor: string; cursorUri: string } | undefined {
+  if (!fs.existsSync(file)) return undefined
+  const checkpoint = JSON.parse(fs.readFileSync(file, 'utf8'))
+  if (
+    checkpoint.config_sha256 !== configSha256 ||
+    typeof checkpoint.cursor_author !== 'string' ||
+    typeof checkpoint.cursor_uri !== 'string'
+  ) {
+    throw new Error('checkpoint does not match the approved revalidation config (actors, since, or validator versions changed)')
+  }
+  return { cursorAuthor: checkpoint.cursor_author, cursorUri: checkpoint.cursor_uri }
+}
+
+async function mainRevalidate(argv: string[]) {
   const startedAt = Date.now()
-  const options = parseCliArgs(process.argv.slice(2))
+  const options = parseRevalidateCliArgs(argv)
+  if (!options.dbUrl) {
+    throw new Error('FEEDGEN_POSTGRES_URL or --db-url is required for --mode revalidate')
+  }
+
+  const db = createDb(options.dbUrl)
+  try {
+    const actors = options.actors && options.actors.length
+      ? [...new Set(options.actors)].sort()
+      : (await resolvePublisherDids(db)).sort()
+    if (!actors.length) {
+      throw new Error('no enabled publisher DIDs resolved from feedgen_ops.feed_catalog; pass --actors explicitly')
+    }
+
+    let revalidation: ContentTimeRevalidationResult | null = null
+    let preview: { scanned: number; counts: ContentTimeRevalidationCounts; truncated: boolean } | null = null
+
+    if (options.apply) {
+      if (!options.checkpointFile) throw new Error('--checkpoint-file is required with --apply')
+      const configSha256 = contentTimeRevalidationConfigSha256(actors, options.since.toISOString())
+      const checkpoint = readRevalidationCheckpoint(options.checkpointFile, configSha256)
+      const deadlineMs = startedAt + REVALIDATION_LIMITS.maxDurationMs
+      const remainingMs = deadlineMs - Date.now()
+      if (remainingMs <= 0) throw new Error('content-time revalidation exhausted its own startup deadline')
+      revalidation = await runContentTimeRevalidation(db, {
+        actors,
+        since: options.since,
+        batchSize: REVALIDATION_LIMITS.batchSize,
+        afterAuthor: checkpoint?.cursorAuthor,
+        afterUri: checkpoint?.cursorUri,
+        configSha256: checkpoint ? configSha256 : undefined,
+        maxDurationMs: remainingMs,
+        pauseMs: REVALIDATION_LIMITS.pauseMs,
+        lockTimeoutMs: REVALIDATION_LIMITS.lockTimeoutMs,
+        statementTimeoutMs: Math.min(REVALIDATION_LIMITS.statementTimeoutMs, remainingMs),
+        onProgress: (progress) => console.error(JSON.stringify({ event: 'revalidate_batch', ...progress })),
+        onCheckpoint: (checkpoint) => writeCheckpoint(options.checkpointFile!, checkpoint),
+      })
+    } else {
+      preview = await previewContentTimeRevalidation(
+        db,
+        actors,
+        options.since,
+        REVALIDATION_LIMITS.batchSize,
+        options.maxPreviewRows,
+      )
+    }
+
+    const summary = {
+      operation: 'content-time-revalidate',
+      mode: options.apply ? 'apply' : 'dry-run',
+      actor_count: actors.length,
+      actor_sha256: actors.map(sha256).sort(),
+      since: options.since.toISOString(),
+      from_validator_version: CONTENT_TIME_VALIDATOR_VERSION_V1,
+      to_validator_version: CONTENT_TIME_VALIDATOR_VERSION,
+      preview,
+      revalidation,
+    }
+
+    if (options.json) {
+      console.log(JSON.stringify(summary, null, 2))
+    } else {
+      const scanned = revalidation?.scanned ?? preview?.scanned ?? 0
+      const updated = revalidation?.updated ?? 0
+      console.log(`${summary.mode}: scanned=${scanned} updated=${updated}`)
+    }
+    if (revalidation && !revalidation.complete) process.exitCode = 3
+  } finally {
+    await db.destroy()
+  }
+}
+
+// --- mode: recover (existing AppView-backed recovery) ---------------------
+
+async function mainRecover(argv: string[]) {
+  const startedAt = Date.now()
+  const options = parseCliArgs(argv)
   const deadlineMs = startedAt + RECOVERY_LIMITS.maxDurationMs
   const plan = await collectPublisherPosts({
     actors: options.actors,
@@ -694,6 +1353,27 @@ async function main() {
     )
   }
   if (recovery && !recovery.complete) process.exitCode = 3
+}
+
+// --- entrypoint -------------------------------------------------------
+
+function detectMode(argv: string[]): 'recover' | 'revalidate' {
+  const index = argv.indexOf('--mode')
+  if (index === -1) return 'recover'
+  const value = argv[index + 1]
+  if (value === 'revalidate') return 'revalidate'
+  if (value === 'recover' || value === undefined) return 'recover'
+  throw new Error(`--mode must be "recover" or "revalidate", got "${value}"`)
+}
+
+async function main() {
+  const argv = process.argv.slice(2)
+  const mode = detectMode(argv)
+  if (mode === 'revalidate') {
+    await mainRevalidate(argv)
+    return
+  }
+  await mainRecover(argv)
 }
 
 if (require.main === module) {
