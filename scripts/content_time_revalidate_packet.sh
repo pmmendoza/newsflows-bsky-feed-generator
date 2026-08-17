@@ -37,11 +37,13 @@
 #
 # Required env (the runner refuses to start without them):
 #   E TREE EXPECTED_SHA EXPECTED_DIST_SHA256 EXPECTED_CT_SHA256 EXPECTED_IMAGE_CT_SHA256 PACKET_SHA
+#   PREREG_MAIN PREREG_BE (pre-registered cells "v1_valid_to_v2_valid=N,v1_invalid_to_v2_valid=N,v1_to_v2_invalid=N")
 # Optional env (production defaults): IMG NETWORK ENV_FILE DB_CONTAINER PSQL_DB PSQL_USER
 #   MAIN_DIDS BE_DID HORIZON_MAIN_DAYS HORIZON_BE_DAYS DOCKER FEEDGEN_CONTAINER RUNNER
 #   (container|host; host = rehearsal with HOST_DSN) CEIL_WAL_BYTES CEIL_REL_BYTES CEIL_DEAD
 #   RANKED_RKEYS MAIN_RKEY_PATTERN BE_RKEY_PATTERN READBACK_JSON (BSR effective-config readback)
-#   PREREG_MAIN / PREREG_BE (pre-registered cells "v1_valid_to_v2_valid=N,v1_invalid_to_v2_valid=N,v1_to_v2_invalid=N")
+#   (READBACK_JSON is required to exist and be fresh: stale_at > now)
+#   SECRET_KEY_REGEX (default: keys matching PASSWORD|SECRET|TOKEN|KEY|PASS) selects which env-file values the secret scan hunts for
 #   PREREG_TOLERANCE_PCT (default 5) SKIP_LIVE_IMAGE_CHECKS=1 (rehearsal only) RESTORE_STOP_AFTER_BATCH (rehearsal only)
 set -euo pipefail
 
@@ -52,6 +54,8 @@ set -euo pipefail
 : "${EXPECTED_CT_SHA256:?EXPECTED_CT_SHA256 is required}"
 : "${EXPECTED_IMAGE_CT_SHA256:?EXPECTED_IMAGE_CT_SHA256 (validator module hash inside the live image) is required}"
 : "${PACKET_SHA:?PACKET_SHA (approved packet SHA-256) is required}"
+: "${PREREG_MAIN:?PREREG_MAIN (pre-registered cells) is required}"
+: "${PREREG_BE:?PREREG_BE (pre-registered cells) is required}"
 [[ "$PACKET_SHA" =~ ^[0-9a-f]{64}$ ]] || { echo "PACKET_SHA must be 64 lowercase hex" >&2; exit 2; }
 IMG="${IMG:-pmmendoza/bsky-feedgen@sha256:928c15aac77a8a842f60053eff8953e70cc9e4117c2fbe86f548e345c1a34711}"
 NETWORK="${NETWORK:-newsflows-bsky-feed-generator-v2_default}"
@@ -69,10 +73,9 @@ CEIL_WAL_BYTES="${CEIL_WAL_BYTES:-614400}"
 CEIL_REL_BYTES="${CEIL_REL_BYTES:-409600}"
 CEIL_DEAD="${CEIL_DEAD:-1000}"
 READBACK_JSON="${READBACK_JSON:-/opt/newsflows/blueskyranker_v2/logs/effective_config_readback.json}"
-PREREG_MAIN="${PREREG_MAIN:-}"
-PREREG_BE="${PREREG_BE:-}"
 PREREG_TOLERANCE_PCT="${PREREG_TOLERANCE_PCT:-5}"
 SKIP_LIVE_IMAGE_CHECKS="${SKIP_LIVE_IMAGE_CHECKS:-0}"
+SECRET_KEY_REGEX="${SECRET_KEY_REGEX:-(PASSWORD|SECRET|TOKEN|_KEY|APIKEY|PASS)}"
 read -r -a DOCKER <<<"${DOCKER:-sudo -n docker}"
 V1='newsflows-content-time/v1'
 V2='newsflows-content-time/v2'
@@ -171,10 +174,11 @@ predicted_outcome() {  # <group> <outcome> from prestate-transitions.tsv
   local pat; case "$1" in main) pat="$MAIN_RKEY_PATTERN";; be) pat="$BE_RKEY_PATTERN";; esac
   awk -F'|' -v pat="$pat" -v o="$2" '$1 ~ "^"pat"$" && $2==o {s+=$3} END{print s+0}' "$E/prestate-transitions.tsv"
 }
-prereg_value() {  # <group> <outcome> from PREREG_MAIN/PREREG_BE ("k=v,k=v"); empty if not set
-  local spec; case "$1" in main) spec="$PREREG_MAIN";; be) spec="$PREREG_BE";; esac
-  [[ -n "$spec" ]] || { echo ""; return; }
-  echo "$spec" | tr ',' '\n' | awk -F= -v k="$2" '$1==k{print $2}'
+prereg_value() {  # <group> <outcome> from PREREG_MAIN/PREREG_BE ("k=v,k=v"); a missing cell is a hard stop
+  local spec v; case "$1" in main) spec="$PREREG_MAIN";; be) spec="$PREREG_BE";; esac
+  v=$(echo "$spec" | tr ',' '\n' | awk -F= -v k="$2" '$1==k{print $2}')
+  [[ "$v" =~ ^[0-9]+$ ]] || die "pre-registered cell $1/$2 missing or non-numeric in PREREG_${1^^}"
+  echo "$v"
 }
 gate_cell() {  # gate_cell <label> <expected> <actual> [tolerance_pct_above_50]
   local exp=$2 act=$3 tol=${4:-2}
@@ -194,7 +198,9 @@ cmd_preflight() {
     [[ "$img_ct" == "$EXPECTED_IMAGE_CT_SHA256" ]] || die "live image validator module hash $img_ct != EXPECTED_IMAGE_CT_SHA256"
     ret=$("${DOCKER[@]}" exec "$FEEDGEN_CONTAINER" sh -c 'echo "${FEEDGEN_RETENTION_ENABLED:-unset}"')
     [[ "$ret" == "unset" || "$ret" == "false" || "$ret" == "0" ]] || die "FEEDGEN_RETENTION_ENABLED=$ret in the running feedgen (must be disabled; D6)"
-    "${DOCKER[@]}" inspect "$FEEDGEN_CONTAINER" --format '{{.Id}} {{.Image}} {{.Config.Image}} {{.State.StartedAt}} {{.RestartCount}}' | emit feedgen-prestate.txt
+    local img_id run_img; img_id=$("${DOCKER[@]}" image inspect "$IMG" --format '{{.Id}}'); run_img=$("${DOCKER[@]}" inspect "$FEEDGEN_CONTAINER" --format '{{.Image}}')
+    [[ "$img_id" == "$run_img" ]] || die "running $FEEDGEN_CONTAINER image ID $run_img != pinned IMG image ID $img_id"
+    { "${DOCKER[@]}" inspect "$FEEDGEN_CONTAINER" --format '{{.Id}} {{.Image}} {{.Config.Image}} {{.State.StartedAt}} {{.RestartCount}}'; echo "pinned_image_id=$img_id"; } | emit feedgen-prestate.txt
     { for t in bsky-ops blueskyranker newsflows-bskyhealth; do f=$(ls /opt/newsflows/tools/uv/$t/lib/python3.*/site-packages/*.dist-info/direct_url.json 2>/dev/null | head -1); echo "$t $(grep -o '"commit_id":"[0-9a-f]*"' "$f" 2>/dev/null | head -1)"; done; } | emit tools.txt
   fi
   psql_ro -c "$CATALOG_SQL" | emit catalog-readback.tsv
@@ -205,7 +211,10 @@ cmd_preflight() {
   local max_main max_be; max_main=$(awk -F'|' -v pat="$MAIN_RKEY_PATTERN" 'NR>1 && $1 ~ "^"pat"$" {if($3+0>m)m=$3+0} END{print m+0}' "$E/catalog-readback.tsv"); max_be=$(awk -F'|' -v pat="$BE_RKEY_PATTERN" 'NR>1 && $1 ~ "^"pat"$" {if($3+0>m)m=$3+0} END{print m+0}' "$E/catalog-readback.tsv")
   (( HORIZON_MAIN_DAYS >= max_main && HORIZON_BE_DAYS >= max_be )) || die "horizon (main $HORIZON_MAIN_DAYS / be $HORIZON_BE_DAYS) below catalog publisher_post_max_age_days (main $max_main / be $max_be)"
   local rb_main="n/a" rb_be="n/a"
-  if [[ -f "$READBACK_JSON" ]]; then
+  if [[ "$SKIP_LIVE_IMAGE_CHECKS" != "1" ]]; then
+    [[ -f "$READBACK_JSON" ]] || die "READBACK_JSON $READBACK_JSON missing — BSR effective-config readback is a prerequisite"
+    local rb_stale rb_now; rb_stale=$(sudo -n node -e 'const j=JSON.parse(require("fs").readFileSync(process.argv[1]));console.log((j.artifact_metadata||{}).stale_at||0)' "$READBACK_JSON"); rb_now=$(date -u +%s)
+    (( rb_stale > rb_now )) || die "BSR effective-config readback is stale (stale_at=$rb_stale now=$rb_now); the 5-min producer must be running"
     rb_main=$(sudo -n node -e 'const j=JSON.parse(require("fs").readFileSync(process.argv[1]));let m=0;for(const b of Object.values(j.bindings||{})){if((b.feed_ids||[]).some(f=>/newsflow-(nl|fr|cz|ir)-2/.test(f)))m=Math.max(m,b.push_window_days||0)}console.log(m)' "$READBACK_JSON")
     rb_be=$(sudo -n node -e 'const j=JSON.parse(require("fs").readFileSync(process.argv[1]));let m=0;for(const b of Object.values(j.bindings||{})){if((b.feed_ids||[]).some(f=>/newsflow-be-/.test(f)))m=Math.max(m,b.push_window_days||0)}console.log(m)' "$READBACK_JSON")
     (( HORIZON_MAIN_DAYS >= rb_main && HORIZON_BE_DAYS >= rb_be )) || die "horizon below BSR push window (readback main $rb_main / be $rb_be)"
@@ -219,7 +228,7 @@ cmd_preflight() {
   local nullraw; nullraw=$(awk -F'|' 'NR>1 && $1 !~ /^rkey$/ {s+=$7} END{print s+0}' "$E/prestate-populations.tsv")
   [[ "$nullraw" == "0" ]] || die "in-horizon v1 rows with NULL raw: $nullraw (expected 0)"
   local g o exp act
-  for g in main be; do for o in "${OUTCOMES[@]}"; do exp=$(prereg_value "$g" "$o"); [[ -n "$exp" ]] || continue; act=$(predicted_outcome "$g" "$o"); gate_cell "prereg $g/$o" "$exp" "$act" "$PREREG_TOLERANCE_PCT"; done; done
+  for g in main be; do for o in "${OUTCOMES[@]}"; do exp=$(prereg_value "$g" "$o"); act=$(predicted_outcome "$g" "$o"); gate_cell "prereg $g/$o" "$exp" "$act" "$PREREG_TOLERANCE_PCT"; done; done
   psql_copy "$(snapshot_sql "$MAIN_DIDS" "$(since_file main)" "$V1")" | emit step1-main-prestate-rows.tsv
   psql_copy "$(snapshot_sql "$BE_DID" "$(since_file be)" "$V1")" | emit step1-be-prestate-rows.tsv
   take_control pg-control-1.txt
@@ -281,11 +290,25 @@ const m=new Map(post.map(r=>[r[0],r]));let missing=0,createdChanged=0,statusChan
 for(const r of pre){const q=m.get(r[0]);if(!q){missing++;continue;}if(q[3]!==r[3])createdChanged++;if(q[5]!==r[5])statusChanged++;if(q[8]!==r[8])rawMismatch++;}
 console.log(`prestate_rows=${pre.length} poststate_rows_v2=${post.length} prestate_missing_in_poststate=${missing} createdAt_changed=${createdChanged} status_changed=${statusChanged} raw_mismatch=${rawMismatch}`);
 process.exit(missing===0&&rawMismatch===0?0:2)' "$E/step1-$g-prestate-rows.tsv" "$E/step1-$g-poststate-rows.tsv" | emit "step1-$g-diff.txt" || die "readback $g: prestate rows missing from poststate or raw mismatch"
+    # realized outcome vs pre-registration: rows whose status/createdAt changed == past_bound->valid + valid->invalid
+    local exp_changed act_status act_created
+    exp_changed=$(( $(prereg_value "$g" v1_invalid_to_v2_valid) + $(prereg_value "$g" v1_to_v2_invalid) ))
+    act_status=$(sed -n 's/.*status_changed=\([0-9]*\).*/\1/p' "$E/step1-$g-diff.txt"); act_created=$(sed -n 's/.*createdAt_changed=\([0-9]*\).*/\1/p' "$E/step1-$g-diff.txt")
+    gate_cell "realized $g/status_changed" "$exp_changed" "$act_status" "$PREREG_TOLERANCE_PCT"
+    gate_cell "realized $g/createdAt_changed" "$exp_changed" "$act_created" "$PREREG_TOLERANCE_PCT"
   done
   psql_ro -c "$POP_SQL" | emit poststate-populations.tsv
   pgstat_read | emit pg-poststate.txt
   local rem; rem=$(awk -F'|' 'NR>1 && $1 !~ /^rkey$/ {s+=$6} END{print s+0}' "$E/poststate-populations.tsv")
   [[ "$rem" == "0" ]] || die "v1_rows_with_raw remaining after apply: $rem"
+  # per-feed post-state v2_invalid must equal prestate v2_invalid + predicted v1_to_v2_invalid (per rkey; exact <50, else +/-2%)
+  local rk pre_inv pred_inv post_inv
+  while IFS='|' read -r rk _h _t _v pre_inv _rest; do
+    [[ "$rk" =~ ^newsflow ]] || continue
+    pred_inv=$(awk -F'|' -v r="$rk" '$1==r && $2=="v1_to_v2_invalid"{s+=$3} END{print s+0}' "$E/prestate-transitions.tsv")
+    post_inv=$(awk -F'|' -v r="$rk" '$1==r{print $5}' "$E/poststate-populations.tsv")
+    gate_cell "poststate $rk/v2_invalid" $(( pre_inv + pred_inv )) "${post_inv:-0}"
+  done <"$E/prestate-populations.tsv"
   log "readback ok: v1_rows_with_raw=0 for all ranked feeds"
 }
 cmd_restore() {  # bounded CAS restore from the prestate snapshot; keyset batches of 500; resumable; batch index derived from the cursor
@@ -298,15 +321,16 @@ cmd_restore() {  # bounded CAS restore from the prestate snapshot; keyset batche
   while (( start <= total )); do
     local end=$(( start + 499 )); (( end > total )) && end=$total; batch=$(( (start - 1) / 500 + 1 ))
     local rtmp; rtmp=$(mktemp)
+    local attempt=1 rname; while [[ -e "$E/restore-$g-rows-$start-$end-attempt-$attempt.txt" ]]; do attempt=$(( attempt + 1 )); done; rname="restore-$g-rows-$start-$end-attempt-$attempt.txt"
     { echo "BEGIN; SET lock_timeout='5s'; SET statement_timeout='30s';"; echo "CREATE TEMP TABLE prestate(uri text, author text, indexed_at text, created_at text, content_time_utc text, status text, reason text, version text, raw_hex text);"; echo "COPY prestate FROM STDIN WITH (FORMAT text);"; sed -n "${start},${end}p" "$pre"; echo '\.'; cat <<'SQL'
 UPDATE public.post AS t SET "createdAt"=s.created_at, content_time_utc=s.content_time_utc, content_time_status=s.status, content_time_clamp_reason=s.reason, content_time_validator_version=s.version
 FROM prestate s WHERE t.uri=s.uri AND t.content_time_validator_version='newsflows-content-time/v2' AND encode(t.created_at_source_raw,'hex')=s.raw_hex;
 SELECT 'restored_in_batch', count(*) FROM post p JOIN prestate s ON s.uri=p.uri WHERE p."createdAt"=s.created_at AND p.content_time_utc IS NOT DISTINCT FROM s.content_time_utc AND p.content_time_status=s.status AND p.content_time_clamp_reason IS NOT DISTINCT FROM s.reason AND p.content_time_validator_version=s.version;
 COMMIT;
 SQL
-    } | "${DOCKER[@]}" exec -i "$DB_CONTAINER" psql -U "$PSQL_USER" -d "$PSQL_DB" -X -A -F '|' -v ON_ERROR_STOP=1 >"$rtmp" 2>&1 || { emit "restore-$g-batch-$batch.txt" <"$rtmp"; die "restore $g batch $batch failed (see restore-$g-batch-$batch.txt); re-run 'restore $g' to resume from the cursor"; }
+    } | "${DOCKER[@]}" exec -i "$DB_CONTAINER" psql -U "$PSQL_USER" -d "$PSQL_DB" -X -A -F '|' -v ON_ERROR_STOP=1 >"$rtmp" 2>&1 || { emit "$rname" <"$rtmp"; die "restore $g batch $batch (rows $start-$end) failed (see $rname); re-run 'restore $g' to resume from the cursor (next attempt gets its own receipt)"; }
     local restored expected=$(( end - start + 1 )); restored=$(awk -F'|' '$1=="restored_in_batch"{print $2}' "$rtmp")
-    emit "restore-$g-batch-$batch.txt" <"$rtmp"; rm -f "$rtmp"
+    emit "$rname" <"$rtmp"; rm -f "$rtmp"
     [[ "$restored" == "$expected" ]] || die "restore $g batch $batch restored $restored of $expected rows (CAS mismatch); stop + escalation"
     echo $(( end + 1 )) | sudo -n tee "$cur" >/dev/null
     if [[ -n "${RESTORE_STOP_AFTER_BATCH:-}" && "$batch" -ge "$RESTORE_STOP_AFTER_BATCH" && "$end" -lt "$total" ]]; then log "restore $g: rehearsal stop after batch $batch (resume by re-running)"; exit 3; fi
@@ -317,15 +341,26 @@ SQL
   log "restore $g complete: identical to prestate"
 }
 cmd_secret_scan() {
-  local vals hits=0 out="" n
-  vals=$(sudo -n awk -F= '/^[A-Za-z_][A-Za-z0-9_]*=/{v=substr($0,index($0,"=")+1); gsub(/^["'"'"']|["'"'"']$/,"",v); if(length(v)>=8)print v}' "$ENV_FILE")
+  # Only values of SECRET-bearing keys are hunted (fixed-string, len>=8); configuration values the runner records itself
+  # (hosts, DB names, DIDs) are not secrets and would collide with source-set.txt / snapshots. The scan fails closed if no
+  # secret-key value could be extracted. Each grep is failure-tolerant so the loop can never abort early.
+  local vals hits=0 out="" n keys
+  keys=$(sudo -n awk -F= -v re="$SECRET_KEY_REGEX" '/^[A-Za-z_][A-Za-z0-9_]*=/{k=$1; if(k ~ re){v=substr($0,index($0,"=")+1); gsub(/^["'"'"']|["'"'"']$/,"",v); if(length(v)>=8)print k}}' "$ENV_FILE" | tr '\n' ' ')
+  vals=$(sudo -n awk -F= -v re="$SECRET_KEY_REGEX" '/^[A-Za-z_][A-Za-z0-9_]*=/{k=$1; if(k ~ re){v=substr($0,index($0,"=")+1); gsub(/^["'"'"']|["'"'"']$/,"",v); if(length(v)>=8)print v}}' "$ENV_FILE")
   n=$(printf '%s\n' "$vals" | grep -c . || true)
-  (( n > 0 )) || die "secret scan: no env-file values (len>=8) could be extracted from $ENV_FILE — cannot certify raw-free"
-  out=$( { while IFS= read -r v; do [[ -n "$v" ]] && sudo -n grep -rlF -- "$v" "$E" 2>/dev/null; done <<<"$vals"; sudo -n grep -rlE 'postgresql://[^ ]+:[^ ]+@|FEEDGEN_DB_PASSWORD=|app_password|API_KEY=' "$E" 2>/dev/null | grep -v '/secret-scan.txt$'; } | sort -u ) || true
+  (( n > 0 )) || die "secret scan: no secret-key values (keys matching $SECRET_KEY_REGEX, len>=8) could be extracted from $ENV_FILE — cannot certify raw-free"
+  echo "$keys" | grep -q -E "PASSWORD" || die "secret scan: no PASSWORD-bearing key found in $ENV_FILE (keys: $keys)"
+  local v f
+  while IFS= read -r v; do
+    [[ -n "$v" ]] || continue
+    f=$(sudo -n grep -rlF -- "$v" "$E" 2>/dev/null || true); [[ -n "$f" ]] && out+="$f"$'\n'
+  done <<<"$vals"
+  f=$(sudo -n grep -rlE 'postgresql://[^ ]+:[^ ]+@|FEEDGEN_DB_PASSWORD=|app_password' "$E" 2>/dev/null | grep -v '/secret-scan.txt$' || true); [[ -n "$f" ]] && out+="$f"$'\n'
+  out=$(printf '%s' "$out" | sort -u | grep . || true)
   if [[ -n "$out" ]]; then hits=$(echo "$out" | wc -l); fi
-  { echo "generated_at=$(ts)"; echo "env_values_scanned=$n"; echo "hits=$hits"; if [[ -n "$out" ]]; then echo "$out"; fi; } | emit secret-scan.txt
-  (( hits == 0 )) || die "secret scan found $hits file(s) with secret markers (names in secret-scan.txt); do NOT append the ledger row; treat as an incident (checkpoint files are written by the tool: quarantine, do not delete)"
-  log "secret scan clean ($n values scanned)"
+  { echo "generated_at=$(ts)"; echo "secret_keys_scanned=$keys"; echo "secret_values_scanned=$n"; echo "hits=$hits"; if [[ -n "$out" ]]; then echo "$out"; fi; } | emit secret-scan.txt
+  (( hits == 0 )) || die "secret scan found $hits file(s) containing a secret value or DSN marker (names in secret-scan.txt); do NOT append the ledger row; incident: quarantine \$E (checkpoint files are written by the tool)"
+  log "secret scan clean ($n secret values from keys: $keys)"
 }
 cmd_finalize() {
   local wstart=${1:-unset} wend=${2:-unset}
