@@ -627,6 +627,15 @@ export type ContentTimeRevalidationProgress = {
   cursor_uri_sha256: string
   elapsed_ms: number
   packet_sha256: string
+  // This batch's own WAL/relation-size deltas, measured inside the batch
+  // transaction (pg_current_wal_lsn() + pg_total_relation_size('public.post')
+  // right after the SET_CONFIGs, again right after the UPDATE and before
+  // commit) -- not cumulative across the run, unlike the fields above. This
+  // is what makes a per-batch ceiling check attributable to that batch alone
+  // rather than confounded by earlier batches or concurrent writers.
+  wal_bytes: number
+  relation_bytes_before: number
+  relation_bytes_after: number
 }
 
 // One entry per committed batch transaction, in order. cursor_author/
@@ -644,6 +653,9 @@ export type ContentTimeRevalidationBatchSummary = {
   cursor_author: string
   cursor_uri: string
   elapsed_ms: number
+  wal_bytes: number
+  relation_bytes_before: number
+  relation_bytes_after: number
 }
 
 export type ContentTimeRevalidationResult = ContentTimeRevalidationProgress & {
@@ -743,6 +755,9 @@ type RevalidationBatchResult = {
   counts: ContentTimeRevalidationCounts
   cursorAuthor: string
   cursorUri: string
+  walBytes: number
+  relationBytesBefore: number
+  relationBytesAfter: number
 }
 
 async function applyRevalidationBatch(
@@ -763,6 +778,15 @@ async function applyRevalidationBatch(
     await sql`SELECT set_config('lock_timeout', ${`${Math.min(lockTimeoutMs, remainingMs)}ms`}, true)`.execute(trx)
     await sql`SELECT set_config('statement_timeout', ${`${Math.min(statementTimeoutMs, remainingMs)}ms`}, true)`.execute(trx)
 
+    // Attributable-ceiling measurement, point one: taken right after the
+    // SET_CONFIGs, before the SELECT ... FOR UPDATE, so it reflects this
+    // batch's transaction only -- not whatever an earlier batch or a
+    // concurrent writer already did to public.post.
+    const before = (await sql<{ lsn: string; relation_bytes: string }>`
+      SELECT pg_current_wal_lsn()::text AS lsn,
+             pg_total_relation_size('public.post')::text AS relation_bytes
+    `.execute(trx)).rows[0]
+
     const rows = await selectRevalidationBatch(trx, actors, sinceIso, afterAuthor, afterUri, batchSize, true)
     if (rows.length === 0) {
       return {
@@ -772,6 +796,9 @@ async function applyRevalidationBatch(
         counts: emptyRevalidationCounts(),
         cursorAuthor: afterAuthor,
         cursorUri: afterUri,
+        walBytes: 0,
+        relationBytesBefore: Number(before.relation_bytes),
+        relationBytesAfter: Number(before.relation_bytes),
       }
     }
 
@@ -832,6 +859,16 @@ async function applyRevalidationBatch(
       }
     }
 
+    // Attributable-ceiling measurement, point two: taken right after the
+    // UPDATE and before this transaction commits (db.transaction().execute
+    // commits when this callback resolves), so pg_wal_lsn_diff isolates
+    // exactly this batch's WAL, and relation_bytes_after captures the size
+    // this same UPDATE just produced.
+    const after = (await sql<{ wal_bytes: string; relation_bytes: string }>`
+      SELECT pg_wal_lsn_diff(pg_current_wal_lsn(), ${before.lsn}::pg_lsn)::text AS wal_bytes,
+             pg_total_relation_size('public.post')::text AS relation_bytes
+    `.execute(trx)).rows[0]
+
     const last = rows[rows.length - 1]
     return {
       candidates: rows.length,
@@ -840,6 +877,9 @@ async function applyRevalidationBatch(
       counts,
       cursorAuthor: last.author,
       cursorUri: last.uri,
+      walBytes: Number(after.wal_bytes),
+      relationBytesBefore: Number(before.relation_bytes),
+      relationBytesAfter: Number(after.relation_bytes),
     }
   })
 }
@@ -890,6 +930,9 @@ export async function runContentTimeRevalidation(
   let cursorAuthor = options.afterAuthor ?? ''
   let cursorUri = options.afterUri ?? ''
   let complete = false
+  let lastWalBytes = 0
+  let lastRelationBytesBefore = 0
+  let lastRelationBytesAfter = 0
   const batches: ContentTimeRevalidationBatchSummary[] = []
 
   while (true) {
@@ -925,6 +968,9 @@ export async function runContentTimeRevalidation(
     counts = mergeRevalidationCounts(counts, result.counts)
     cursorAuthor = result.cursorAuthor
     cursorUri = result.cursorUri
+    lastWalBytes = result.walBytes
+    lastRelationBytesBefore = result.relationBytesBefore
+    lastRelationBytesAfter = result.relationBytesAfter
     const batchElapsedMs = Date.now() - batchStartedAt
     batches.push({
       batch,
@@ -935,6 +981,9 @@ export async function runContentTimeRevalidation(
       cursor_author: cursorAuthor,
       cursor_uri: cursorUri,
       elapsed_ms: batchElapsedMs,
+      wal_bytes: result.walBytes,
+      relation_bytes_before: result.relationBytesBefore,
+      relation_bytes_after: result.relationBytesAfter,
     })
 
     const progress: ContentTimeRevalidationProgress = {
@@ -947,6 +996,9 @@ export async function runContentTimeRevalidation(
       cursor_uri_sha256: sha256(cursorUri),
       elapsed_ms: Date.now() - startedAt,
       packet_sha256: options.packetSha256,
+      wal_bytes: result.walBytes,
+      relation_bytes_before: result.relationBytesBefore,
+      relation_bytes_after: result.relationBytesAfter,
     }
     options.onProgress?.(progress)
     options.onCheckpoint?.({
@@ -978,6 +1030,12 @@ export async function runContentTimeRevalidation(
     cursor_uri_sha256: cursorUri ? sha256(cursorUri) : '',
     elapsed_ms: Date.now() - startedAt,
     packet_sha256: options.packetSha256,
+    // Mirrors the last batch pushed above (0 if this invocation ran zero
+    // batches, e.g. an immediate empty scan) -- the top-level result is a
+    // snapshot of the final progress state, not a sum across batches.
+    wal_bytes: lastWalBytes,
+    relation_bytes_before: lastRelationBytesBefore,
+    relation_bytes_after: lastRelationBytesAfter,
     complete,
     batches,
   }
