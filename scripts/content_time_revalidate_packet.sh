@@ -270,13 +270,13 @@ cmd_secret_scan() {
   local hits=0 out
   out=$( ( set +e; pw=$(sudo -n grep -m1 '^FEEDGEN_DB_PASSWORD=' "$ENV_FILE" | cut -d= -f2- | tr -d "\"'"); [[ -n "$pw" ]] && sudo -n grep -rlF -- "$pw" "$E" ; sudo -n grep -rlE 'postgresql://[^ ]+:[^ ]+@|FEEDGEN_DB_PASSWORD=|app_password' "$E" | grep -v '/secret-scan.txt$' ) | sort -u ) || true   # pipefail: an empty grep result is the GOOD case
   if [[ -n "$out" ]]; then hits=$(echo "$out" | wc -l); fi
-  { echo "generated_at=$(ts)"; echo "hits=$hits"; [[ -n "$out" ]] && echo "$out"; } | emit secret-scan.txt
+  { echo "generated_at=$(ts)"; echo "hits=$hits"; if [[ -n "$out" ]]; then echo "$out"; fi; } | emit secret-scan.txt
   (( hits == 0 )) || die "secret scan found $hits file(s) with secret markers; do NOT append the ledger row"
   log "secret scan clean"
 }
 cmd_finalize() {
   local wstart=${1:-unset} wend=${2:-unset}
-  { echo "status=complete"; echo "generated_at=$(ts)"; cat "$E/source-set.txt"; echo "window_start_utc=$wstart"; echo "window_end_utc=$wend"; for f in "$E"/ceiling-*.txt; do [[ -f "$f" ]] && { echo "--- $(basename "$f")"; cat "$f"; }; done; echo "--- diffs"; cat "$E"/step1-*-diff.txt 2>/dev/null; echo "--- populations after"; cat "$E/poststate-populations.tsv"; } | emit RESULT.txt
+  { echo "status=complete"; echo "generated_at=$(ts)"; cat "$E/source-set.txt"; echo "window_start_utc=$wstart"; echo "window_end_utc=$wend"; for f in "$E"/ceiling-*.txt; do if [[ -f "$f" ]]; then echo "--- $(basename "$f")"; cat "$f"; fi; done; echo "--- diffs"; cat "$E"/step1-*-diff.txt 2>/dev/null; echo "--- populations after"; cat "$E/poststate-populations.tsv"; } | emit RESULT.txt
   ( cd "$E" && sudo -n sh -c 'sha256sum $(ls | grep -v "^SHA256SUMS$") > SHA256SUMS && chown root:newsflows SHA256SUMS && chmod 640 SHA256SUMS' )
   log "finalized: $E"
 }
