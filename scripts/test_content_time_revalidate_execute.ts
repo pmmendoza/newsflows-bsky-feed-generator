@@ -278,6 +278,9 @@ async function main() {
     assert(first.batches[0].cursor_author.startsWith('did:plc:'), 'per-batch cursor_author must be the raw DID, not a hash')
     assert(first.batches[0].cursor_uri.startsWith('at://'), 'per-batch cursor_uri must be the raw URI, not a hash')
     assert(typeof first.batches[0].elapsed_ms === 'number' && first.batches[0].elapsed_ms >= 0)
+    assert(typeof first.batches[0].wal_bytes === 'number' && first.batches[0].wal_bytes >= 0, 'wal_bytes must be a measured non-negative integer even for a 1-row batch')
+    assert(typeof first.batches[0].relation_bytes_before === 'number' && first.batches[0].relation_bytes_before > 0)
+    assert(typeof first.batches[0].relation_bytes_after === 'number' && first.batches[0].relation_bytes_after >= first.batches[0].relation_bytes_before)
 
     const resumed = await runContentTimeRevalidation(db, {
       actors,
@@ -588,6 +591,16 @@ async function main() {
     assert.equal(bulkResult.batches.length, 1, '500 candidates at batchSize=500 must be exactly one batch summary')
     assert.equal(bulkResult.batches[0].updated, 500)
     assert.equal(bulkResult.packet_sha256, PACKET_SHA)
+    // Attributable per-batch WAL/relation-size instrumentation: measured
+    // inside the batch transaction itself, so it must be strictly positive
+    // for a real 500-row UPDATE and must appear both on the batch summary
+    // and mirrored onto the cumulative result (last-batch snapshot).
+    assert(bulkResult.batches[0].wal_bytes > 0, 'a 500-row UPDATE must produce measurable WAL inside its own batch transaction')
+    assert(bulkResult.batches[0].relation_bytes_before > 0, 'relation_bytes_before must reflect the already-populated table')
+    assert(bulkResult.batches[0].relation_bytes_after >= bulkResult.batches[0].relation_bytes_before, 'relation size must not shrink from an UPDATE-only batch')
+    assert.equal(bulkResult.wal_bytes, bulkResult.batches[0].wal_bytes, 'the cumulative result must mirror the last (only) batch summary')
+    assert.equal(bulkResult.relation_bytes_before, bulkResult.batches[0].relation_bytes_before)
+    assert.equal(bulkResult.relation_bytes_after, bulkResult.batches[0].relation_bytes_after)
 
     await sql`SELECT pg_stat_force_next_flush()`.execute(db)
     await sql`ANALYZE public.post`.execute(db)
