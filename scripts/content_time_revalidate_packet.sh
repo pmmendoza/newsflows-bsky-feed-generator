@@ -181,10 +181,10 @@ pred AS (SELECT rkey, CASE
 SELECT rkey, outcome, count(*) FROM pred GROUP BY 1,2 ORDER BY 1,2;"
 # among predicted valid->valid rows, those whose stored "createdAt" differs from the v2 rendering of the raw (per rkey) -> createdAt_changed pre-registration
 CREATED_SQL="WITH t AS (SELECT c.rkey, c.publisher_did, CASE WHEN c.rkey LIKE 'newsflow-be-%' THEN '$SINCE_BE' ELSE '$SINCE_MAIN' END AS since FROM feedgen_ops.feed_catalog c WHERE c.enabled AND c.rkey IN ($RANKED_RKEYS)),
-v1 AS (SELECT t.rkey, p.\"createdAt\" AS ca, convert_from(p.created_at_source_raw,'UTF8') AS raw, p.\"indexedAt\" AS ia
+v0 AS (SELECT t.rkey, p.\"createdAt\" AS ca, convert_from(p.created_at_source_raw,'UTF8') AS raw, p.\"indexedAt\" AS ia
  FROM t JOIN post p ON p.author=t.publisher_did AND p.\"indexedAt\" >= t.since
- WHERE p.content_time_validator_version='$V1' AND p.created_at_source_raw IS NOT NULL AND p.content_time_status='source_valid'
-   AND raw ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}T' AND NOT (raw::timestamptz > ia::timestamptz + interval '5 minutes'))
+ WHERE p.content_time_validator_version='$V1' AND p.created_at_source_raw IS NOT NULL AND p.content_time_status='source_valid'),
+v1 AS (SELECT * FROM v0 WHERE raw ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}T' AND NOT (raw::timestamptz > ia::timestamptz + interval '5 minutes'))
 SELECT rkey, count(*) FILTER (WHERE ca IS DISTINCT FROM to_char(raw::timestamptz AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"')) AS createdat_extra FROM v1 GROUP BY 1 ORDER BY 1;"
 CATALOG_SQL="SELECT rkey, publisher_did, publisher_post_max_age_days FROM feedgen_ops.feed_catalog WHERE enabled AND rkey IN ($RANKED_RKEYS) ORDER BY 1;"
 snapshot_sql() {  # <dids-csv> <since> <version>
