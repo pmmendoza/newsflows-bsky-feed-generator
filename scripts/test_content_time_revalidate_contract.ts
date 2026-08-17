@@ -157,14 +157,22 @@ console.log('bounded-contract constant checks passed')
     cursor_uri_sha256: 'b'.repeat(64),
     elapsed_ms: 4200,
     packet_sha256: 'c'.repeat(64),
+    // This batch's own WAL/relation-size deltas -- plain measured integers,
+    // not derived from row content, so they carry no raw-data risk.
+    wal_bytes: 333896,
+    relation_bytes_before: 8192000,
+    relation_bytes_after: 8355840,
   }
   const serialized = JSON.stringify(syntheticProgress)
   check(!/at:\/\//.test(serialized), 'progress receipt must never contain a raw at:// post/publisher URI')
   check(!/did:plc:/.test(serialized), 'progress receipt must never contain a raw DID')
   check(!/\d{4}-\d{2}-\d{2}T\d{2}:\d{2}/.test(serialized), 'progress receipt must never contain a raw content/receipt timestamp (only elapsed_ms and counts)')
   check(/^[0-9a-f]{64}$/.test(syntheticProgress.packet_sha256), 'packet_sha256 must be a lowercase sha256 hex digest, not raw packet content')
+  check(Number.isInteger(syntheticProgress.wal_bytes) && syntheticProgress.wal_bytes >= 0, 'wal_bytes must be a non-negative integer')
+  check(Number.isInteger(syntheticProgress.relation_bytes_before) && Number.isInteger(syntheticProgress.relation_bytes_after), 'relation_bytes_before/after must be integers')
   const allowedKeys = new Set([
     'batch', 'scanned', 'updated', 'skipped_cas', 'counts', 'cursor_author_sha256', 'cursor_uri_sha256', 'elapsed_ms', 'packet_sha256',
+    'wal_bytes', 'relation_bytes_before', 'relation_bytes_after',
   ])
   for (const key of Object.keys(syntheticProgress)) {
     check(allowedKeys.has(key), `unexpected key in progress receipt: ${key}`)
@@ -191,9 +199,13 @@ console.log('bounded-contract constant checks passed')
     cursor_author: 'did:plc:example-publisher',
     cursor_uri: 'at://did:plc:example-publisher/app.bsky.feed.post/abc123',
     elapsed_ms: 72,
+    wal_bytes: 333896,
+    relation_bytes_before: 8192000,
+    relation_bytes_after: 8355840,
   }
   const allowedKeys = new Set([
     'batch', 'candidates', 'updated', 'skipped_cas', 'counts', 'cursor_author', 'cursor_uri', 'elapsed_ms',
+    'wal_bytes', 'relation_bytes_before', 'relation_bytes_after',
   ])
   for (const key of Object.keys(syntheticBatch)) {
     check(allowedKeys.has(key), `unexpected key in per-batch summary: ${key}`)
