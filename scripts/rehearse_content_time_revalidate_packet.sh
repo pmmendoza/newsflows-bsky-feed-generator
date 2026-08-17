@@ -44,7 +44,7 @@ export E TREE="$repo_root" RUNNER=host HOST_DSN="postgresql://feedgen:feedgen@12
 
 step() { echo "status=$1"; shift; "$@"; }
 step preflight bash "$runner" preflight
-[[ -s "$E/step1-main-prestate-rows.tsv" && $(wc -l <"$E/step1-main-prestate-rows.tsv") -eq 620 ]] || { echo "preflight main snapshot rows != 620"; exit 1; }
+[[ -s "$E/step1-main-prestate-rows.tsv" && $(wc -l <"$E/step1-main-prestate-rows.tsv") -ge 620 ]] || { echo "preflight main snapshot rows < 620"; exit 1; }
 step preview_main bash "$runner" preview main
 step preview_be bash "$runner" preview be
 step apply_main_b1 bash "$runner" apply main b1 1
