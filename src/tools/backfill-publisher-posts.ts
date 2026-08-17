@@ -628,7 +628,7 @@ export type ContentTimeRevalidationProgress = {
   elapsed_ms: number
   packet_sha256: string
   // This batch's own WAL/relation-size deltas, measured inside the batch
-  // transaction (pg_current_wal_lsn() + pg_total_relation_size('public.post')
+  // transaction (pg_current_wal_insert_lsn() + pg_total_relation_size('public.post')
   // right after the SET_CONFIGs, again right after the UPDATE and before
   // commit) -- not cumulative across the run, unlike the fields above. This
   // is what makes a per-batch ceiling check attributable to that batch alone
@@ -783,7 +783,7 @@ async function applyRevalidationBatch(
     // batch's transaction only -- not whatever an earlier batch or a
     // concurrent writer already did to public.post.
     const before = (await sql<{ lsn: string; relation_bytes: string }>`
-      SELECT pg_current_wal_lsn()::text AS lsn,
+      SELECT pg_current_wal_insert_lsn()::text AS lsn,
              pg_total_relation_size('public.post')::text AS relation_bytes
     `.execute(trx)).rows[0]
 
@@ -865,7 +865,7 @@ async function applyRevalidationBatch(
     // exactly this batch's WAL, and relation_bytes_after captures the size
     // this same UPDATE just produced.
     const after = (await sql<{ wal_bytes: string; relation_bytes: string }>`
-      SELECT pg_wal_lsn_diff(pg_current_wal_lsn(), ${before.lsn}::pg_lsn)::text AS wal_bytes,
+      SELECT pg_wal_lsn_diff(pg_current_wal_insert_lsn(), ${before.lsn}::pg_lsn)::text AS wal_bytes,
              pg_total_relation_size('public.post')::text AS relation_bytes
     `.execute(trx)).rows[0]
 

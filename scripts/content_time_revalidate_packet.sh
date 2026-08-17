@@ -244,7 +244,8 @@ process.exit(missing===0&&rawMismatch===0?0:2)' "$E/step1-$g-prestate-rows.tsv" 
   log "readback ok: v1_rows_with_raw=0 for all six ranked feeds"
 }
 cmd_restore() {  # bounded CAS restore from the prestate snapshot; keyset batches of 500
-  local g=$1 pre="$E/step1-$g-prestate-rows.tsv" cur="$E/restore-$g-cursor.txt" total done_rows=0 batch=0
+  local g=$1
+  local pre="$E/step1-$g-prestate-rows.tsv" cur="$E/restore-$g-cursor.txt" total done_rows=0 batch=0
   [[ -f "$pre" ]] || die "no prestate snapshot for $g"
   total=$(wc -l <"$pre"); log "restore $g: $total prestate rows"
   local start=1; [[ -f "$cur" ]] && start=$(cat "$cur")
