@@ -90,6 +90,7 @@ RANKED_RKEYS="${RANKED_RKEYS:-'newsflow-nl-2','newsflow-fr-2','newsflow-cz-2','n
 MAIN_RKEY_PATTERN="${MAIN_RKEY_PATTERN:-newsflow-(nl|fr|cz|ir)-2}"
 BE_RKEY_PATTERN="${BE_RKEY_PATTERN:-newsflow-be-k}"   # be-k and be-m share one publisher: count once
 OUTCOMES=(v1_valid_to_v2_valid v1_invalid_to_v2_valid v1_to_v2_invalid)
+EXTRA_CELLS=(createdat_extra)   # pre-registered but not a tool outcome: valid->valid rows whose createdAt string differs from the v2 rendering
 
 log() { echo "[packet] $*" >&2; }
 die() { echo "[packet] STOP: $*" >&2; exit 2; }
@@ -178,6 +179,13 @@ pred AS (SELECT rkey, CASE
   WHEN raw::timestamptz > ia::timestamptz + interval '5 minutes' THEN 'v1_to_v2_invalid'
   WHEN s1='source_valid' THEN 'v1_valid_to_v2_valid' ELSE 'v1_invalid_to_v2_valid' END AS outcome FROM v1)
 SELECT rkey, outcome, count(*) FROM pred GROUP BY 1,2 ORDER BY 1,2;"
+# among predicted valid->valid rows, those whose stored "createdAt" differs from the v2 rendering of the raw (per rkey) -> createdAt_changed pre-registration
+CREATED_SQL="WITH t AS (SELECT c.rkey, c.publisher_did, CASE WHEN c.rkey LIKE 'newsflow-be-%' THEN '$SINCE_BE' ELSE '$SINCE_MAIN' END AS since FROM feedgen_ops.feed_catalog c WHERE c.enabled AND c.rkey IN ($RANKED_RKEYS)),
+v1 AS (SELECT t.rkey, p.\"createdAt\" AS ca, convert_from(p.created_at_source_raw,'UTF8') AS raw, p.\"indexedAt\" AS ia
+ FROM t JOIN post p ON p.author=t.publisher_did AND p.\"indexedAt\" >= t.since
+ WHERE p.content_time_validator_version='$V1' AND p.created_at_source_raw IS NOT NULL AND p.content_time_status='source_valid'
+   AND raw ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}T' AND NOT (raw::timestamptz > ia::timestamptz + interval '5 minutes'))
+SELECT rkey, count(*) FILTER (WHERE ca IS DISTINCT FROM to_char(raw::timestamptz AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"')) AS createdat_extra FROM v1 GROUP BY 1 ORDER BY 1;"
 CATALOG_SQL="SELECT rkey, publisher_did, publisher_post_max_age_days FROM feedgen_ops.feed_catalog WHERE enabled AND rkey IN ($RANKED_RKEYS) ORDER BY 1;"
 snapshot_sql() {  # <dids-csv> <since> <version>
   echo "SELECT p.uri, p.author, p.\"indexedAt\", p.\"createdAt\", p.content_time_utc, p.content_time_status, p.content_time_clamp_reason, p.content_time_validator_version, encode(p.created_at_source_raw,'hex') AS raw_hex FROM post p WHERE p.author = ANY($(sql_array "$1")::text[]) AND p.content_time_validator_version = '$3' AND p.created_at_source_raw IS NOT NULL AND p.\"indexedAt\" >= '$2' ORDER BY p.author, p.uri"
@@ -185,6 +193,10 @@ snapshot_sql() {  # <dids-csv> <since> <version>
 predicted_outcome() {  # <group> <outcome> from prestate-transitions.tsv
   local pat; case "$1" in main) pat="$MAIN_RKEY_PATTERN";; be) pat="$BE_RKEY_PATTERN";; esac
   awk -F'|' -v pat="$pat" -v o="$2" '$1 ~ "^"pat"$" && $2==o {s+=$3} END{print s+0}' "$E/prestate-transitions.tsv"
+}
+predicted_extra() {  # <group> from prestate-createdat.tsv
+  local pat; case "$1" in main) pat="$MAIN_RKEY_PATTERN";; be) pat="$BE_RKEY_PATTERN";; esac
+  awk -F'|' -v pat="$pat" '$1 ~ "^"pat"$" {s+=$2} END{print s+0}' "$E/prestate-createdat.tsv"
 }
 prereg_value() {  # <group> <outcome> from PREREG_MAIN/PREREG_BE ("k=v,k=v"); a missing cell is a hard stop
   local spec v; case "$1" in main) spec="$PREREG_MAIN";; be) spec="$PREREG_BE";; esac
@@ -251,11 +263,13 @@ cmd_preflight() {
   psql_ro -c "$SCOPE_SQL" | emit prestate-scope.tsv
   psql_ro -c "$POP_SQL" | emit prestate-populations.tsv
   psql_ro -c "$TRANS_SQL" | emit prestate-transitions.tsv
+  psql_ro -c "$CREATED_SQL" | emit prestate-createdat.tsv
   local nullraw; nullraw=$(awk -F'|' 'NR>1 && $1 !~ /^rkey$/ {s+=$7} END{print s+0}' "$E/prestate-populations.tsv")
   [[ "$nullraw" == "0" ]] || die "in-horizon v1 rows with NULL raw: $nullraw (expected 0)"
   local g o exp act
   # the candidate set is stable at absolute bounds (no v1 producer exists), so pre-registered cells must match EXACTLY
-  for g in main be; do for o in "${OUTCOMES[@]}"; do exp=$(prereg_value "$g" "$o"); act=$(predicted_outcome "$g" "$o"); [[ "$exp" == "$act" ]] || die "prereg $g/$o: pre-registered $exp, live prediction $act (candidate set must be stable at the bound SINCE)"; log "prereg $g/$o ok ($exp)"; done; done
+  for g in main be; do for o in "${OUTCOMES[@]}"; do exp=$(prereg_value "$g" "$o"); act=$(predicted_outcome "$g" "$o"); [[ "$exp" == "$act" ]] || die "prereg $g/$o: pre-registered $exp, live prediction $act (candidate set must be stable at the bound SINCE)"; log "prereg $g/$o ok ($exp)"; done
+    exp=$(prereg_value "$g" createdat_extra); act=$(predicted_extra "$g"); [[ "$exp" == "$act" ]] || die "prereg $g/createdat_extra: pre-registered $exp, live prediction $act"; log "prereg $g/createdat_extra ok ($exp)"; done
   psql_copy "$(snapshot_sql "$MAIN_DIDS" "$(since_file main)" "$V1")" | emit step1-main-prestate-rows.tsv
   psql_copy "$(snapshot_sql "$BE_DID" "$(since_file be)" "$V1")" | emit step1-be-prestate-rows.tsv
   take_control pg-control-1.txt
@@ -306,7 +320,7 @@ cmd_apply() {
   log "apply $g/$label exit=$rc batches=$nb verdict=$verdict"
 }
 cmd_readback() {  # re-runnable: every attempt gets its own suffix
-  local g rc a=1; while [[ -e "$E/readback-attempt-$a.txt" ]]; do a=$(( a + 1 )); done; local sfx="attempt-$a"
+  local g rc a=1; while [[ -e "$E/step1-main-preview-after-attempt-$a.json" || -e "$E/step1-main-preview-after-attempt-$a.err" ]]; do a=$(( a + 1 )); done; local sfx="attempt-$a"
   local summary=""
   for g in main be; do
     rc=$(run_tool "step1-$g-preview-after-$sfx" --mode revalidate --actors "$(group_dids "$g")" --since "$(since_file "$g")" --json --packet-sha256 "$PACKET_SHA")
@@ -322,8 +336,9 @@ for(const [a,v] of Object.entries(byAuthor))console.log(`author=${a} rows=${v.ro
 process.exit(missing===0&&rawMismatch===0?0:2)' "$E/step1-$g-prestate-rows.tsv" "$E/step1-$g-poststate-rows-$sfx.tsv" | emit "step1-$g-diff-$sfx.txt" || die "readback $g: prestate rows missing from poststate or raw mismatch"
     local exp_changed act_status act_created
     exp_changed=$(( $(prereg_value "$g" v1_invalid_to_v2_valid) + $(prereg_value "$g" v1_to_v2_invalid) ))
+    local exp_created=$(( exp_changed + $(prereg_value "$g" createdat_extra) ))
     act_status=$(sed -n 's/^prestate_rows=.*status_changed=\([0-9]*\).*/\1/p' "$E/step1-$g-diff-$sfx.txt"); act_created=$(sed -n 's/^prestate_rows=.*createdAt_changed=\([0-9]*\).*/\1/p' "$E/step1-$g-diff-$sfx.txt")
-    [[ "$act_status" == "$exp_changed" && "$act_created" == "$exp_changed" ]] || die "realized $g: status_changed=$act_status createdAt_changed=$act_created, pre-registered $exp_changed"
+    [[ "$act_status" == "$exp_changed" && "$act_created" == "$exp_created" ]] || die "realized $g: status_changed=$act_status (pre-registered $exp_changed) createdAt_changed=$act_created (pre-registered $exp_created)"
     # per publisher (= per feed for main; the shared BE publisher counts once): realized to_invalid / to_valid == predicted per rkey
     local line author rk pi pv ai av
     while read -r line; do
@@ -418,7 +433,9 @@ cmd_prereg() {  # read-only helper for the ledger approval: cells at the given S
   local g o; echo "since_main=$SINCE_MAIN since_be=$SINCE_BE"
   local tmp; tmp=$(mktemp); psql_ro -c "$TRANS_SQL" >"$tmp"
   for g in main be; do local pat; case "$g" in main) pat="$MAIN_RKEY_PATTERN";; be) pat="$BE_RKEY_PATTERN";; esac
-    local cells=""; for o in "${OUTCOMES[@]}"; do cells+="$o=$(awk -F'|' -v pat="$pat" -v o="$o" '$1 ~ "^"pat"$" && $2==o {s+=$3} END{print s+0}' "$tmp"),"; done; echo "PREREG_${g^^}=${cells%,}"; done
+    local cells=""; for o in "${OUTCOMES[@]}"; do cells+="$o=$(awk -F'|' -v pat="$pat" -v o="$o" '$1 ~ "^"pat"$" && $2==o {s+=$3} END{print s+0}' "$tmp"),"; done
+    cells+="createdat_extra=$(psql_ro -c "$CREATED_SQL" | awk -F'|' -v pat="$pat" '$1 ~ "^"pat"$" {s+=$2} END{print s+0}')"
+    echo "PREREG_${g^^}=$cells"; done
   psql_ro -c "$SCOPE_SQL"; rm -f "$tmp"
 }
 
