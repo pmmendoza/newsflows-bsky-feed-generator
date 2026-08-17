@@ -206,11 +206,17 @@ cmd_apply() {
   local dw dr dd cw cr cd
   dw=$(( $(echo "$a"|cut -d'|' -f1) - $(echo "$b"|cut -d'|' -f1) )); dr=$(( $(echo "$a"|cut -d'|' -f2) - $(echo "$b"|cut -d'|' -f2) )); dd=$(( $(echo "$a"|cut -d'|' -f3) - $(echo "$b"|cut -d'|' -f3) ))
   cw=$(( $(echo "$c2"|cut -d'|' -f1) - $(echo "$c1"|cut -d'|' -f1) )); cr=$(( $(echo "$c2"|cut -d'|' -f2) - $(echo "$c1"|cut -d'|' -f2) )); cd=$(( $(echo "$c2"|cut -d'|' -f3) - $(echo "$c1"|cut -d'|' -f3) ))
+  # the idle control baseline can only ADD to a delta (autovacuum can make it negative): clamp at 0 before subtracting
+  (( cw < 0 )) && cw=0; (( cr < 0 )) && cr=0; (( cd < 0 )) && cd=0
   local verdict="ok"
   if (( nb > 0 )); then
     local pw=$(( (dw - cw) / nb )) pr=$(( (dr - cr) / nb )) pd=$(( (dd - cd) / nb ))
-    (( pw <= CEIL_WAL_BYTES && pr <= CEIL_REL_BYTES && pd <= CEIL_DEAD )) || verdict="BREACH"
-    { echo "batches=$nb exit=$rc updated=$(jsonq "$f" revalidation.updated) complete=$(jsonq "$f" revalidation.complete)"; echo "delta_wal_bytes=$dw delta_relation_bytes=$dr delta_dead_tuples=$dd"; echo "control_60s_wal=$cw control_60s_relation=$cr control_60s_dead=$cd"; echo "per_batch_wal_minus_control=$pw per_batch_relation_minus_control=$pr per_batch_dead_minus_control=$pd"; echo "ceilings wal<=$CEIL_WAL_BYTES relation<=$CEIL_REL_BYTES dead<=$CEIL_DEAD"; echo "verdict=$verdict"; } | emit "ceiling-$g-$label.txt"
+    # preferred attribution: the tool's own in-transaction WAL measurement per batch (pg_wal_lsn_diff inside the batch transaction), when the receipt carries it
+    local twal; twal=$(node -e 'const j=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8"));const b=(j.revalidation&&j.revalidation.batches)||[];const w=b.map(x=>x.wal_bytes).filter(x=>typeof x==="number");console.log(w.length?Math.max(...w):"")' "$f")
+    local wal_used=$pw wal_source="pg_stat_wal_delta_minus_control"
+    [[ -n "$twal" ]] && { wal_used=$twal; wal_source="tool_in_transaction_max_batch"; }
+    (( wal_used <= CEIL_WAL_BYTES && pr <= CEIL_REL_BYTES && pd <= CEIL_DEAD )) || verdict="BREACH"
+    { echo "batches=$nb exit=$rc updated=$(jsonq "$f" revalidation.updated) complete=$(jsonq "$f" revalidation.complete)"; echo "delta_wal_bytes=$dw delta_relation_bytes=$dr delta_dead_tuples=$dd"; echo "control_60s_wal=$cw control_60s_relation=$cr control_60s_dead=$cd (clamped at 0)"; echo "per_batch_wal_minus_control=$pw per_batch_relation_minus_control=$pr per_batch_dead_minus_control=$pd"; echo "wal_used_for_verdict=$wal_used wal_source=$wal_source"; echo "ceilings wal<=$CEIL_WAL_BYTES relation<=$CEIL_REL_BYTES dead<=$CEIL_DEAD"; echo "verdict=$verdict"; } | emit "ceiling-$g-$label.txt"
   else
     echo "batches=0 exit=$rc verdict=no_batches" | emit "ceiling-$g-$label.txt"
   fi
