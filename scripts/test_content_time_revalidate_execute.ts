@@ -484,7 +484,7 @@ async function main() {
     )
     await assert.rejects(
       runContentTimeRevalidation(db, {
-        actors, packetSha256: PACKET_SHA.toUpperCase(), since, batchSize: 1, maxDurationMs: 30_000,
+        actors, packetSha256: 'ABCDEF'.repeat(10) + 'ABCD', since, batchSize: 1, maxDurationMs: 30_000,
         pauseMs: 0, lockTimeoutMs: 5000, statementTimeoutMs: 30_000,
       }),
       /packetSha256 must be a lowercase SHA-256/,
