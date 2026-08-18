@@ -685,7 +685,8 @@ export async function runPublisherPostRecovery(
     }
   }
 
-  const plan = [...options.posts].sort((left, right) => left.uri.localeCompare(right.uri))
+  // code-unit order, the same comparator the resume uses (`row.uri > afterUri`) -- never a locale collation
+  const plan = [...options.posts].sort((left, right) => (left.uri < right.uri ? -1 : left.uri > right.uri ? 1 : 0))
   if (new Set(plan.map((row) => row.uri)).size !== plan.length) {
     throw new Error('recovery input contains duplicate URIs')
   }

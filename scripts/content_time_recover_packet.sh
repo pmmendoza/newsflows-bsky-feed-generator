@@ -142,7 +142,7 @@ assert_bound_env() {
     [[ "$exp" == "$v" ]] || die "bound-value mismatch for $k: preflight recorded '$exp', this invocation has '$v' -- STOP (values may not be re-bound between invocations)"
   done
 }
-latest_control() { ls -1 "$E"/pg-control-*.txt 2>/dev/null | sort | tail -1; }
+latest_control() { ls -1 "$E"/pg-control-*.txt 2>/dev/null | sort -V | tail -1; }
 control_rates() {  # prints "wal_per_s rel_per_s dead_per_s" from the latest control file (clamped at 0)
   local f; f=$(latest_control); [[ -n "$f" ]] || die "no control read yet"
   awk -F'|' '/^read1 /{sub(/^read1 /,""); w1=$1; r1=$2; d1=$3; t1=$5} /^read2 /{sub(/^read2 /,""); w2=$1; r2=$2; d2=$3; t2=$5}
@@ -186,7 +186,7 @@ run_tool_scratch() {  # run_tool_scratch <dir> <outname> <tool args...>  -> <dir
 }
 jsonq() { node -e 'const j=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8"));const v=process.argv[2].split(".").reduce((a,k)=>a==null?a:a[k],j);console.log(v===undefined||v===null?"":(typeof v==="object"?JSON.stringify(v):v))' "$1" "$2"; }
 
-CATALOG_SQL="SELECT rkey, publisher_did, publisher_post_max_age_days, publisher_time_clock FROM feedgen_ops.feed_catalog WHERE enabled AND rkey ~ '$RECOVER_RKEY_PATTERN' ORDER BY 1;"
+CATALOG_SQL="SELECT rkey, publisher_did, publisher_post_max_age_days, publisher_time_clock FROM feedgen_ops.feed_catalog WHERE enabled AND rkey ~ '^($RECOVER_RKEY_PATTERN)$' ORDER BY 1;"
 POP_SQL="SELECT c.rkey,
  count(*) FILTER (WHERE p.\"indexedAt\" >= '$SINCE' AND p.\"indexedAt\" < '$UNTIL') AS total,
  count(*) FILTER (WHERE p.\"indexedAt\" >= '$SINCE' AND p.\"indexedAt\" < '$UNTIL' AND p.content_time_status='source_valid' AND p.content_time_validator_version='$V2') AS v2_valid,
@@ -194,7 +194,7 @@ POP_SQL="SELECT c.rkey,
  count(*) FILTER (WHERE p.\"indexedAt\" >= '$SINCE' AND p.\"indexedAt\" < '$UNTIL' AND p.content_time_validator_version='$V1') AS v1,
  count(*) FILTER (WHERE p.\"indexedAt\" >= '$SINCE' AND p.\"indexedAt\" < '$UNTIL' AND p.created_at_source_raw IS NULL AND (p.content_time_status IS NULL OR p.content_time_status='legacy_unknown')) AS legacy
 FROM feedgen_ops.feed_catalog c JOIN post p ON p.author = c.publisher_did
-WHERE c.enabled AND c.rkey ~ '$RECOVER_RKEY_PATTERN'
+WHERE c.enabled AND c.rkey ~ '^($RECOVER_RKEY_PATTERN)$'
 GROUP BY c.rkey ORDER BY c.rkey;"
 SCOPE_SQL="SELECT 'legacy_in_window', count(*) FROM public.post p WHERE p.author = ANY($(sql_array "$RECOVER_DIDS")::text[]) AND p.\"indexedAt\" >= '$SINCE' AND p.\"indexedAt\" < '$UNTIL' AND p.created_at_source_raw IS NULL AND (p.content_time_status IS NULL OR p.content_time_status='legacy_unknown')
 UNION ALL SELECT 'legacy_outside_window', count(*) FROM public.post p WHERE p.author = ANY($(sql_array "$RECOVER_DIDS")::text[]) AND NOT (p.\"indexedAt\" >= '$SINCE' AND p.\"indexedAt\" < '$UNTIL') AND p.created_at_source_raw IS NULL AND (p.content_time_status IS NULL OR p.content_time_status='legacy_unknown')
@@ -204,7 +204,7 @@ UNION ALL SELECT 'wrong_version_in_rolling_horizon', count(*) FROM public.post p
 UNION ALL SELECT 'unclassified_or_wrong_version_in_rolling_horizon_after_until', count(*) FROM public.post p WHERE p.author = ANY($(sql_array "$RECOVER_DIDS")::text[]) AND p.\"indexedAt\" >= '$UNTIL' AND (p.content_time_validator_version IS DISTINCT FROM 'newsflows-content-time/v2');"
 PREREG_RKEY_SQL="SELECT c.rkey, count(*) AS legacy_in_window
 FROM feedgen_ops.feed_catalog c JOIN post p ON p.author = c.publisher_did
-WHERE c.enabled AND c.rkey ~ '$RECOVER_RKEY_PATTERN'
+WHERE c.enabled AND c.rkey ~ '^($RECOVER_RKEY_PATTERN)$'
   AND p.\"indexedAt\" >= '$SINCE' AND p.\"indexedAt\" < '$UNTIL'
   AND p.created_at_source_raw IS NULL AND (p.content_time_status IS NULL OR p.content_time_status = 'legacy_unknown')
 GROUP BY c.rkey ORDER BY c.rkey;"
@@ -218,7 +218,7 @@ plan_uris_path() {  # the immutable plan (URIs of the prestate legacy rows), as 
 }
 snapshot_by_uris() {  # snapshot_by_uris <urifile> -> stdout tab-text rows, SAME columns/order as snapshot_sql_legacy, for exactly the given URIs
   local urifile=$1
-  { echo "BEGIN; SET default_transaction_read_only = on; SET statement_timeout = '120s';"
+  { echo "BEGIN; SET TRANSACTION READ ONLY; SET statement_timeout = '120s';"
     echo "CREATE TEMP TABLE want_uris(uri text);"
     echo "COPY want_uris FROM STDIN WITH (FORMAT text);"
     cut -f1 "$urifile"
@@ -251,6 +251,7 @@ gate_recover_preview() {  # gate_recover_preview <jsonfile> -- gates every PRERE
   local candidates unretr legacy rows notinplan
   candidates=$(jsonq "$f" preview.candidates); unretr=$(jsonq "$f" unretrievable); legacy=$(jsonq "$f" db_legacy_in_window); rows=$(wc -l <"$E/step1-be-prestate-rows.tsv")
   [[ $(( candidates + unretr )) == "$legacy" && "$legacy" == "$rows" ]] || die "gate consistency: candidates($candidates)+unretrievable($unretr) must equal legacy_in_window($legacy) and prestate rows($rows)"
+  [[ "$(jsonq "$f" plan_uris_not_in_db)" == "0" ]] || die "gate: plan_uris_not_in_db=$(jsonq "$f" plan_uris_not_in_db) (frozen plan URIs missing from the DB)"
   notinplan=$(jsonq "$f" preview.db_legacy_not_in_plan)
   [[ "$notinplan" == "$unretr" ]] || die "gate consistency: preview.db_legacy_not_in_plan($notinplan) != unretrievable($unretr)"
   log "gate recover preview ok: candidates=$candidates unretrievable=$unretr legacy_in_window=$legacy"
@@ -374,9 +375,12 @@ cmd_apply() {
   (( wps0 >= 1 )) || die "apply be/$label: control baseline write rate is $wps0 B/s (stalled or missing control read) -- run '$0 control' first"
   local rc; rc=$(run_tool "step1-be-apply-$label" --mode recover --plan-from-db --plan-uris-file "$(plan_uris_path)" --no-insert --apply --actors "$RECOVER_DIDS" --since "$SINCE" --until "$UNTIL" --api-base "$API_BASE" --checkpoint-file "$ckpt" --packet-sha256 "$PACKET_SHA" ${maxb:+--max-batches "$maxb"} --pause-baseline-bytes-per-s "$wps0" --json)
   pgstat_read | emit "pg-be-$label-after.txt"
+  [[ -f "$E/step1-be-checkpoint.json" ]] && sudo -n chown root:newsflows "$E/step1-be-checkpoint.json" 2>/dev/null && sudo -n chmod 0640 "$E/step1-be-checkpoint.json" 2>/dev/null || true
   local f="$E/step1-be-apply-$label.json"
   [[ "$rc" == "0" || "$rc" == "3" ]] || die "apply be/$label exit=$rc (see .err); STOP + escalation"
   [[ "$(jsonq "$f" operation)" == "publisher-post-recover" && "$(jsonq "$f" mode)" == "apply" ]] || die "apply be/$label did not run the recover apply path"
+  [[ "$(jsonq "$f" plan_source)" == "plan-uris-file+getPosts" && "$(jsonq "$f" plan_uris_not_in_db)" == "0" ]] || die "apply be/$label: plan_source=$(jsonq "$f" plan_source) plan_uris_not_in_db=$(jsonq "$f" plan_uris_not_in_db) (must be the frozen plan, all URIs present)"
+  [[ "$(jsonq "$f" unretrievable)" == "$(prereg_value unretrievable)" && "$(jsonq "$f" preview)" == "" ]] || die "apply be/$label: unretrievable=$(jsonq "$f" unretrievable) != pre-registered $(prereg_value unretrievable)"
   local nb; nb=$(node -e 'const j=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8"));console.log((j.recovery&&j.recovery.batches||[]).length)' "$f")
   local b a; b=$(cat "$E/pg-be-$label-before.txt"); a=$(cat "$E/pg-be-$label-after.txt")
   local dw dr dd dur; dw=$(( $(echo "$a"|cut -d'|' -f1) - $(echo "$b"|cut -d'|' -f1) )); dr=$(( $(echo "$a"|cut -d'|' -f2) - $(echo "$b"|cut -d'|' -f2) )); dd=$(( $(echo "$a"|cut -d'|' -f3) - $(echo "$b"|cut -d'|' -f3) )); dur=$(( $(echo "$a"|cut -d'|' -f5) - $(echo "$b"|cut -d'|' -f5) )); (( dur < 1 )) && dur=1
@@ -390,7 +394,8 @@ cmd_apply() {
     local perbatch; perbatch=$(node -e 'const j=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8"));const b=(j.recovery&&j.recovery.batches)||[];const [r,m,p,fl,rr,relCap]=process.argv.slice(2).map(Number);let worst=0,worstRatio=0,fail=0,unpaid=0,relFail=0,relWorst=0,lines=[];for(const x of b){if(typeof x.wal_bytes!=="number"){lines.push(`batch=${x.batch} wal_bytes=missing`);fail++;continue;}const ms=x.elapsed_ms||0;const paidMs=(typeof x.pause_ms==="number")?x.pause_ms:Math.round(p*1000);const owedMs=(x.candidates===0)?0:Math.max(Math.round(p*1000),Math.ceil(x.wal_bytes*1000/r));const paid=paidMs>=owedMs;if(!paid)unpaid++;const adj=Math.max(0,x.wal_bytes-Math.round(r*ms/1000));const ceil=Math.max(fl,Math.round(m*r*(ms/1000+paidMs/1000)));const okWal=adj<=ceil&&paid;if(!okWal)fail++;const ratio=ceil?adj/ceil:0;if(ratio>worstRatio){worstRatio=ratio;worst=adj;}const relDelta=(typeof x.relation_bytes_after==="number"&&typeof x.relation_bytes_before==="number")?(x.relation_bytes_after-x.relation_bytes_before):NaN;const relAdj=Number.isFinite(relDelta)?Math.max(0,relDelta-Math.round(rr*ms/1000)):NaN;const okRel=Number.isFinite(relAdj)&&relAdj<=relCap;if(!okRel)relFail++;if(Number.isFinite(relAdj)&&relAdj>relWorst)relWorst=relAdj;lines.push(`batch=${x.batch} elapsed_ms=${ms} lsn_advance=${x.wal_bytes} attributed=${adj} pause_owed_ms=${owedMs} pause_paid_ms=${paidMs} ceiling=${ceil} ratio=${ratio.toFixed(2)} ${paid?"paid":"UNPAID"} ${adj<=ceil?"ok":"BREACH"} relation_growth=${Number.isFinite(relAdj)?relAdj:"missing"} rel_cap=${relCap} ${okRel?"rel_ok":"REL_BREACH"}`);}console.log(JSON.stringify({fail,unpaid,relFail,relWorst,worst,worstRatio:worstRatio.toFixed(2),lines}))' "$f" "$wps0" "$CEIL_WAL_BASELINE_MULTIPLE" "$PAUSE_SECONDS" "$CEIL_WAL_FLOOR_BYTES" "$rps0" "$CEIL_REL_BYTES")
     local wal_fail wal_worst wal_ratio wal_lines wal_unpaid
     wal_fail=$(node -e 'console.log(JSON.parse(process.argv[1]).fail)' "$perbatch"); wal_unpaid=$(node -e 'console.log(JSON.parse(process.argv[1]).unpaid)' "$perbatch"); wal_worst=$(node -e 'console.log(JSON.parse(process.argv[1]).worst)' "$perbatch"); wal_ratio=$(node -e 'console.log(JSON.parse(process.argv[1]).worstRatio)' "$perbatch"); wal_lines=$(node -e 'console.log(JSON.parse(process.argv[1]).lines.join("\n"))' "$perbatch")
-    local dead_ceiling=$(( 2 * $(jsonq "$f" recovery.recovered) / nb ))
+    local recovered_n; recovered_n=$(jsonq "$f" recovery.recovered)
+    local dead_ceiling=$(( 2 * recovered_n / nb )); (( recovered_n > 0 )) || pd=0   # nothing written -> no dead tuples of ours to bound (already_current-only resume)
     local rel_fail rel_worst; rel_fail=$(node -e 'console.log(JSON.parse(process.argv[1]).relFail)' "$perbatch"); rel_worst=$(node -e 'console.log(JSON.parse(process.argv[1]).relWorst)' "$perbatch")
     # verdict = conjunction over batches for WAL (paid + ceiling) AND relation growth (per batch, baseline-adjusted); dead tuples
     # are only available as an invocation delta (pg_stat) and stay per-invocation-mean against 2 x recovered / batches
@@ -427,7 +432,7 @@ for(const r of pre){
   if(q[4]!==r[4])cidChanged++; if(q[2]!==r[2])indexedChanged++; if(q[3]!==r[3])createdChanged++;
   const rawNonEmpty=!isNull(q[5]); const isV2=q[9]==="newsflows-content-time/v2";
   if(rawNonEmpty && isV2 && (q[7]==="source_valid"||q[7]==="source_invalid")){ if(q[7]==="source_valid")recoveredValid++; else recoveredInvalid++; }
-  else if(!rawNonEmpty && isNull(q[9]) && isNull(q[7])) stillLegacy++;
+  else if(!rawNonEmpty && isNull(q[9]) && (isNull(q[7])||q[7]==="legacy_unknown")) stillLegacy++;
   else badRecovered++;
 }
 console.log(`prestate_rows=${pre.length} poststate_rows=${post.length} missing=${missing} cid_changed=${cidChanged} indexedAt_changed=${indexedChanged} createdAt_changed=${createdChanged} recovered_valid=${recoveredValid} recovered_invalid=${recoveredInvalid} still_legacy=${stillLegacy} bad_recovered=${badRecovered} expected_valid=${expValid} expected_invalid=${expInvalid} expected_unretrievable=${expUnret}`);
@@ -460,6 +465,7 @@ cmd_restore() {  # bounded CAS restore from the prestate snapshot; keyset batche
     local end=$(( start + 499 )); (( end > total )) && end=$total; batch=$(( (start - 1) / 500 + 1 ))
     local rtmp; rtmp=$(mktemp)
     local attempt=1 rname; while [[ -e "$E/restore-be-rows-$start-$end-attempt-$attempt.txt" ]]; do attempt=$(( attempt + 1 )); done; rname="restore-be-rows-$start-$end-attempt-$attempt.txt"
+    (( attempt <= 2 )) || die "restore be rows $start-$end: a third attempt is prohibited (contract: a failed restore adapter is a P1 incident) -- STOP + escalation"
     { echo "BEGIN; SET lock_timeout='5s'; SET statement_timeout='30s';"; echo "CREATE TEMP TABLE prestate(uri text, author text, indexed_at text, created_at text, cid text, raw_hex text, content_time_utc text, status text, reason text, version text);"; echo "COPY prestate FROM STDIN WITH (FORMAT text);"; sed -n "${start},${end}p" "$pre"; echo '\.'; cat <<'SQL'
 UPDATE public.post AS t SET created_at_source_raw=decode(s.raw_hex,'hex'), content_time_utc=s.content_time_utc, content_time_status=s.status, content_time_clamp_reason=s.reason, content_time_validator_version=s.version
 FROM prestate s WHERE t.uri=s.uri AND t.content_time_validator_version='newsflows-content-time/v2' AND t.created_at_source_raw IS NOT NULL;
