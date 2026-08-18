@@ -192,6 +192,9 @@ PREREG_ALLTIME_SQL="SELECT count(*) AS legacy_all_time FROM public.post p WHERE 
 snapshot_sql_legacy() {  # the legacy rows in [SINCE,UNTIL) for the actors, ordered by uri -- the prestate population
   echo "SELECT p.uri, p.author, p.\"indexedAt\", p.\"createdAt\", p.cid, encode(p.created_at_source_raw,'hex') AS raw_hex, p.content_time_utc, p.content_time_status, p.content_time_clamp_reason, p.content_time_validator_version FROM public.post p WHERE p.author = ANY($(sql_array "$RECOVER_DIDS")::text[]) AND p.\"indexedAt\" >= '$SINCE' AND p.\"indexedAt\" < '$UNTIL' AND p.created_at_source_raw IS NULL AND (p.content_time_status IS NULL OR p.content_time_status = 'legacy_unknown') ORDER BY p.uri"
 }
+plan_uris_path() {  # the immutable plan (URIs of the prestate legacy rows), as seen by the tool (container path or host path)
+  if [[ "$RUNNER" == "host" ]]; then echo "$E/step1-be-plan-uris.txt"; else echo "/evidence/step1-be-plan-uris.txt"; fi
+}
 snapshot_by_uris() {  # snapshot_by_uris <urifile> -> stdout tab-text rows, SAME columns/order as snapshot_sql_legacy, for exactly the given URIs
   local urifile=$1
   { echo "BEGIN; SET default_transaction_read_only = on; SET statement_timeout = '120s';"
@@ -216,7 +219,7 @@ gate_recover_preview() {  # gate_recover_preview <jsonfile> -- gates every PRERE
   local f=$1
   [[ "$(jsonq "$f" operation)" == "publisher-post-recover" ]] || die "$f: operation != publisher-post-recover"
   [[ "$(jsonq "$f" mode)" == "dry-run" ]] || die "$f: mode != dry-run"
-  [[ "$(jsonq "$f" plan_source)" == "db-legacy-rows+getPosts" ]] || die "$f: plan_source != db-legacy-rows+getPosts"
+  [[ "$(jsonq "$f" plan_source)" == "plan-uris-file+getPosts" ]] || die "$f: plan_source != plan-uris-file+getPosts (the frozen prestate plan)"
   gate_cell legacy_in_window "$(prereg_value legacy_in_window)" "$(jsonq "$f" db_legacy_in_window)"
   gate_cell unretrievable "$(prereg_value unretrievable)" "$(jsonq "$f" unretrievable)"
   gate_cell would_recover "$(prereg_value would_recover)" "$(jsonq "$f" preview.would_recover)"
@@ -308,7 +311,10 @@ cmd_preflight() {
   psql_ro -c "$SCOPE_SQL" | emit prestate-scope.tsv
   psql_ro -c "$POP_SQL" | emit prestate-populations.tsv
   psql_copy "$(snapshot_sql_legacy)" | emit step1-be-prestate-rows.tsv
-  local rc; rc=$(run_tool step1-be-preflight-preview --mode recover --plan-from-db --no-insert --actors "$RECOVER_DIDS" --since "$SINCE" --until "$UNTIL" --api-base "$API_BASE" --packet-sha256 "$PACKET_SHA" --json)
+  # the plan is frozen here: exactly the prestate URIs; every later invocation (preview/apply/readback) passes this file so
+  # the plan hash the checkpoint binds stays identical across resumes (rows already recovered come back as already_current)
+  cut -f1 "$E/step1-be-prestate-rows.tsv" | emit step1-be-plan-uris.txt
+  local rc; rc=$(run_tool step1-be-preflight-preview --mode recover --plan-from-db --plan-uris-file "$(plan_uris_path)" --no-insert --actors "$RECOVER_DIDS" --since "$SINCE" --until "$UNTIL" --api-base "$API_BASE" --packet-sha256 "$PACKET_SHA" --json)
   [[ "$rc" == "0" ]] || die "preflight dry-run exit=$rc (see step1-be-preflight-preview.err)"
   gate_recover_preview "$E/step1-be-preflight-preview.json"
   take_control pg-control-1.txt
@@ -318,7 +324,7 @@ cmd_preflight() {
 cmd_control() { local n; n=$(( $(ls -1 "$E"/pg-control-*.txt 2>/dev/null | wc -l) + 1 )); take_control "pg-control-$n.txt"; }
 
 cmd_preview() {
-  local rc; rc=$(run_tool step1-be-preview --mode recover --plan-from-db --no-insert --actors "$RECOVER_DIDS" --since "$SINCE" --until "$UNTIL" --api-base "$API_BASE" --packet-sha256 "$PACKET_SHA" --json)
+  local rc; rc=$(run_tool step1-be-preview --mode recover --plan-from-db --plan-uris-file "$(plan_uris_path)" --no-insert --actors "$RECOVER_DIDS" --since "$SINCE" --until "$UNTIL" --api-base "$API_BASE" --packet-sha256 "$PACKET_SHA" --json)
   [[ "$rc" == "0" ]] || die "preview exit=$rc (see step1-be-preview.err)"
   gate_recover_preview "$E/step1-be-preview.json"
   log "preview be ok"
@@ -333,7 +339,7 @@ cmd_apply() {
   # max(1 s, batch LSN advance / baseline write rate); the baseline is the most recent control read.
   local wps0 rps0 dps0; read -r wps0 rps0 dps0 <<<"$(control_rates)"
   (( wps0 >= 1 )) || die "apply be/$label: control baseline write rate is $wps0 B/s (stalled or missing control read) -- run '$0 control' first"
-  local rc; rc=$(run_tool "step1-be-apply-$label" --mode recover --plan-from-db --no-insert --apply --actors "$RECOVER_DIDS" --since "$SINCE" --until "$UNTIL" --api-base "$API_BASE" --checkpoint-file "$ckpt" --packet-sha256 "$PACKET_SHA" ${maxb:+--max-batches "$maxb"} --pause-baseline-bytes-per-s "$wps0" --json)
+  local rc; rc=$(run_tool "step1-be-apply-$label" --mode recover --plan-from-db --plan-uris-file "$(plan_uris_path)" --no-insert --apply --actors "$RECOVER_DIDS" --since "$SINCE" --until "$UNTIL" --api-base "$API_BASE" --checkpoint-file "$ckpt" --packet-sha256 "$PACKET_SHA" ${maxb:+--max-batches "$maxb"} --pause-baseline-bytes-per-s "$wps0" --json)
   pgstat_read | emit "pg-be-$label-after.txt"
   local f="$E/step1-be-apply-$label.json"
   [[ "$rc" == "0" || "$rc" == "3" ]] || die "apply be/$label exit=$rc (see .err); STOP + escalation"
@@ -363,7 +369,7 @@ cmd_apply() {
 
 cmd_readback() {  # re-runnable: every attempt gets its own suffix
   local a=1; while [[ -e "$E/step1-be-preview-after-attempt-$a.json" || -e "$E/step1-be-preview-after-attempt-$a.err" ]]; do a=$(( a + 1 )); done; local sfx="attempt-$a"
-  local rc; rc=$(run_tool "step1-be-preview-after-$sfx" --mode recover --plan-from-db --no-insert --actors "$RECOVER_DIDS" --since "$SINCE" --until "$UNTIL" --api-base "$API_BASE" --packet-sha256 "$PACKET_SHA" --json)
+  local rc; rc=$(run_tool "step1-be-preview-after-$sfx" --mode recover --plan-from-db --plan-uris-file "$(plan_uris_path)" --no-insert --actors "$RECOVER_DIDS" --since "$SINCE" --until "$UNTIL" --api-base "$API_BASE" --packet-sha256 "$PACKET_SHA" --json)
   local f="$E/step1-be-preview-after-$sfx.json"
   [[ "$rc" == "0" ]] || die "post-apply preview exit=$rc"
   [[ "$(jsonq "$f" operation)" == "publisher-post-recover" && "$(jsonq "$f" mode)" == "dry-run" ]] || die "post-apply preview did not run the recover dry-run path"
