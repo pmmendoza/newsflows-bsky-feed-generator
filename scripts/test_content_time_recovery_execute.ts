@@ -202,6 +202,13 @@ async function main() {
     })
     assert.equal(pauseLimited.complete, true)
     assert(pauseLimited.elapsed_ms >= 1000, '1s inter-batch pause was not enforced')
+    // per-batch receipts (mirror of the revalidate receipts) + adaptive-pause bookkeeping
+    assert(Array.isArray(pauseLimited.batches) && pauseLimited.batches.length >= 1, 'recovery batches receipts missing')
+    for (const b of pauseLimited.batches) {
+      assert(typeof b.wal_bytes === 'number' && typeof b.elapsed_ms === 'number', 'batch receipt lacks wal_bytes/elapsed_ms')
+      assert(b.pause_required_ms === 1000 && b.pause_ms >= 0, 'fixed pause must be recorded per batch')
+      assert(typeof b.skipped_missing === 'number', 'skipped_missing must be recorded')
+    }
 
     await assert.rejects(
       runPublisherPostRecovery(db as any, {

@@ -77,6 +77,13 @@ type CollectOptions = {
   fetchPage: FetchPage
   maxPagesPerActor?: number
   deadlineMs?: number
+  // Which post timestamp bounds the [since, until) window: the record's own
+  // createdAt (default, historical behaviour) or the AppView indexedAt (matches
+  // a public.post population bounded by "indexedAt").
+  windowField?: 'createdAt' | 'indexedAt'
+  // Stop paging an actor once an entire page lies before `since` by indexedAt
+  // (the author feed is ordered by indexedAt, so nothing newer can follow).
+  stopWhenPageBeforeSince?: boolean
 }
 
 type CliOptions = {
@@ -90,6 +97,12 @@ type CliOptions = {
   dbUrl?: string
   checkpointFile?: string
   packetSha256?: string
+  maxBatches?: number
+  pauseBaselineBytesPerSecond?: number
+  noInsert: boolean
+  windowField: 'createdAt' | 'indexedAt'
+  planFromDb: boolean
+  planLimit?: number
 }
 
 export type PublisherPostRecoveryProgress = {
@@ -98,12 +111,36 @@ export type PublisherPostRecoveryProgress = {
   inserted: number
   recovered: number
   already_current: number
+  skipped_missing: number
   cursor_sha256: string
   elapsed_ms: number
+  wal_bytes: number
+  relation_bytes_before: number
+  relation_bytes_after: number
+}
+
+// Per-batch receipt for the recovery apply path (mirrors the revalidate
+// receipts so the same packet runner ceilings -- per-batch WAL, relation
+// growth, adaptive pause paid -- apply to both modes).
+export type PublisherPostRecoveryBatch = {
+  batch: number
+  candidates: number
+  inserted: number
+  recovered: number
+  already_current: number
+  skipped_missing: number
+  cursor_uri: string
+  elapsed_ms: number
+  wal_bytes: number
+  relation_bytes_before: number
+  relation_bytes_after: number
+  pause_ms: number
+  pause_required_ms: number
 }
 
 export type PublisherPostRecoveryResult = PublisherPostRecoveryProgress & {
   complete: boolean
+  batches: PublisherPostRecoveryBatch[]
 }
 
 export type PublisherPostRecoveryOptions = {
@@ -115,6 +152,11 @@ export type PublisherPostRecoveryOptions = {
   maxBatches?: number
   maxDurationMs: number
   pauseMs: number
+  // Adaptive pause (D4-b): when set, each batch pauses max(pauseMs, wal_bytes / rate).
+  pauseBaselineBytesPerSecond?: number
+  // When true, posts present in the AppView but missing from public.post are
+  // NOT inserted (counted as skipped_missing) -- classification-only packets.
+  noInsert?: boolean
   lockTimeoutMs: number
   statementTimeoutMs: number
   onProgress?: (progress: PublisherPostRecoveryProgress) => void
@@ -188,6 +230,93 @@ export function normalizeAppViewPost(
   }
 }
 
+// --- plan from the database (Belgium Step-2 recovery, 2026-08-18) ----------
+//
+// Instead of walking the author feed (which omits some posts and pages through
+// everything), build the plan from the rows that actually need recovery: the
+// actors' unclassified rows inside [since, until) by "indexedAt", fetched from
+// the AppView by URI (app.bsky.feed.getPosts, 25 URIs per call). Rows the
+// AppView no longer returns (deleted/taken down) are counted as unretrievable
+// and left untouched -- they are reported, never guessed.
+export type DbPlanOptions = {
+  actors: string[]
+  since: Date
+  until: Date
+  fetchPosts: (uris: string[]) => Promise<AppViewPost[]>
+  deadlineMs?: number
+  limit?: number
+}
+
+export type DbPlan = BackfillPlan & {
+  db_legacy_in_window: number
+  unretrievable: number
+  unretrievable_uri_sha256_sample: string[]
+  requests: number
+}
+
+export async function collectPublisherPostsFromDb(db: Database, options: DbPlanOptions): Promise<DbPlan> {
+  const rows = (await sql<{ uri: string; author: string }>`
+    SELECT uri, author FROM public.post
+    WHERE author = ANY(${options.actors}::text[])
+      AND "indexedAt" >= ${options.since.toISOString()} AND "indexedAt" < ${options.until.toISOString()}
+      AND created_at_source_raw IS NULL
+      AND (content_time_status IS NULL OR content_time_status = 'legacy_unknown')
+    ORDER BY uri
+    ${options.limit ? sql`LIMIT ${options.limit}` : sql``}
+  `.execute(db)).rows
+  const posts = new Map<string, BackfillPostRow>()
+  const byActor: BackfillPlan['by_actor'] = {}
+  for (const actor of options.actors) byActor[actor] = { scanned: 0, candidate_posts: 0, skipped_out_of_window: 0, skipped_wrong_author: 0 }
+  let scanned = 0
+  let skippedWrongAuthor = 0
+  let requests = 0
+  const unretrievable: string[] = []
+  const authorByUri = new Map(rows.map((row) => [row.uri, row.author]))
+  for (let offset = 0; offset < rows.length; offset += 25) {
+    if (options.deadlineMs !== undefined && Date.now() >= options.deadlineMs) {
+      throw new Error('publisher recovery collection exceeded its deadline')
+    }
+    const chunk = rows.slice(offset, offset + 25)
+    const returned = await options.fetchPosts(chunk.map((row) => row.uri))
+    requests += 1
+    const seen = new Set<string>()
+    for (const post of returned) {
+      scanned += 1
+      const expectedAuthor = post.uri ? authorByUri.get(post.uri) : undefined
+      if (!expectedAuthor) { skippedWrongAuthor += 1; continue }
+      const normalized = normalizeAppViewPost(post, expectedAuthor)
+      if (!normalized) { skippedWrongAuthor += 1; byActor[expectedAuthor].skipped_wrong_author += 1; continue }
+      seen.add(normalized.uri)
+      posts.set(normalized.uri, normalized)
+      byActor[expectedAuthor].scanned += 1
+      byActor[expectedAuthor].candidate_posts += 1
+    }
+    for (const row of chunk) if (!seen.has(row.uri)) unretrievable.push(row.uri)
+  }
+  return {
+    posts: [...posts.values()],
+    scanned,
+    skipped_out_of_window: 0,
+    skipped_wrong_author: skippedWrongAuthor,
+    by_actor: byActor,
+    db_legacy_in_window: rows.length,
+    unretrievable: unretrievable.length,
+    unretrievable_uri_sha256_sample: unretrievable.slice(0, 5).map(sha256),
+    requests,
+  }
+}
+
+async function fetchPostsByUri(apiBase: string, uris: string[], timeoutMs = 30_000): Promise<AppViewPost[]> {
+  const url = new URL('/xrpc/app.bsky.feed.getPosts', apiBase)
+  for (const uri of uris) url.searchParams.append('uris', uri)
+  const response = await fetch(url, { signal: AbortSignal.timeout(timeoutMs) })
+  if (!response.ok) {
+    throw new Error(`AppView getPosts failed: ${response.status} ${response.statusText}`)
+  }
+  const body: any = await response.json()
+  return (body.posts || []) as AppViewPost[]
+}
+
 export async function collectPublisherPosts(options: CollectOptions): Promise<BackfillPlan> {
   const maxPagesPerActor = options.maxPagesPerActor ?? 50
   const posts = new Map<string, BackfillPostRow>()
@@ -214,7 +343,10 @@ export async function collectPublisherPosts(options: CollectOptions): Promise<Ba
       const authorPage = await options.fetchPage(actor, cursor)
       if (!authorPage.posts.length) break
 
+      let pageAllBeforeSince = true
       for (const post of authorPage.posts) {
+        const indexed = parseDate(post.indexedAt)
+        if (!indexed || indexed >= options.since) pageAllBeforeSince = false
         scanned += 1
         byActor[actor].scanned += 1
         const normalized = normalizeAppViewPost(post, actor)
@@ -224,7 +356,8 @@ export async function collectPublisherPosts(options: CollectOptions): Promise<Ba
           continue
         }
         const created = parseDate(normalized.createdAt)
-        if (!created || created < options.since || created >= options.until) {
+        const windowTime = options.windowField === 'indexedAt' ? parseDate(post.indexedAt) : created
+        if (!created || !windowTime || windowTime < options.since || windowTime >= options.until) {
           skippedOutOfWindow += 1
           byActor[actor].skipped_out_of_window += 1
           continue
@@ -234,6 +367,7 @@ export async function collectPublisherPosts(options: CollectOptions): Promise<Ba
       }
 
       if (!authorPage.cursor) break
+      if (options.stopWhenPageBeforeSince && pageAllBeforeSince) break
       cursor = authorPage.cursor
     }
   }
@@ -311,6 +445,7 @@ async function applyRecoveryBatch(
   lockTimeoutMs: number,
   statementTimeoutMs: number,
   deadlineMs: number,
+  noInsert = false,
 ) {
   return db.transaction().execute(async (trx) => {
     const remainingMs = deadlineMs - Date.now()
@@ -318,6 +453,12 @@ async function applyRecoveryBatch(
     await sql`SELECT set_config('transaction_timeout', ${`${remainingMs}ms`}, true)`.execute(trx)
     await sql`SELECT set_config('lock_timeout', ${`${Math.min(lockTimeoutMs, remainingMs)}ms`}, true)`.execute(trx)
     await sql`SELECT set_config('statement_timeout', ${`${Math.min(statementTimeoutMs, remainingMs)}ms`}, true)`.execute(trx)
+    // WAL attribution for this batch's transaction only (same measurement as
+    // the revalidate path): cluster-wide insert LSN before/after.
+    const before = (await sql<{ lsn: string; relation_bytes: string }>`
+      SELECT pg_current_wal_insert_lsn()::text AS lsn,
+             pg_total_relation_size('public.post')::text AS relation_bytes
+    `.execute(trx)).rows[0]
 
     const uris = batch.map((row) => row.uri)
     const existingRows = (await sql<ExistingContentTime>`
@@ -332,10 +473,13 @@ async function applyRecoveryBatch(
     const recoveries: BackfillPostRow[] = []
     let alreadyCurrent = 0
 
+    let skippedMissing = 0
     for (const row of batch) {
       const current = existing.get(row.uri)
-      if (!current) inserts.push(row)
-      else {
+      if (!current) {
+        if (noInsert) skippedMissing += 1
+        else inserts.push(row)
+      } else {
         const expected = revalidateForExisting(current, row)
         if (matchesRecovery(current, expected)) alreadyCurrent += 1
         else if (isUnclassified(current)) recoveries.push(expected)
@@ -392,12 +536,95 @@ async function applyRecoveryBatch(
       }
     }
 
+    const after = (await sql<{ wal_bytes: string; relation_bytes: string }>`
+      SELECT pg_wal_lsn_diff(pg_current_wal_insert_lsn(), ${before.lsn}::pg_lsn)::text AS wal_bytes,
+             pg_total_relation_size('public.post')::text AS relation_bytes
+    `.execute(trx)).rows[0]
+
     return {
       inserted: inserts.length,
       recovered: recoveries.length,
       already_current: alreadyCurrent,
+      skipped_missing: skippedMissing,
+      walBytes: Number(after.wal_bytes),
+      relationBytesBefore: Number(before.relation_bytes),
+      relationBytesAfter: Number(after.relation_bytes),
     }
   })
+}
+
+// Read-only preview of what a recovery apply would do to public.post for the
+// collected plan (no AppView state is changed; nothing is written): per-URI
+// classification against the current rows plus the DB-side residual -- legacy
+// rows of the actors inside [since, until) by "indexedAt" that the plan does
+// not cover (they would stay unclassified after the apply).
+export type PublisherPostRecoveryPreview = {
+  candidates: number
+  would_insert: number
+  would_recover: number
+  already_current: number
+  conflict: number
+  recover_by_status: { source_valid: number; source_invalid: number }
+  recover_by_reason: Partial<Record<ContentTimeClampReason, number>>
+  db_legacy_in_window: number
+  db_legacy_not_in_plan: number
+}
+
+export async function previewPublisherPostRecovery(
+  db: Database,
+  posts: BackfillPostRow[],
+  actors: string[],
+  since: Date,
+  until: Date,
+): Promise<PublisherPostRecoveryPreview> {
+  const preview: PublisherPostRecoveryPreview = {
+    candidates: posts.length,
+    would_insert: 0,
+    would_recover: 0,
+    already_current: 0,
+    conflict: 0,
+    recover_by_status: { source_valid: 0, source_invalid: 0 },
+    recover_by_reason: {},
+    db_legacy_in_window: 0,
+    db_legacy_not_in_plan: 0,
+  }
+  const uris = posts.map((row) => row.uri)
+  for (let offset = 0; offset < uris.length; offset += 1000) {
+    const slice = uris.slice(offset, offset + 1000)
+    const rows = (await sql<ExistingContentTime>`
+      SELECT uri, cid, author, "indexedAt", created_at_source_raw, content_time_utc, content_time_status,
+             content_time_clamp_reason, content_time_validator_version
+      FROM public.post WHERE uri = ANY(${slice}::text[])
+    `.execute(db)).rows
+    const existing = new Map(rows.map((row) => [row.uri, row]))
+    for (const row of posts.slice(offset, offset + 1000)) {
+      const current = existing.get(row.uri)
+      if (!current) { preview.would_insert += 1; continue }
+      let expected: BackfillPostRow
+      try { expected = revalidateForExisting(current, row) } catch { preview.conflict += 1; continue }
+      if (matchesRecovery(current, expected)) preview.already_current += 1
+      else if (isUnclassified(current)) {
+        preview.would_recover += 1
+        preview.recover_by_status[expected.content_time_status] += 1
+        if (expected.content_time_clamp_reason) {
+          preview.recover_by_reason[expected.content_time_clamp_reason] =
+            (preview.recover_by_reason[expected.content_time_clamp_reason] ?? 0) + 1
+        }
+      } else preview.conflict += 1
+    }
+  }
+  const residual = (await sql<{ in_window: string; not_in_plan: string }>`
+    SELECT count(*)::text AS in_window,
+           count(*) FILTER (WHERE NOT (uri = ANY(${uris}::text[])))::text AS not_in_plan
+    FROM public.post
+    WHERE author = ANY(${actors}::text[])
+      AND "indexedAt" >= ${since.toISOString()} AND "indexedAt" < ${until.toISOString()}
+      AND created_at_source_raw IS NULL
+      AND (content_time_status IS NULL OR content_time_status = 'legacy_unknown')
+  `.execute(db)).rows[0]
+  preview.db_legacy_in_window = Number(residual.in_window)
+  preview.db_legacy_not_in_plan = Number(residual.not_in_plan)
+  return preview
 }
 
 export async function runPublisherPostRecovery(
@@ -440,8 +667,13 @@ export async function runPublisherPostRecovery(
   let inserted = 0
   let recovered = 0
   let alreadyCurrent = 0
+  let skippedMissing = 0
   let cursorUri = options.afterUri ?? ''
   let complete = true
+  const batches: PublisherPostRecoveryBatch[] = []
+  let lastWalBytes = 0
+  let lastRelationBefore = 0
+  let lastRelationAfter = 0
 
   for (let offset = 0; offset < ordered.length; offset += options.batchSize) {
     const remainingMs = deadlineMs - Date.now()
@@ -450,27 +682,60 @@ export async function runPublisherPostRecovery(
       break
     }
     const rows = ordered.slice(offset, offset + options.batchSize)
+    const batchStartedAt = Date.now()
     const result = await applyRecoveryBatch(
       db,
       rows,
       options.lockTimeoutMs,
       Math.min(options.statementTimeoutMs, remainingMs),
       deadlineMs,
+      options.noInsert === true,
     )
+    const batchElapsedMs = Date.now() - batchStartedAt
     batch += 1
     scanned += rows.length
     inserted += result.inserted
     recovered += result.recovered
     alreadyCurrent += result.already_current
+    skippedMissing += result.skipped_missing
     cursorUri = rows[rows.length - 1].uri
+    lastWalBytes = result.walBytes
+    lastRelationBefore = result.relationBytesBefore
+    lastRelationAfter = result.relationBytesAfter
+    // Adaptive pause (D4-b): pay this batch's WAL back at the baseline rate,
+    // after every batch (including the last), clipped by the hard deadline.
+    const pauseRequiredMs = options.pauseBaselineBytesPerSecond && options.pauseBaselineBytesPerSecond > 0
+      ? Math.max(options.pauseMs, Math.ceil((result.walBytes * 1000) / options.pauseBaselineBytesPerSecond))
+      : options.pauseMs
+    const pauseSleptMs = Math.min(pauseRequiredMs, Math.max(0, deadlineMs - Date.now()))
+    if (pauseSleptMs > 0) await sleep(pauseSleptMs)
+    batches.push({
+      batch,
+      candidates: rows.length,
+      inserted: result.inserted,
+      recovered: result.recovered,
+      already_current: result.already_current,
+      skipped_missing: result.skipped_missing,
+      cursor_uri: cursorUri,
+      elapsed_ms: batchElapsedMs,
+      wal_bytes: result.walBytes,
+      relation_bytes_before: result.relationBytesBefore,
+      relation_bytes_after: result.relationBytesAfter,
+      pause_ms: pauseSleptMs,
+      pause_required_ms: pauseRequiredMs,
+    })
     const progress: PublisherPostRecoveryProgress = {
       batch,
       scanned,
       inserted,
       recovered,
       already_current: alreadyCurrent,
+      skipped_missing: skippedMissing,
       cursor_sha256: sha256(cursorUri),
       elapsed_ms: Date.now() - startedAt,
+      wal_bytes: result.walBytes,
+      relation_bytes_before: result.relationBytesBefore,
+      relation_bytes_after: result.relationBytesAfter,
     }
     options.onProgress?.(progress)
     options.onCheckpoint?.({
@@ -479,9 +744,6 @@ export async function runPublisherPostRecovery(
       plan_sha256: planSha256,
       cursor_uri: cursorUri,
     })
-    if (offset + rows.length < ordered.length && options.pauseMs > 0) {
-      await sleep(Math.min(options.pauseMs, Math.max(0, deadlineMs - Date.now())))
-    }
   }
 
   return {
@@ -490,9 +752,14 @@ export async function runPublisherPostRecovery(
     inserted,
     recovered,
     already_current: alreadyCurrent,
+    skipped_missing: skippedMissing,
     cursor_sha256: cursorUri ? sha256(cursorUri) : '',
     elapsed_ms: Date.now() - startedAt,
+    wal_bytes: lastWalBytes,
+    relation_bytes_before: lastRelationBefore,
+    relation_bytes_after: lastRelationAfter,
     complete,
+    batches,
   }
 }
 
@@ -1128,6 +1395,8 @@ function parseCliArgs(argv: string[]): CliOptions {
   const flags = new Map<string, string[]>()
   let apply = false
   let json = false
+  let noInsert = false
+  let planFromDb = false
 
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i]
@@ -1141,6 +1410,14 @@ function parseCliArgs(argv: string[]): CliOptions {
     }
     if (arg === '--json') {
       json = true
+      continue
+    }
+    if (arg === '--no-insert') {
+      noInsert = true
+      continue
+    }
+    if (arg === '--plan-from-db') {
+      planFromDb = true
       continue
     }
     if (!arg.startsWith('--')) throw new Error(`Unexpected positional argument: ${arg}`)
@@ -1168,6 +1445,35 @@ function parseCliArgs(argv: string[]): CliOptions {
     throw new Error('--max-pages-per-actor must be a positive integer')
   }
 
+  const maxBatchesRaw = flags.get('max-batches')?.at(-1)
+  let maxBatches: number | undefined
+  if (maxBatchesRaw !== undefined) {
+    maxBatches = Number.parseInt(maxBatchesRaw, 10)
+    if (!Number.isInteger(maxBatches) || String(maxBatches) !== maxBatchesRaw.trim() || maxBatches < 1) {
+      throw new Error('--max-batches must be a positive integer')
+    }
+  }
+  const pauseBaselineRaw = flags.get('pause-baseline-bytes-per-s')?.at(-1)
+  let pauseBaselineBytesPerSecond: number | undefined
+  if (pauseBaselineRaw !== undefined) {
+    pauseBaselineBytesPerSecond = Number.parseInt(pauseBaselineRaw, 10)
+    if (!Number.isInteger(pauseBaselineBytesPerSecond) || String(pauseBaselineBytesPerSecond) !== pauseBaselineRaw.trim() || pauseBaselineBytesPerSecond < 1) {
+      throw new Error('--pause-baseline-bytes-per-s must be a positive integer (bytes of WAL per second)')
+    }
+  }
+  const windowFieldRaw = flags.get('window-field')?.at(-1) ?? 'createdAt'
+  if (windowFieldRaw !== 'createdAt' && windowFieldRaw !== 'indexedAt') {
+    throw new Error('--window-field must be createdAt or indexedAt')
+  }
+  const planLimitRaw = flags.get('plan-limit')?.at(-1)
+  let planLimit: number | undefined
+  if (planLimitRaw !== undefined) {
+    planLimit = Number.parseInt(planLimitRaw, 10)
+    if (!Number.isInteger(planLimit) || String(planLimit) !== planLimitRaw.trim() || planLimit < 1) {
+      throw new Error('--plan-limit must be a positive integer')
+    }
+  }
+
   return {
     actors,
     since,
@@ -1179,6 +1485,12 @@ function parseCliArgs(argv: string[]): CliOptions {
     dbUrl: flags.get('db-url')?.at(-1) || process.env.FEEDGEN_POSTGRES_URL,
     checkpointFile: flags.get('checkpoint-file')?.at(-1),
     packetSha256: flags.get('packet-sha256')?.at(-1),
+    maxBatches,
+    pauseBaselineBytesPerSecond,
+    noInsert,
+    windowField: windowFieldRaw,
+    planFromDb,
+    planLimit,
   }
 }
 
@@ -1442,21 +1754,51 @@ async function mainRecover(argv: string[]) {
   const startedAt = Date.now()
   const options = parseCliArgs(argv)
   const deadlineMs = startedAt + RECOVERY_LIMITS.maxDurationMs
-  const plan = await collectPublisherPosts({
-    actors: options.actors,
-    since: options.since,
-    until: options.until,
-    maxPagesPerActor: options.maxPagesPerActor,
-    deadlineMs,
-    fetchPage: (actor, cursor) => fetchAuthorFeedPage(
-      options.apiBase,
-      actor,
-      cursor,
-      Math.max(1, Math.min(30_000, deadlineMs - Date.now())),
-    ),
-  })
+  let plan: BackfillPlan | DbPlan
+  if (options.planFromDb) {
+    if (!options.dbUrl) throw new Error('--plan-from-db needs FEEDGEN_POSTGRES_URL or --db-url')
+    const db = createDb(options.dbUrl)
+    try {
+      plan = await collectPublisherPostsFromDb(db, {
+        actors: options.actors,
+        since: options.since,
+        until: options.until,
+        deadlineMs,
+        limit: options.planLimit,
+        fetchPosts: (uris) => fetchPostsByUri(options.apiBase, uris, Math.max(1, Math.min(30_000, deadlineMs - Date.now()))),
+      })
+    } finally {
+      await db.destroy()
+    }
+  } else {
+    plan = await collectPublisherPosts({
+      actors: options.actors,
+      since: options.since,
+      until: options.until,
+      maxPagesPerActor: options.maxPagesPerActor,
+      deadlineMs,
+      windowField: options.windowField,
+      stopWhenPageBeforeSince: true,
+      fetchPage: (actor, cursor) => fetchAuthorFeedPage(
+        options.apiBase,
+        actor,
+        cursor,
+        Math.max(1, Math.min(30_000, deadlineMs - Date.now())),
+      ),
+    })
+  }
 
   let recovery: PublisherPostRecoveryResult | null = null
+  let preview: PublisherPostRecoveryPreview | null = null
+  if (!options.apply && options.dbUrl) {
+    // Read-only DB comparison so a packet can pre-register the exact outcome.
+    const db = createDb(options.dbUrl)
+    try {
+      preview = await previewPublisherPostRecovery(db, plan.posts, options.actors, options.since, options.until)
+    } finally {
+      await db.destroy()
+    }
+  }
   if (options.apply) {
     if (!options.checkpointFile) throw new Error('--checkpoint-file is required with --apply')
     if (!options.packetSha256 || !/^[0-9a-f]{64}$/.test(options.packetSha256)) {
@@ -1478,6 +1820,9 @@ async function mainRecover(argv: string[]) {
         planSha256: checkpoint?.planSha256,
         maxDurationMs: remainingMs,
         pauseMs: RECOVERY_LIMITS.pauseMs,
+        maxBatches: options.maxBatches,
+        pauseBaselineBytesPerSecond: options.pauseBaselineBytesPerSecond,
+        noInsert: options.noInsert,
         lockTimeoutMs: RECOVERY_LIMITS.lockTimeoutMs,
         statementTimeoutMs: Math.min(RECOVERY_LIMITS.statementTimeoutMs, remainingMs),
         onProgress: (progress) => console.error(JSON.stringify({ event: 'recovery_batch', ...progress })),
@@ -1488,11 +1833,18 @@ async function mainRecover(argv: string[]) {
     }
   }
   const summary = {
+    operation: 'publisher-post-recover',
     mode: options.apply ? 'apply' : 'dry-run',
     actor_count: options.actors.length,
     actor_sha256: options.actors.map(sha256).sort(),
     since: options.since.toISOString(),
     until: options.until.toISOString(),
+    window_field: options.windowField,
+    no_insert: options.noInsert,
+    plan_source: options.planFromDb ? 'db-legacy-rows+getPosts' : 'author-feed',
+    ...('db_legacy_in_window' in plan
+      ? { db_legacy_in_window: plan.db_legacy_in_window, unretrievable: plan.unretrievable, unretrievable_uri_sha256_sample: plan.unretrievable_uri_sha256_sample, appview_requests: plan.requests }
+      : {}),
     scanned: plan.scanned,
     candidate_posts: plan.posts.length,
     skipped_out_of_window: plan.skipped_out_of_window,
@@ -1500,6 +1852,7 @@ async function mainRecover(argv: string[]) {
     by_actor: Object.fromEntries(
       Object.entries(plan.by_actor).map(([actor, counts]) => [sha256(actor), counts]),
     ),
+    preview,
     recovery,
   }
 
