@@ -17,7 +17,7 @@ WITH target AS (
   FROM feedgen_ops.feed_catalog
   WHERE enabled AND rkey = ANY(string_to_array(:'rkeys', ','))
 ), latest AS (
-  SELECT DISTINCT ON (rl.algo) rl.algo AS rkey, rl.id AS request_id, rl.timestamp AS ts,
+  SELECT DISTINCT ON (rl.algo) rl.algo AS rkey, rl.id AS request_id, rl.timestamp AS ts, encode(digest(rl.requester_did, 'sha256'), 'hex') AS requester_sha256,
          rl.publisher_time_clock AS served_clock, rl.feed_catalog_revision AS served_revision, rl.request_reference_time AS ref
   FROM request_log rl JOIN target t ON t.rkey = rl.algo
   ORDER BY rl.algo, rl.timestamp DESC
@@ -49,6 +49,7 @@ SELECT t.rkey, t.publisher_time_clock AS catalog_clock, t.catalog_revision,
        (SELECT count(*) FROM served s WHERE s.rkey = t.rkey AND s.scored) AS served_scored,
        (SELECT encode(digest(COALESCE(string_agg(o.uri, ',' ORDER BY o.served_rank), ''), 'sha256'), 'hex') FROM ordered o WHERE o.rkey = t.rkey) AS served_sha256,
        (SELECT count(*) FROM served_all sa WHERE sa.rkey = t.rkey AND sa.unjoined) AS unjoined_request_posts,
-       (SELECT count(*) FROM served s WHERE s.rkey = t.rkey AND s.content_time_utc IS NOT NULL AND s.content_time_utc::timestamptz > l.ref::timestamptz) AS served_future_dated
+       (SELECT count(*) FROM served s WHERE s.rkey = t.rkey AND s.content_time_utc IS NOT NULL AND s.content_time_utc::timestamptz > l.ref::timestamptz) AS served_future_dated,
+       l.request_id, l.requester_sha256
 FROM target t LEFT JOIN latest l ON l.rkey = t.rkey
 ORDER BY t.rkey;
