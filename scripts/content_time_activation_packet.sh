@@ -56,7 +56,7 @@ assert_bindings_minimal() {  # what a RESTORE needs and nothing more: the approv
   if [[ "$EXPECTED_CLOCK" != "receipt_time" && "${BINDINGS_MODE:-full}" != "restore" ]]; then approval_ok "$APPROVAL_A_PATH" "$EXPECTED_PACKET_SHA" "$EXPECTED_FLOOR" "2026-08-18" || die "APPROVAL_A_PATH ($APPROVAL_A_PATH) missing, lacks the owner-attribution header, or lacks the packet SHA / floor / amendment date"; fi
   APPROVAL_A_SHA=$( [[ -f "$APPROVAL_A_PATH" ]] && sha256sum "$APPROVAL_A_PATH" | cut -d' ' -f1 || echo absent ); APPROVAL_B1_SHA=$( [[ -f "$APPROVAL_B1_PATH" ]] && sha256sum "$APPROVAL_B1_PATH" | cut -d' ' -f1 || echo absent ); APPROVAL_B2_SHA=$( [[ -f "$APPROVAL_B2_PATH" ]] && sha256sum "$APPROVAL_B2_PATH" | cut -d' ' -f1 || echo absent )
   # export the bound values for callers that run this check in a subshell (battery): one line, parsed by bindings_capture
-  echo "BINDINGS_OUT ${CATALOG_SHA:-} $APPROVAL_A_SHA $APPROVAL_B1_SHA $APPROVAL_B2_SHA $APPROVAL_A_PATH $APPROVAL_B1_PATH $APPROVAL_B2_PATH"
+  echo "BINDINGS_OUT ${CATALOG_SHA:--} $APPROVAL_A_SHA $APPROVAL_B1_SHA $APPROVAL_B2_SHA $APPROVAL_A_PATH $APPROVAL_B1_PATH $APPROVAL_B2_PATH"
   local t exp got; for t in bsky-ops newsflows-bskyhealth blueskyranker; do exp=$(echo "$EXPECTED_TOOL_REFS" | tr ',' '\n' | awk -F= -v k="$t" '$1==k{print $2}'); grep -qF -- "$exp" "$PACKET_PATH" || die "tool ref $t=$exp not named in the approved packet"; got=$(tool_ref "$t"); [[ -n "$exp" && "$got" == "$exp" ]] || die "installed tool $t is '$got', expected '$exp'"; done
   local rk; for rk in $(echo "$EXPECTED_UPDATE_RKEYS" | tr ',' ' '); do grep -qF -- "$rk" "$PACKET_PATH" || die "rkey $rk not named in the approved packet"; done
   local d; d="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -78,6 +78,7 @@ assert_bindings() {  # full: minimal + catalog identity (deployed == origin@CATA
   [[ "$PREDECESSOR_SOURCE_SHA" == "$p1" || "$pdh" == "$EXPECTED_PREDECESSOR_CATALOG_SHA" ]] || die "PREDECESSOR_SOURCE_SHA is neither the first parent of CATALOG_SOURCE_SHA nor carries the expected predecessor publishers.yml"
   [[ "$pdh" == "$EXPECTED_PREDECESSOR_CATALOG_SHA" ]] || die "predecessor publishers.yml sha $pdh != EXPECTED_PREDECESSOR_CATALOG_SHA"
   CATALOG_SHA=$d1
+  echo "BINDINGS_OUT $CATALOG_SHA $APPROVAL_A_SHA $APPROVAL_B1_SHA $APPROVAL_B2_SHA $APPROVAL_A_PATH $APPROVAL_B1_PATH $APPROVAL_B2_PATH"
   # the BSR effective-config readback is a gate INPUT (bskyops compares its time_column to the constant createdAt, not to the catalog clock):
   # it must be fresh (documented 60-min TTL); the 5-min producer stalling would silently stale the sync/parity gates otherwise
   local rb_age; rb_age=$(node -e 'const j=JSON.parse(require("fs").readFileSync(process.argv[1]));const v=(j.artifact_metadata||{}).generated_at;const t=typeof v==="number"?v*1000:Date.parse(v);console.log(Math.round((Date.now()-t)/1000))' "$EFFECTIVE_CONFIG_JSON")
@@ -125,7 +126,7 @@ console.log("gate ok updates="+b.updates.length);' "$f" "$EXPECTED_UPDATE_RKEYS"
 cmd_preview() {
   if [[ "$EXPECTED_CLOCK" != "receipt_time" ]]; then install -d -o root -g newsflows -m 750 "$E"; [[ -n "${APPROVAL_A_PATH:-}" && ! -f "$E/approval-A.txt" ]] && install -o root -g newsflows -m 640 "$APPROVAL_A_PATH" "$E/approval-A.txt"; [[ -n "${APPROVAL_B1_PATH:-}" && ! -f "$E/approval-B1.txt" ]] && install -o root -g newsflows -m 640 "$APPROVAL_B1_PATH" "$E/approval-B1.txt"; fi
   [[ "$(docker inspect feedgen --format '{{.Image}}')" == "$EXPECTED_FEEDGEN_IMAGE" ]] || die "running feedgen image != EXPECTED_FEEDGEN_IMAGE"
-  assert_bindings; load_keys; local p; p=$(mktemp); sync_packet "$p"; gate_packet "$p"
+  assert_bindings >/dev/null; load_keys; local p; p=$(mktemp); sync_packet "$p"; gate_packet "$p"
   emit feedgen-sync-packet-preview.json < "$p"; sha256sum "$E/feedgen-sync-packet-preview.json" | emit feedgen-sync-packet-preview.sha256
   node -e 'const j=JSON.parse(require("fs").readFileSync(process.argv[1]));console.log(JSON.stringify(j.atomic_change_set.request_body))' "$p" | emit feedgen-bulk-request.json
   node -e 'const j=JSON.parse(require("fs").readFileSync(process.argv[1]));console.log(JSON.stringify(j.atomic_change_set.rollback_request_body))' "$p" | emit feedgen-bulk-rollback.json
@@ -145,7 +146,7 @@ cmd_preview() {
 }
 cmd_apply() {
   if [[ -n "${APPROVAL_B2_PATH:-}" && ! -f "$E/approval-B2.txt" ]]; then install -o root -g newsflows -m 640 "$APPROVAL_B2_PATH" "$E/approval-B2.txt"; fi
-  assert_bindings; load_keys; [[ -f "$E/feedgen-bulk-request.json" && -f "$E/preview-summary.txt" ]] || die "run preview first"
+  assert_bindings >/dev/null; load_keys; [[ -f "$E/feedgen-bulk-request.json" && -f "$E/preview-summary.txt" ]] || die "run preview first"
   local t0; t0=$(ts)
   # the request body must be byte-identical to the previewed one and the live rows must still match if_current (fresh packet == same body)
   local p; p=$(mktemp); sync_packet "$p"; gate_packet "$p"
@@ -168,7 +169,7 @@ cmd_apply() {
   rm -f "$p" "$resp" "$HDR"; log "apply ok"
 }
 cmd_parity() {  # parity of the DEPLOYED catalog vs feedgen: status must be exactly "matched" with mismatch_count 0; plus a NEGATIVE control
-  assert_bindings; local st; st=$(date -u +%H%M%S); local f="feedgen-parity-$st.json"
+  assert_bindings >/dev/null; local st; st=$(date -u +%H%M%S); local f="feedgen-parity-$st.json"
   bskyops_env "$BSKYOPS" ecosystem desired-state feedgen-parity --active-only --catalog-yaml "$TREE_CATALOG" --feedgen-url "$FEEDGEN_URL" --bsr-effective-config-json "$EFFECTIVE_CONFIG_JSON" --json | emit "$f"
   parity_gate "$E/$f" matched | emit "feedgen-parity-$st-gate.txt" || die "feedgen-parity not matched (see $f)"
   # negative control: the comparator must report the difference between the predecessor catalog file and the live rows (4 mismatches after apply)
@@ -177,7 +178,7 @@ cmd_parity() {  # parity of the DEPLOYED catalog vs feedgen: status must be exac
   if [[ "$EXPECTED_CLOCK" == "content_time_v1" ]]; then parity_gate "$E/feedgen-parity-negative-control-$st.json" drift "$EXPECTED_UPDATE_RKEYS" | emit "feedgen-parity-negative-control-$st-gate.txt" || die "parity negative control did not report drift on the four rkeys against the predecessor catalog"; fi
 }
 cmd_rollback_dryrun() {  # only meaningful AFTER apply (the rollback CAS expects the activated values); every row gated like the forward dry-run
-  assert_bindings; load_keys; local n=0 stamp; stamp=$(date -u +%H%M%S); tool_refs_line | emit "rollback-dry-run-$stamp-bindings.txt"; while IFS= read -r u; do local rk; rk=$(node -e 'console.log(JSON.parse(process.argv[1]).rkey)' "$u"); curl --fail -sS --max-time 30 -H "@$HDR" -H 'content-type: application/json' --data-binary "$u" "$FEEDGEN_URL/api/admin/feed_catalog/dry-run" | emit "rollback-dry-run-$rk-$stamp.json"; dry_run_gate "$E/rollback-dry-run-$rk-$stamp.json" || die "rollback dry-run $rk not clean (see rollback-dry-run-$rk-$stamp.json)"; n=$((n+1)); done < <(node -e 'const j=JSON.parse(require("fs").readFileSync(process.argv[1]));for(const u of j.updates)console.log(JSON.stringify(u))' "$E/feedgen-bulk-rollback.json"); log "rollback dry-run ok ($n rows, all would_write=false, no blockers)"; }
+  assert_bindings >/dev/null; load_keys; local n=0 stamp; stamp=$(date -u +%H%M%S); tool_refs_line | emit "rollback-dry-run-$stamp-bindings.txt"; while IFS= read -r u; do local rk; rk=$(node -e 'console.log(JSON.parse(process.argv[1]).rkey)' "$u"); curl --fail -sS --max-time 30 -H "@$HDR" -H 'content-type: application/json' --data-binary "$u" "$FEEDGEN_URL/api/admin/feed_catalog/dry-run" | emit "rollback-dry-run-$rk-$stamp.json"; dry_run_gate "$E/rollback-dry-run-$rk-$stamp.json" || die "rollback dry-run $rk not clean (see rollback-dry-run-$rk-$stamp.json)"; n=$((n+1)); done < <(node -e 'const j=JSON.parse(require("fs").readFileSync(process.argv[1]));for(const u of j.updates)console.log(JSON.stringify(u))' "$E/feedgen-bulk-rollback.json"); log "rollback dry-run ok ($n rows, all would_write=false, no blockers)"; }
 cmd_rollback() { BINDINGS_MODE=restore assert_bindings_minimal >/dev/null; load_keys; local resp; resp=$(mktemp); local http; ROWS_RESTORED=no; http=$(curl -sS --max-time 60 -H "@$HDR" -H "x-feedgen-actor: approved-activation-packet-rollback" -H "x-feedgen-source: $EXPECTED_PACKET_SHA" -H "x-feedgen-request-id: rollback-$(sha256sum "$E/feedgen-bulk-rollback.json" | cut -c1-64)" -H 'content-type: application/json' --data-binary "@$E/feedgen-bulk-rollback.json" --output "$resp" --write-out '%{http_code}' "$FEEDGEN_URL/api/admin/feed_catalog/bulk") || true; emit "feedgen-bulk-rollback-response-$(date -u +%H%M%S).json" < "$resp"; echo "rolled_back_at=$(ts) http=$http" | emit "rollback-transport-$(date -u +%H%M%S).txt"; [[ "$http" == "200" ]] || escalate "rollback bulk POST http=$http (layer i failed; see the rollback response receipt)" no unknown
   node -e 'const j=JSON.parse(require("fs").readFileSync(process.argv[1]));const n=Number(process.argv[2]);if(!(j.status==="applied"&&j.applied===true&&j.result_count===n&&j.results.length===n))process.exit(2)' "$resp" "$(echo "$EXPECTED_UPDATE_RKEYS" | tr ',' '\n' | wc -l | tr -d ' ')" || escalate "rollback bulk response is not a clean apply of all rows (layer i)" no unknown
   local rs2; rs2=$(date -u +%H%M%S); psqlq -c "SELECT rkey, catalog_revision, publisher_time_clock, publisher_time_transition_expires_at, content_time_cutover_min_valid_share, content_time_contract_version FROM feedgen_ops.feed_catalog WHERE enabled ORDER BY 1" | emit "catalog-after-rollback-$rs2.tsv"
