@@ -150,7 +150,7 @@ export E TREE="$repo_root" RUNNER=host \
 export EXPECTED_IMAGE_CT_SHA256="$EXPECTED_CT_SHA256"   # unused: SKIP_LIVE_IMAGE_CHECKS=1 never reads this
 export SKIP_LIVE_IMAGE_CHECKS=1
 export EXPECTED_TOOL_REFS="bsky-ops=rehearsal,blueskyranker=rehearsal,newsflows-bskyhealth=rehearsal"   # unused under SKIP_LIVE_IMAGE_CHECKS=1
-export RECOVER_DIDS="$pub_did" RECOVER_RKEY_PATTERN='newsflow-zz-.*' HORIZON_DAYS=10 SINCE UNTIL
+export RECOVER_DIDS="$pub_did" RECOVER_RKEY_PATTERN='newsflow-zz-.*' HORIZON_DAYS=10 SINCE UNTIL EXPECTED_RKEYS=newsflow-zz-2a
 export API_BASE="http://127.0.0.1:${mock_port}"
 export PACKET_SHA="$(printf '2%.0s' $(seq 1 64))"
 rb=$(mktemp); now=$(date -u +%s)
@@ -165,6 +165,15 @@ prereg_out=$(bash "$runner" prereg); echo "$prereg_out" | sed 's/^/prereg: /'
   || { echo "prereg did not reproduce the pre-registered cells: $(echo "$prereg_out" | sed -n 's/^PREREG=//p') vs $PREREG"; exit 1; }
 
 step() { echo "status=$1"; shift; "$@"; }
+# NEGATIVE legs of the participant-safety gates (each must stop preflight before writing prestate/plan artifacts):
+psql -c "UPDATE feedgen_ops.feed_catalog SET publisher_time_clock='content_time_v1', publisher_time_transition_expires_at='2030-01-01T00:00:00Z', content_time_cutover_min_valid_share=0.8, content_time_contract_version='newsflows-content-time/v2' WHERE rkey='newsflow-zz-2a';" >/dev/null
+set +e; E="$E-neg-clock" bash "$runner" preflight >/dev/null 2>&1; rc=$?; set -e
+[[ $rc -ne 0 && ! -f "$E-neg-clock/step1-be-prestate-rows.tsv" ]] || { echo "content-time clock on the target feed did not stop preflight pre-artifact (rc=$rc)"; exit 1; }
+psql -c "UPDATE feedgen_ops.feed_catalog SET publisher_time_clock='receipt_time', publisher_time_transition_expires_at=NULL, content_time_cutover_min_valid_share=NULL, content_time_contract_version=NULL WHERE rkey='newsflow-zz-2a';" >/dev/null
+rb_bad=$(mktemp); sed 's/"time_column":"createdAt"/"time_column":"content_time_utc"/' "$rb" > "$rb_bad"; grep -q content_time_utc "$rb_bad" || { echo "could not build the bad readback"; exit 1; }
+set +e; E="$E-neg-timecol" READBACK_JSON="$rb_bad" bash "$runner" preflight >/dev/null 2>&1; rc=$?; set -e
+[[ $rc -ne 0 && ! -f "$E-neg-timecol/step1-be-prestate-rows.tsv" ]] || { echo "BSR time_column=content_time_utc did not stop preflight pre-artifact (rc=$rc)"; exit 1; }
+rm -f "$rb_bad"; sudo -n rm -rf "$E-neg-clock" "$E-neg-timecol"; echo "status=participant_safety_negatives ok"
 step preflight bash "$runner" preflight
 [[ $(wc -l <"$E/step1-be-prestate-rows.tsv") -eq 1260 ]] || { echo "prestate snapshot count unexpected"; exit 1; }
 grep -q "^mode=recover$" "$E/source-set.txt" || { echo "mode=recover not recorded"; exit 1; }
@@ -219,9 +228,12 @@ grep -q "^hits=0$" "$E/secret-scan.txt" || { echo "secret scan not clean"; cat "
 grep -q "SOME_HOSTNAME_CONFIG" "$E/secret-scan.txt" && { echo "secret scan must not treat config keys as secrets"; exit 1; }
 # negative test: a scratch evidence root containing the rehearsal DB password must FAIL the scan
 E2=$(mktemp -d); sudo -n install -d -o root -g newsflows -m 750 "$E2/leak"; echo "leak $rehearsal_pw" | sudo -n tee "$E2/leak/step1-x.err" >/dev/null
+sudo -n install -o root -g newsflows -m 640 "$E/source-set.txt" "$E2/leak/source-set.txt"   # same bound values -> the DETECTOR runs, not the bindings gate
+sudo -n cp "$E/tree-manifest.txt" "$E2/leak/" 2>/dev/null || true
 set +e; E="$E2/leak" bash "$runner" secret-scan >/dev/null 2>&1; rc=$?; set -e
 [[ $rc -ne 0 ]] || { echo "secret scan failed to detect a leaked password"; exit 1; }
-sudo -n rm -rf "$E2"; echo "status=secret_scan_negative_test ok"
+sudo -n grep -q "^hits=1$" "$E2/leak/secret-scan.txt" && sudo -n grep -q "step1-x.err" "$E2/leak/secret-scan.txt" || { echo "secret scan negative: expected hits=1 naming step1-x.err"; sudo -n cat "$E2/leak/secret-scan.txt"; exit 1; }
+sudo -n rm -rf "$E2"; echo "status=secret_scan_negative_test ok (hits=1 step1-x.err)"
 step finalize bash "$runner" finalize 2026-08-18T00:00:00Z 2026-08-18T01:00:00Z
 sudo -n grep -q "RESULT.txt" "$E/SHA256SUMS" || { echo "SHA256SUMS incomplete"; exit 1; }
 rm -f "$rb"
