@@ -143,7 +143,8 @@ run_tool() {  # run_tool <outname> <tool args...>  -> $E/<outname>.json + .err ;
     sudo -n env FEEDGEN_POSTGRES_URL="$HOST_DSN" node "$TREE/dist/tools/backfill-publisher-posts.js" "$@" >"$so" 2>"$se" || rc=$?
   else
     # explicit entrypoint; DSN composed in-container by the committed helper (no shell expansion of secrets)
-    "${DOCKER[@]}" run --rm --network "$NETWORK" --env-file "$ENV_FILE" \
+    # NODE_OPTIONS pins the AppView calls to IPv4 (outbound IPv6 is deliberately off on the host — owner 2026-08-17)
+    "${DOCKER[@]}" run --rm --network "$NETWORK" --env-file "$ENV_FILE" -e NODE_OPTIONS=--dns-result-order=ipv4first \
       -v "$TREE:/src:ro" -v "$E:/evidence" -w /src --entrypoint sh "$IMG" \
       -c 'export FEEDGEN_POSTGRES_URL="$(node /src/scripts/compose_feedgen_dsn.js)" || exit 97; exec node /src/dist/tools/backfill-publisher-posts.js "$@"' sh "$@" \
       >"$so" 2>"$se" || rc=$?
@@ -158,7 +159,7 @@ run_tool_scratch() {  # run_tool_scratch <dir> <outname> <tool args...>  -> <dir
     : "${HOST_DSN:?HOST_DSN required for RUNNER=host}"
     sudo -n env FEEDGEN_POSTGRES_URL="$HOST_DSN" node "$TREE/dist/tools/backfill-publisher-posts.js" "$@" >"$so" 2>"$se" || rc=$?
   else
-    "${DOCKER[@]}" run --rm --network "$NETWORK" --env-file "$ENV_FILE" \
+    "${DOCKER[@]}" run --rm --network "$NETWORK" --env-file "$ENV_FILE" -e NODE_OPTIONS=--dns-result-order=ipv4first \
       -v "$TREE:/src:ro" -v "$dir:/evidence" -w /src --entrypoint sh "$IMG" \
       -c 'export FEEDGEN_POSTGRES_URL="$(node /src/scripts/compose_feedgen_dsn.js)" || exit 97; exec node /src/dist/tools/backfill-publisher-posts.js "$@"' sh "$@" \
       >"$so" 2>"$se" || rc=$?
