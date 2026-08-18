@@ -103,6 +103,7 @@ type CliOptions = {
   windowField: 'createdAt' | 'indexedAt'
   planFromDb: boolean
   planLimit?: number
+  planUrisFile?: string
 }
 
 export type PublisherPostRecoveryProgress = {
@@ -245,25 +246,59 @@ export type DbPlanOptions = {
   fetchPosts: (uris: string[]) => Promise<AppViewPost[]>
   deadlineMs?: number
   limit?: number
+  // Immutable plan for resumable applies: when given, the plan is exactly this
+  // URI list (materialized once by the packet runner from its prestate
+  // snapshot) instead of "whatever is legacy right now" -- so the plan hash the
+  // checkpoint binds stays identical across invocations while rows already
+  // recovered simply come back as already_current. Rows must belong to the
+  // actors (author is read from the DB); URIs not in the DB are reported as
+  // unretrievable-in-db and skipped.
+  planUris?: string[]
 }
 
 export type DbPlan = BackfillPlan & {
   db_legacy_in_window: number
+  plan_source_rows: number
+  plan_uris_not_in_db: number
   unretrievable: number
   unretrievable_uri_sha256_sample: string[]
   requests: number
 }
 
 export async function collectPublisherPostsFromDb(db: Database, options: DbPlanOptions): Promise<DbPlan> {
-  const rows = (await sql<{ uri: string; author: string }>`
-    SELECT uri, author FROM public.post
+  const legacyInWindow = Number((await sql<{ n: string }>`
+    SELECT count(*)::text AS n FROM public.post
     WHERE author = ANY(${options.actors}::text[])
       AND "indexedAt" >= ${options.since.toISOString()} AND "indexedAt" < ${options.until.toISOString()}
       AND created_at_source_raw IS NULL
       AND (content_time_status IS NULL OR content_time_status = 'legacy_unknown')
-    ORDER BY uri
-    ${options.limit ? sql`LIMIT ${options.limit}` : sql``}
-  `.execute(db)).rows
+  `.execute(db)).rows[0].n)
+  let planUrisNotInDb = 0
+  let rows: { uri: string; author: string }[]
+  if (options.planUris) {
+    const wanted = [...new Set(options.planUris)].sort()
+    rows = []
+    for (let offset = 0; offset < wanted.length; offset += 1000) {
+      const slice = wanted.slice(offset, offset + 1000)
+      const found = (await sql<{ uri: string; author: string }>`
+        SELECT uri, author FROM public.post
+        WHERE uri = ANY(${slice}::text[]) AND author = ANY(${options.actors}::text[])
+        ORDER BY uri
+      `.execute(db)).rows
+      rows.push(...found)
+      planUrisNotInDb += slice.length - found.length
+    }
+  } else {
+    rows = (await sql<{ uri: string; author: string }>`
+      SELECT uri, author FROM public.post
+      WHERE author = ANY(${options.actors}::text[])
+        AND "indexedAt" >= ${options.since.toISOString()} AND "indexedAt" < ${options.until.toISOString()}
+        AND created_at_source_raw IS NULL
+        AND (content_time_status IS NULL OR content_time_status = 'legacy_unknown')
+      ORDER BY uri
+      ${options.limit ? sql`LIMIT ${options.limit}` : sql``}
+    `.execute(db)).rows
+  }
   const posts = new Map<string, BackfillPostRow>()
   const byActor: BackfillPlan['by_actor'] = {}
   for (const actor of options.actors) byActor[actor] = { scanned: 0, candidate_posts: 0, skipped_out_of_window: 0, skipped_wrong_author: 0 }
@@ -299,7 +334,9 @@ export async function collectPublisherPostsFromDb(db: Database, options: DbPlanO
     skipped_out_of_window: 0,
     skipped_wrong_author: skippedWrongAuthor,
     by_actor: byActor,
-    db_legacy_in_window: rows.length,
+    db_legacy_in_window: legacyInWindow,
+    plan_source_rows: rows.length,
+    plan_uris_not_in_db: planUrisNotInDb,
     unretrievable: unretrievable.length,
     unretrievable_uri_sha256_sample: unretrievable.slice(0, 5).map(sha256),
     requests,
@@ -1474,6 +1511,11 @@ function parseCliArgs(argv: string[]): CliOptions {
     }
   }
 
+  const planUrisFile = flags.get('plan-uris-file')?.at(-1)
+  if (planUrisFile !== undefined && !planFromDb) {
+    throw new Error('--plan-uris-file requires --plan-from-db')
+  }
+
   return {
     actors,
     since,
@@ -1491,6 +1533,7 @@ function parseCliArgs(argv: string[]): CliOptions {
     windowField: windowFieldRaw,
     planFromDb,
     planLimit,
+    planUrisFile,
   }
 }
 
@@ -1759,12 +1802,18 @@ async function mainRecover(argv: string[]) {
     if (!options.dbUrl) throw new Error('--plan-from-db needs FEEDGEN_POSTGRES_URL or --db-url')
     const db = createDb(options.dbUrl)
     try {
+      let planUris: string[] | undefined
+      if (options.planUrisFile) {
+        planUris = fs.readFileSync(options.planUrisFile, 'utf8').split('\n').map((l) => l.trim()).filter(Boolean)
+        if (!planUris.length) throw new Error('--plan-uris-file is empty')
+      }
       plan = await collectPublisherPostsFromDb(db, {
         actors: options.actors,
         since: options.since,
         until: options.until,
         deadlineMs,
         limit: options.planLimit,
+        planUris,
         fetchPosts: (uris) => fetchPostsByUri(options.apiBase, uris, Math.max(1, Math.min(30_000, deadlineMs - Date.now()))),
       })
     } finally {
@@ -1841,9 +1890,9 @@ async function mainRecover(argv: string[]) {
     until: options.until.toISOString(),
     window_field: options.windowField,
     no_insert: options.noInsert,
-    plan_source: options.planFromDb ? 'db-legacy-rows+getPosts' : 'author-feed',
+    plan_source: options.planFromDb ? (options.planUrisFile ? 'plan-uris-file+getPosts' : 'db-legacy-rows+getPosts') : 'author-feed',
     ...('db_legacy_in_window' in plan
-      ? { db_legacy_in_window: plan.db_legacy_in_window, unretrievable: plan.unretrievable, unretrievable_uri_sha256_sample: plan.unretrievable_uri_sha256_sample, appview_requests: plan.requests }
+      ? { db_legacy_in_window: plan.db_legacy_in_window, plan_source_rows: plan.plan_source_rows, plan_uris_not_in_db: plan.plan_uris_not_in_db, unretrievable: plan.unretrievable, unretrievable_uri_sha256_sample: plan.unretrievable_uri_sha256_sample, appview_requests: plan.requests }
       : {}),
     scanned: plan.scanned,
     candidate_posts: plan.posts.length,
