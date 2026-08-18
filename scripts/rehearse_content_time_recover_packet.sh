@@ -144,7 +144,9 @@ export E TREE="$repo_root" RUNNER=host \
   ENV_FILE="$envfile" \
   EXPECTED_SHA="$(git -C "$repo_root" rev-parse HEAD)" \
   EXPECTED_DIST_SHA256="$(sha256sum "$repo_root/dist/tools/backfill-publisher-posts.js" | cut -d' ' -f1)" \
-  EXPECTED_CT_SHA256="$(sha256sum "$repo_root/dist/util/content-time.js" | cut -d' ' -f1)"
+  EXPECTED_CT_SHA256="$(sha256sum "$repo_root/dist/util/content-time.js" | cut -d' ' -f1)" \
+  EXPECTED_RUNNER_SHA256="$(sha256sum "$repo_root/scripts/content_time_recover_packet.sh" | cut -d' ' -f1)" \
+  EXPECTED_DSN_HELPER_SHA256="$(sha256sum "$repo_root/scripts/compose_feedgen_dsn.js" | cut -d' ' -f1)"
 export EXPECTED_IMAGE_CT_SHA256="$EXPECTED_CT_SHA256"   # unused: SKIP_LIVE_IMAGE_CHECKS=1 never reads this
 export SKIP_LIVE_IMAGE_CHECKS=1
 export EXPECTED_TOOL_REFS="bsky-ops=rehearsal,blueskyranker=rehearsal,newsflows-bskyhealth=rehearsal"   # unused under SKIP_LIVE_IMAGE_CHECKS=1
@@ -155,12 +157,12 @@ rb=$(mktemp); now=$(date -u +%s)
 printf '{"schema_version":"bsr.ops.effective_config.readback.v1","raw_values_in_output":false,"artifact_metadata":{"generated_at":%s,"stale_at":%s},"bindings":{"reh-recover":{"feed_ids":["newsflow-zz-2a"],"push_window_days":10,"time_column":"createdAt"}}}\n' "$now" "$((now+3600))" >"$rb"
 export READBACK_JSON="$rb"
 
-# --- pre-registration flow: read-only prereg, then bind the cells (as the ledger approval would) --
-export PREREG=placeholder
+# --- pre-registration flow: PREREG is the REVIEWED table's values (here: the seeded ground truth), never re-bound from the
+# read-only prereg output; prereg must merely REPRODUCE them (a difference = STOP, not a re-bind)
+export PREREG="legacy_in_window=1260,unretrievable=20,would_recover=1240,recover_source_valid=1230,recover_source_invalid=10,would_insert=0,conflict=0"
 prereg_out=$(bash "$runner" prereg); echo "$prereg_out" | sed 's/^/prereg: /'
-export PREREG="$(echo "$prereg_out" | sed -n 's/^PREREG=//p')"
-[[ "$PREREG" == "legacy_in_window=1260,unretrievable=20,would_recover=1240,recover_source_valid=1230,recover_source_invalid=10,would_insert=0,conflict=0" ]] \
-  || { echo "prereg cells unexpected: $PREREG"; exit 1; }
+[[ "$(echo "$prereg_out" | sed -n 's/^PREREG=//p')" == "$PREREG" ]] \
+  || { echo "prereg did not reproduce the pre-registered cells: $(echo "$prereg_out" | sed -n 's/^PREREG=//p') vs $PREREG"; exit 1; }
 
 step() { echo "status=$1"; shift; "$@"; }
 step preflight bash "$runner" preflight
@@ -187,11 +189,14 @@ grep -q "batches=1 exit=0 recovered=240 complete=true" "$E/ceiling-be-full.txt" 
 step readback bash "$runner" readback
 grep -q "missing=0" "$E/step1-be-diff-attempt-1.txt" && grep -q "recovered_valid=1230 recovered_invalid=10.*still_legacy=20" "$E/step1-be-diff-attempt-1.txt" \
   || { echo "readback diff not closed / counts unexpected"; cat "$E/step1-be-diff-attempt-1.txt"; exit 1; }
-# readback must be re-runnable even after a FAILED attempt (files of the failed attempt stay; the next attempt gets a new suffix)
+# re-binding PREREG (or SINCE/UNTIL/...) between invocations must be REJECTED before any artifact is written (bound-env gate)
 set +e; PREREG="legacy_in_window=1260,unretrievable=20,would_recover=1240,recover_source_valid=1230,recover_source_invalid=11,would_insert=0,conflict=0" bash "$runner" readback >/dev/null 2>&1; rc=$?; set -e
-[[ $rc -ne 0 && -f "$E/step1-be-preview-after-attempt-2.json" && ! -f "$E/readback-attempt-2.txt" ]] || { echo "forced readback failure did not behave (rc=$rc)"; exit 1; }
-step readback_after_failure bash "$runner" readback
-[[ -f "$E/readback-attempt-3.txt" ]] || { echo "readback attempt-3 receipt missing"; exit 1; }
+[[ $rc -ne 0 && ! -f "$E/step1-be-preview-after-attempt-2.json" && ! -f "$E/readback-attempt-2.txt" ]] || { echo "re-bound PREREG was not rejected pre-artifact (rc=$rc)"; exit 1; }
+set +e; UNTIL="$(date -u -d '4 days ago' +%Y-%m-%dT%H:%M:%S.000Z)" bash "$runner" readback >/dev/null 2>&1; rc=$?; set -e
+[[ $rc -ne 0 && ! -f "$E/step1-be-preview-after-attempt-2.json" ]] || { echo "re-bound UNTIL was not rejected pre-artifact (rc=$rc)"; exit 1; }
+# readback stays re-runnable: a second clean run gets its own attempt suffix
+step readback_rerun bash "$runner" readback
+[[ -f "$E/readback-attempt-2.txt" && -f "$E/step1-be-preview-after-attempt-2.json" ]] || { echo "readback attempt-2 receipt missing"; exit 1; }
 # genuine mid-restore failure: hold a row lock on a recovered row of batch 2 (rows 501-1000) so lock_timeout=5s fires, then resume after release
 lock_uri=$(sed -n '510p' "$E/step1-be-prestate-rows.tsv" | cut -f1)
 ( "${D[@]}" exec -i "$container" psql -U "$db_user" -d "$db_name" -X -q -v ON_ERROR_STOP=1 -c "BEGIN; SELECT uri FROM post WHERE uri='$lock_uri' FOR UPDATE; SELECT pg_sleep(25); COMMIT;" >/dev/null 2>&1 & ); sleep 2
