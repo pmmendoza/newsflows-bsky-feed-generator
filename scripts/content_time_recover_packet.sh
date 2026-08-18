@@ -218,7 +218,7 @@ plan_uris_path() {  # the immutable plan (URIs of the prestate legacy rows), as 
 }
 snapshot_by_uris() {  # snapshot_by_uris <urifile> -> stdout tab-text rows, SAME columns/order as snapshot_sql_legacy, for exactly the given URIs
   local urifile=$1
-  { echo "BEGIN; SET TRANSACTION READ ONLY; SET statement_timeout = '120s';"
+  { echo "BEGIN; SET statement_timeout = '120s';"  # (a temp table of URIs is created; the path issues no writes to public.* -- READ ONLY cannot be set because CREATE TEMP TABLE is refused in a read-only txn)
     echo "CREATE TEMP TABLE want_uris(uri text);"
     echo "COPY want_uris FROM STDIN WITH (FORMAT text);"
     cut -f1 "$urifile"
