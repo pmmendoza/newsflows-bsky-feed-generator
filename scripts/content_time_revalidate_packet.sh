@@ -454,6 +454,8 @@ cmd_prereg() {  # read-only helper for the ledger approval: cells at the given S
     local ctmp; ctmp=$(mktemp); psql_ro -c "$CREATED_SQL" >"$ctmp"
     cells+="createdat_extra=$(awk -F'|' -v pat="$pat" '$1 ~ "^"pat"$" {s+=$2} END{print s+0}' "$ctmp"),createdat_unchanged=$(awk -F'|' -v pat="$pat" '$1 ~ "^"pat"$" {s+=$3} END{print s+0}' "$ctmp")"; rm -f "$ctmp"
     echo "PREREG_${g^^}=$cells"; done
+  echo "--- per-feed population at the bounds (rkey|since|total|v2_valid|v2_invalid|v1_rows_with_raw|v1_rows_null_raw|legacy)"; psql_ro -c "$POP_SQL"
+  echo "--- per-feed predicted transitions (rkey|outcome|count)"; cat "$tmp"
   psql_ro -c "$SCOPE_SQL"; rm -f "$tmp"
 }
 
