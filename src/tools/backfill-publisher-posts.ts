@@ -101,6 +101,8 @@ type CliOptions = {
   pauseBaselineBytesPerSecond?: number
   noInsert: boolean
   windowField: 'createdAt' | 'indexedAt'
+  planFromDb: boolean
+  planLimit?: number
 }
 
 export type PublisherPostRecoveryProgress = {
@@ -226,6 +228,93 @@ export function normalizeAppViewPost(
       link_description: sanitizeForPostgres(embed?.description),
     }),
   }
+}
+
+// --- plan from the database (Belgium Step-2 recovery, 2026-08-18) ----------
+//
+// Instead of walking the author feed (which omits some posts and pages through
+// everything), build the plan from the rows that actually need recovery: the
+// actors' unclassified rows inside [since, until) by "indexedAt", fetched from
+// the AppView by URI (app.bsky.feed.getPosts, 25 URIs per call). Rows the
+// AppView no longer returns (deleted/taken down) are counted as unretrievable
+// and left untouched -- they are reported, never guessed.
+export type DbPlanOptions = {
+  actors: string[]
+  since: Date
+  until: Date
+  fetchPosts: (uris: string[]) => Promise<AppViewPost[]>
+  deadlineMs?: number
+  limit?: number
+}
+
+export type DbPlan = BackfillPlan & {
+  db_legacy_in_window: number
+  unretrievable: number
+  unretrievable_uri_sha256_sample: string[]
+  requests: number
+}
+
+export async function collectPublisherPostsFromDb(db: Database, options: DbPlanOptions): Promise<DbPlan> {
+  const rows = (await sql<{ uri: string; author: string }>`
+    SELECT uri, author FROM public.post
+    WHERE author = ANY(${options.actors}::text[])
+      AND "indexedAt" >= ${options.since.toISOString()} AND "indexedAt" < ${options.until.toISOString()}
+      AND created_at_source_raw IS NULL
+      AND (content_time_status IS NULL OR content_time_status = 'legacy_unknown')
+    ORDER BY uri
+    ${options.limit ? sql`LIMIT ${options.limit}` : sql``}
+  `.execute(db)).rows
+  const posts = new Map<string, BackfillPostRow>()
+  const byActor: BackfillPlan['by_actor'] = {}
+  for (const actor of options.actors) byActor[actor] = { scanned: 0, candidate_posts: 0, skipped_out_of_window: 0, skipped_wrong_author: 0 }
+  let scanned = 0
+  let skippedWrongAuthor = 0
+  let requests = 0
+  const unretrievable: string[] = []
+  const authorByUri = new Map(rows.map((row) => [row.uri, row.author]))
+  for (let offset = 0; offset < rows.length; offset += 25) {
+    if (options.deadlineMs !== undefined && Date.now() >= options.deadlineMs) {
+      throw new Error('publisher recovery collection exceeded its deadline')
+    }
+    const chunk = rows.slice(offset, offset + 25)
+    const returned = await options.fetchPosts(chunk.map((row) => row.uri))
+    requests += 1
+    const seen = new Set<string>()
+    for (const post of returned) {
+      scanned += 1
+      const expectedAuthor = post.uri ? authorByUri.get(post.uri) : undefined
+      if (!expectedAuthor) { skippedWrongAuthor += 1; continue }
+      const normalized = normalizeAppViewPost(post, expectedAuthor)
+      if (!normalized) { skippedWrongAuthor += 1; byActor[expectedAuthor].skipped_wrong_author += 1; continue }
+      seen.add(normalized.uri)
+      posts.set(normalized.uri, normalized)
+      byActor[expectedAuthor].scanned += 1
+      byActor[expectedAuthor].candidate_posts += 1
+    }
+    for (const row of chunk) if (!seen.has(row.uri)) unretrievable.push(row.uri)
+  }
+  return {
+    posts: [...posts.values()],
+    scanned,
+    skipped_out_of_window: 0,
+    skipped_wrong_author: skippedWrongAuthor,
+    by_actor: byActor,
+    db_legacy_in_window: rows.length,
+    unretrievable: unretrievable.length,
+    unretrievable_uri_sha256_sample: unretrievable.slice(0, 5).map(sha256),
+    requests,
+  }
+}
+
+async function fetchPostsByUri(apiBase: string, uris: string[], timeoutMs = 30_000): Promise<AppViewPost[]> {
+  const url = new URL('/xrpc/app.bsky.feed.getPosts', apiBase)
+  for (const uri of uris) url.searchParams.append('uris', uri)
+  const response = await fetch(url, { signal: AbortSignal.timeout(timeoutMs) })
+  if (!response.ok) {
+    throw new Error(`AppView getPosts failed: ${response.status} ${response.statusText}`)
+  }
+  const body: any = await response.json()
+  return (body.posts || []) as AppViewPost[]
 }
 
 export async function collectPublisherPosts(options: CollectOptions): Promise<BackfillPlan> {
@@ -1307,6 +1396,7 @@ function parseCliArgs(argv: string[]): CliOptions {
   let apply = false
   let json = false
   let noInsert = false
+  let planFromDb = false
 
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i]
@@ -1324,6 +1414,10 @@ function parseCliArgs(argv: string[]): CliOptions {
     }
     if (arg === '--no-insert') {
       noInsert = true
+      continue
+    }
+    if (arg === '--plan-from-db') {
+      planFromDb = true
       continue
     }
     if (!arg.startsWith('--')) throw new Error(`Unexpected positional argument: ${arg}`)
@@ -1371,6 +1465,14 @@ function parseCliArgs(argv: string[]): CliOptions {
   if (windowFieldRaw !== 'createdAt' && windowFieldRaw !== 'indexedAt') {
     throw new Error('--window-field must be createdAt or indexedAt')
   }
+  const planLimitRaw = flags.get('plan-limit')?.at(-1)
+  let planLimit: number | undefined
+  if (planLimitRaw !== undefined) {
+    planLimit = Number.parseInt(planLimitRaw, 10)
+    if (!Number.isInteger(planLimit) || String(planLimit) !== planLimitRaw.trim() || planLimit < 1) {
+      throw new Error('--plan-limit must be a positive integer')
+    }
+  }
 
   return {
     actors,
@@ -1387,6 +1489,8 @@ function parseCliArgs(argv: string[]): CliOptions {
     pauseBaselineBytesPerSecond,
     noInsert,
     windowField: windowFieldRaw,
+    planFromDb,
+    planLimit,
   }
 }
 
@@ -1650,21 +1754,39 @@ async function mainRecover(argv: string[]) {
   const startedAt = Date.now()
   const options = parseCliArgs(argv)
   const deadlineMs = startedAt + RECOVERY_LIMITS.maxDurationMs
-  const plan = await collectPublisherPosts({
-    actors: options.actors,
-    since: options.since,
-    until: options.until,
-    maxPagesPerActor: options.maxPagesPerActor,
-    deadlineMs,
-    windowField: options.windowField,
-    stopWhenPageBeforeSince: true,
-    fetchPage: (actor, cursor) => fetchAuthorFeedPage(
-      options.apiBase,
-      actor,
-      cursor,
-      Math.max(1, Math.min(30_000, deadlineMs - Date.now())),
-    ),
-  })
+  let plan: BackfillPlan | DbPlan
+  if (options.planFromDb) {
+    if (!options.dbUrl) throw new Error('--plan-from-db needs FEEDGEN_POSTGRES_URL or --db-url')
+    const db = createDb(options.dbUrl)
+    try {
+      plan = await collectPublisherPostsFromDb(db, {
+        actors: options.actors,
+        since: options.since,
+        until: options.until,
+        deadlineMs,
+        limit: options.planLimit,
+        fetchPosts: (uris) => fetchPostsByUri(options.apiBase, uris, Math.max(1, Math.min(30_000, deadlineMs - Date.now()))),
+      })
+    } finally {
+      await db.destroy()
+    }
+  } else {
+    plan = await collectPublisherPosts({
+      actors: options.actors,
+      since: options.since,
+      until: options.until,
+      maxPagesPerActor: options.maxPagesPerActor,
+      deadlineMs,
+      windowField: options.windowField,
+      stopWhenPageBeforeSince: true,
+      fetchPage: (actor, cursor) => fetchAuthorFeedPage(
+        options.apiBase,
+        actor,
+        cursor,
+        Math.max(1, Math.min(30_000, deadlineMs - Date.now())),
+      ),
+    })
+  }
 
   let recovery: PublisherPostRecoveryResult | null = null
   let preview: PublisherPostRecoveryPreview | null = null
@@ -1719,6 +1841,10 @@ async function mainRecover(argv: string[]) {
     until: options.until.toISOString(),
     window_field: options.windowField,
     no_insert: options.noInsert,
+    plan_source: options.planFromDb ? 'db-legacy-rows+getPosts' : 'author-feed',
+    ...('db_legacy_in_window' in plan
+      ? { db_legacy_in_window: plan.db_legacy_in_window, unretrievable: plan.unretrievable, unretrievable_uri_sha256_sample: plan.unretrievable_uri_sha256_sample, appview_requests: plan.requests }
+      : {}),
     scanned: plan.scanned,
     candidate_posts: plan.posts.length,
     skipped_out_of_window: plan.skipped_out_of_window,
