@@ -172,7 +172,7 @@ step preview bash "$runner" preview
 step apply_b1 bash "$runner" apply b1 1
 grep -q "batches=1 exit=3" "$E/ceiling-be-b1.txt" || { echo "b1 did not stop after one batch with exit 3"; exit 1; }
 grep -q "wal_batches_failing=0" "$E/ceiling-be-b1.txt" && grep -q "wal_batches_unpaid=0" "$E/ceiling-be-b1.txt" \
-  && grep -q "^batch=1 elapsed_ms=.* pause_owed_ms=[0-9]* pause_paid_ms=[0-9]* .* paid ok$" "$E/ceiling-be-b1.txt" \
+  && grep -q "^batch=1 elapsed_ms=.* pause_owed_ms=[0-9]* pause_paid_ms=[0-9]* .* paid ok relation_growth=[0-9]* rel_cap=[0-9]* rel_ok$" "$E/ceiling-be-b1.txt" \
   || { echo "b1 per-batch WAL rule / adaptive pause not evaluated"; cat "$E/ceiling-be-b1.txt"; exit 1; }
 # the adaptive pause must have been PAID: pause_paid_ms >= pause_owed_ms = max(1 s, LSN advance / idle baseline) -- on the idle disposable DB that is ~2 minutes per batch
 [[ $(sed -n 's/^batch=1 .* pause_owed_ms=\([0-9]*\) pause_paid_ms=\([0-9]*\) .*/\1 \2/p' "$E/ceiling-be-b1.txt" | awk '{print ($2>=$1 && $1>1000)?"yes":"no"}') == "yes" ]] \
@@ -180,7 +180,7 @@ grep -q "wal_batches_failing=0" "$E/ceiling-be-b1.txt" && grep -q "wal_batches_u
 # NEGATIVE: floor 1 B and multiple 0.5 -> the ceiling is half the estate's rate x (elapsed + paid pause) while the batch wrote ~1x -> BREACH must stop the invocation (non-zero exit)
 set +e; CEIL_WAL_FLOOR_BYTES=1 CEIL_WAL_BASELINE_MULTIPLE=0.5 bash "$runner" apply neg 1; rc=$?; set -e
 [[ $rc -ne 0 ]] || { echo "negative apply (floor=1) should have stopped on BREACH"; exit 1; }
-grep -q "verdict=BREACH" "$E/ceiling-be-neg.txt" && grep -q "wal_batches_failing=1" "$E/ceiling-be-neg.txt" && grep -q "^batch=1 .* paid BREACH$" "$E/ceiling-be-neg.txt" \
+grep -q "verdict=BREACH" "$E/ceiling-be-neg.txt" && grep -q "wal_batches_failing=1" "$E/ceiling-be-neg.txt" && grep -q "^batch=1 .* paid BREACH relation_growth=.*$" "$E/ceiling-be-neg.txt" \
   || { echo "negative apply receipt does not show the per-batch BREACH"; cat "$E/ceiling-be-neg.txt"; exit 1; }
 step apply_full bash "$runner" apply full
 # the remaining 240 rows (1,240 - 500 - 500) fit in one batch of this invocation; recovery.recovered is per-invocation, not cumulative
