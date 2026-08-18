@@ -76,7 +76,7 @@ step preview_main bash "$runner" preview main
 step preview_be bash "$runner" preview be
 step apply_main_b1 bash "$runner" apply main b1 1
 grep -q "batches=1 exit=3" "$E/ceiling-main-b1.txt" || { echo "b1 did not stop after one batch with exit 3"; exit 1; }
-grep -q "wal_source=tool_in_transaction" "$E/ceiling-main-b1.txt" || { echo "b1 verdict not from the tool's in-transaction WAL"; exit 1; }
+grep -q "wal_batches_failing=0" "$E/ceiling-main-b1.txt" && grep -q "^batch=1 elapsed_ms=" "$E/ceiling-main-b1.txt" || { echo "b1 per-batch WAL rule not evaluated"; exit 1; }
 step apply_main_full bash "$runner" apply main full
 grep -q "exit=0" "$E/ceiling-main-full.txt" || { echo "full apply did not exit 0"; exit 1; }
 step apply_be_full bash "$runner" apply be full
