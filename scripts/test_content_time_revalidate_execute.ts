@@ -465,6 +465,12 @@ async function main() {
     })
     assert.equal(pauseLimited.complete, true)
     assert(pauseLimited.elapsed_ms >= 1000, '1s inter-batch pause was not enforced')
+    // Adaptive pause (D4-b): every batch records pause_ms/pause_required_ms; with a
+    // baseline of 1 B/s the required pause is wal_bytes seconds and is clipped by the
+    // hard deadline; with an astronomically high baseline it collapses to pauseMs.
+    for (const b of pauseLimited.batches) {
+      assert(typeof b.pause_ms === 'number' && b.pause_ms >= 0 && b.pause_required_ms === (b.candidates > 0 ? 1000 : 0), 'fixed pause must be recorded per batch')
+    }
 
     await assert.rejects(
       runContentTimeRevalidation(db, {

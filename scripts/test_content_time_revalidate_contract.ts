@@ -253,6 +253,13 @@ console.log('receipt raw-free shape checks passed')
   // Both flags combine cleanly with the rest of the existing surface.
   const combined = parseRevalidateCliArgs(['--apply', '--packet-sha256', validSha, '--max-batches', '1', '--json'])
   check(combined.apply === true && combined.json === true && combined.packetSha256 === validSha && combined.maxBatches === 1, 'flags must combine without interference')
+  // --pause-baseline-bytes-per-s (adaptive inter-batch pause, D4-b): optional, positive integer bytes/s.
+  check(bare.pauseBaselineBytesPerSecond === undefined, 'pause baseline defaults to unset (fixed pause)')
+  const withPause = parseRevalidateCliArgs(['--pause-baseline-bytes-per-s', '3041841'])
+  check(withPause.pauseBaselineBytesPerSecond === 3041841, '--pause-baseline-bytes-per-s must be captured as a number')
+  for (const bad of ['0', '-5', '1.5', 'abc', ' ']) {
+    check(throws(() => parseRevalidateCliArgs(['--pause-baseline-bytes-per-s', bad])), `--pause-baseline-bytes-per-s must reject: ${JSON.stringify(bad)}`)
+  }
 }
 
 function throws(fn: () => unknown): boolean {
