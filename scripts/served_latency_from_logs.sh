@@ -4,6 +4,7 @@
 # Pairs each request line with the next retrieved line for the same rkey (single-flight per feed in practice; a
 # request without a following retrieval within MAX_PAIR_MS is counted as unpaired, never guessed).
 # Usage: served_latency_from_logs.sh <since-docker-duration|RFC3339> <rkey,...> [p95_max_ms=5000] [abs_max_ms=8000] [min_samples=30]
+# NOTE: pass min_samples=1 for an in-window battery gate on p95/max only; the >=30-sample D5 count accrues and is reported.
 # Output: JSON to stdout {schema_version, generated_at, since, requirements, feeds:{rkey:{samples,p50_ms,p95_ms,max_ms,unpaired,pass}}, all_pass}
 set -euo pipefail
 SINCE=${1:?since}; RKEYS=${2:?rkeys}; P95=${3:-5000}; MAXMS=${4:-8000}; MINS=${5:-30}
