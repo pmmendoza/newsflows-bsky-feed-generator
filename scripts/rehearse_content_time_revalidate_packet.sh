@@ -107,7 +107,7 @@ set +e; bash "$runner" restore main; rc=$?; set -e
 [[ "$(cat "$E/restore-main-cursor.txt")" == "501" ]] || { echo "cursor should point at 501 after the failed batch"; exit 1; }
 sleep 26
 step restore_main_resume bash "$runner" restore main
-[[ -f "$E/restore-main-rows-501-1000-attempt-2.txt" && -f "$E/restore-main-rows-2001-2120-attempt-2.txt" ]] || { echo "resume did not produce attempt-2 receipts for rows 501-1000 … 2001-2120"; exit 1; }
+[[ -f "$E/restore-main-rows-501-1000-attempt-2.txt" && -f "$E/restore-main-rows-2001-2120-attempt-1.txt" ]] || { echo "resume did not produce attempt-2 receipts for rows 501-1000 … 2001-2120"; exit 1; }
 step restore_be bash "$runner" restore be
 grep -q "identical_to_prestate" "$E/restore-main-result-attempt-1.txt" && grep -q "identical_to_prestate" "$E/restore-be-result-attempt-1.txt" || { echo "restore not identical"; exit 1; }
 # a no-op re-run of a completed restore must still produce a fresh attempt-2 verification receipt (post-loop path resume-safe)
