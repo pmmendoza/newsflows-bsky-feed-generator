@@ -24,7 +24,8 @@ pub_a="did:plc:revalidate-rehearsal-publisher-a"; pub_b="did:plc:revalidate-rehe
 rehearsal_pw="rehearsal-not-a-real-secret-8f2c"
 psql() { "${D[@]}" exec -i "$container" psql -U feedgen -d feedgen_revalidate_rehearsal -X -A -F '|' -v ON_ERROR_STOP=1 "$@"; }
 
-# Seed fresh in-window v1 rows: 620 for publisher A (600 valid + 10 past_bound + 10 future-skew), 40 for publisher B (30/5/5);
+# Seed fresh in-window v1 rows: 2,120 for publisher A (2,100 valid + 10 past_bound + 10 future-skew) so one apply invocation
+# has >= 2 batches of 500 (V11 round-10 P2-1), 40 for publisher B (30/5/5);
 # give the disposable DB a distinct password so the secret scan is meaningful.
 psql <<SQL >/dev/null
 ALTER USER feedgen PASSWORD '$rehearsal_pw';
@@ -35,10 +36,10 @@ SELECT 'at://'||a||'/app.bsky.feed.post/pk-'||lpad(g::text,4,'0'),'cid-pk-'||a||
  CASE k WHEN 'v' THEN convert_to('2026-08-13T09:00:00+00:00','UTF8') WHEN 'pb' THEN convert_to('2020-01-01T00:00:00+00:00','UTF8') ELSE convert_to('2026-08-13T11:00:00+00:00','UTF8') END,
  CASE k WHEN 'v' THEN '2026-08-13T09:00:00.000Z' WHEN 'pb' THEN NULL ELSE '2026-08-13T11:00:00.000Z' END,
  CASE k WHEN 'pb' THEN 'source_invalid' ELSE 'source_valid' END, CASE k WHEN 'pb' THEN 'past_bound' ELSE NULL END,'newsflows-content-time/v1'
-FROM (SELECT '$pub_a' AS a, g, CASE WHEN g<=600 THEN 'v' WHEN g<=610 THEN 'pb' ELSE 'fs' END AS k FROM generate_series(1,620) g
+FROM (SELECT '$pub_a' AS a, g, CASE WHEN g<=2100 THEN 'v' WHEN g<=2110 THEN 'pb' ELSE 'fs' END AS k FROM generate_series(1,2120) g
       UNION ALL SELECT '$pub_b', g, CASE WHEN g<=30 THEN 'v' WHEN g<=35 THEN 'pb' ELSE 'fs' END FROM generate_series(1,40) g) x;
 SQL
-echo "status=seeded a=620 b=40"
+echo "status=seeded a=2120 b=40"
 
 db_ip=$("${D[@]}" inspect "$container" --format '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}')
 envfile=$(mktemp); chmod 600 "$envfile"
@@ -63,20 +64,29 @@ export EXPECTED_TOOL_REFS="bsky-ops=$(tool_ref bsky-ops),blueskyranker=$(tool_re
 export PREREG_MAIN=placeholder PREREG_BE=placeholder
 prereg_out=$(bash "$runner" prereg); echo "$prereg_out" | sed 's/^/prereg: /'
 export PREREG_MAIN="$(echo "$prereg_out" | sed -n 's/^PREREG_MAIN=//p')" PREREG_BE="$(echo "$prereg_out" | sed -n 's/^PREREG_BE=//p')"
-[[ "$PREREG_MAIN" == "v1_valid_to_v2_valid=600,v1_invalid_to_v2_valid=10,v1_to_v2_invalid=10,createdat_extra=0,createdat_unchanged=0" ]] || { echo "prereg main cells unexpected: $PREREG_MAIN"; exit 1; }
+[[ "$PREREG_MAIN" == "v1_valid_to_v2_valid=2100,v1_invalid_to_v2_valid=10,v1_to_v2_invalid=10,createdat_extra=0,createdat_unchanged=0" ]] || { echo "prereg main cells unexpected: $PREREG_MAIN"; exit 1; }
 [[ "$PREREG_BE" == "v1_valid_to_v2_valid=30,v1_invalid_to_v2_valid=5,v1_to_v2_invalid=5,createdat_extra=0,createdat_unchanged=0" ]] || { echo "prereg be cells unexpected: $PREREG_BE"; exit 1; }
 rb=$(mktemp); now=$(date -u +%s); printf '{"schema_version":"bsr.ops.effective_config.readback.v1","raw_values_in_output":false,"artifact_metadata":{"generated_at":%s,"stale_at":%s},"bindings":{"reh-a":{"feed_ids":["newsflow-zz-1a"],"push_window_days":10,"time_column":"createdAt"},"reh-b":{"feed_ids":["newsflow-zz-1b"],"push_window_days":10,"time_column":"createdAt"}}}\n' "$now" "$((now+3600))" >"$rb"
 export READBACK_JSON="$rb"
 
 step() { echo "status=$1"; shift; "$@"; }
 step preflight bash "$runner" preflight
-[[ $(wc -l <"$E/step1-main-prestate-rows.tsv") -eq 620 && $(wc -l <"$E/step1-be-prestate-rows.tsv") -eq 40 ]] || { echo "prestate snapshot counts unexpected"; exit 1; }
+[[ $(wc -l <"$E/step1-main-prestate-rows.tsv") -eq 2120 && $(wc -l <"$E/step1-be-prestate-rows.tsv") -eq 40 ]] || { echo "prestate snapshot counts unexpected"; exit 1; }
 grep -q "^feedgen_retention_enabled=unset$\|^feedgen_retention_enabled=false$\|^feedgen_retention_enabled=0$" "$E/source-set.txt" || { echo "retention gate not recorded as disabled"; exit 1; }
 step preview_main bash "$runner" preview main
 step preview_be bash "$runner" preview be
 step apply_main_b1 bash "$runner" apply main b1 1
 grep -q "batches=1 exit=3" "$E/ceiling-main-b1.txt" || { echo "b1 did not stop after one batch with exit 3"; exit 1; }
 grep -q "wal_batches_failing=0" "$E/ceiling-main-b1.txt" && grep -q "^batch=1 elapsed_ms=" "$E/ceiling-main-b1.txt" || { echo "b1 per-batch WAL rule not evaluated"; exit 1; }
+# NEGATIVE: floor 1 B and multiple 1.0 on the idle DB -> the batch's own attributed WAL exceeds its ceiling -> BREACH must stop the invocation (non-zero exit)
+set +e; CEIL_WAL_FLOOR_BYTES=1 bash "$runner" apply main neg 1; rc=$?; set -e
+[[ $rc -ne 0 ]] || { echo "negative apply (floor=1) should have stopped on BREACH"; exit 1; }
+grep -q "verdict=BREACH" "$E/ceiling-main-neg.txt" && grep -q "wal_batches_failing=1" "$E/ceiling-main-neg.txt" && grep -q "^batch=1 .* BREACH$" "$E/ceiling-main-neg.txt" || { echo "negative apply receipt does not show the per-batch BREACH"; cat "$E/ceiling-main-neg.txt"; exit 1; }
+# MULTI-BATCH + baseline-scaled branch governing: floor 1 B, multiple 1000 -> ceiling = 1000 x idle baseline x (elapsed+1s) (a few MB) > per-batch attributed WAL; 2 batches
+step apply_main_b2 env CEIL_WAL_FLOOR_BYTES=1 CEIL_WAL_BASELINE_MULTIPLE=1000 bash "$runner" apply main b2 2
+grep -q "batches=2 exit=3" "$E/ceiling-main-b2.txt" && [[ $(grep -c "^batch=[0-9]* elapsed_ms=" "$E/ceiling-main-b2.txt") -eq 2 ]] || { echo "b2 did not run exactly two batches"; cat "$E/ceiling-main-b2.txt"; exit 1; }
+grep -q "wal_batches_failing=0" "$E/ceiling-main-b2.txt" && ! grep -q "ceiling=614400 " "$E/ceiling-main-b2.txt" && ! grep -q "ceiling=1 " "$E/ceiling-main-b2.txt" || { echo "b2 baseline-scaled branch did not govern both batches"; cat "$E/ceiling-main-b2.txt"; exit 1; }
+[[ $(grep "^batch=" "$E/ceiling-main-b2.txt" | sed 's/.*elapsed_ms=\([0-9]*\).*/\1/' | sort -u | wc -l) -ge 1 ]]
 step apply_main_full bash "$runner" apply main full
 grep -q "exit=0" "$E/ceiling-main-full.txt" || { echo "full apply did not exit 0"; exit 1; }
 step apply_be_full bash "$runner" apply be full
@@ -84,25 +94,25 @@ step apply_be_full bash "$runner" apply be full
 step readback bash "$runner" readback
 grep -q "prestate_missing_in_poststate=0" "$E/step1-main-diff-attempt-1.txt" || { echo "readback diff main not closed"; exit 1; }
 # readback must be re-runnable even after a FAILED attempt (files of the failed attempt stay; the next attempt gets a new suffix)
-set +e; PREREG_MAIN="v1_valid_to_v2_valid=600,v1_invalid_to_v2_valid=10,v1_to_v2_invalid=11,createdat_extra=0,createdat_unchanged=0" bash "$runner" readback >/dev/null 2>&1; rc=$?; set -e
+set +e; PREREG_MAIN="v1_valid_to_v2_valid=2100,v1_invalid_to_v2_valid=10,v1_to_v2_invalid=11,createdat_extra=0,createdat_unchanged=0" bash "$runner" readback >/dev/null 2>&1; rc=$?; set -e
 [[ $rc -ne 0 && -f "$E/step1-main-preview-after-attempt-2.json" && ! -f "$E/readback-attempt-2.txt" ]] || { echo "forced readback failure did not behave (rc=$rc)"; exit 1; }
 step readback_after_failure bash "$runner" readback
 [[ -f "$E/readback-attempt-3.txt" ]] || { echo "readback attempt-3 receipt missing"; exit 1; }
-# genuine mid-restore failure: hold a row lock on a row of batch 2 (rows 501-620) so lock_timeout=5s fires, then resume after release
+# genuine mid-restore failure: hold a row lock on a row of batch 2 (rows 501-1000) so lock_timeout=5s fires, then resume after release
 lock_uri=$(sed -n '510p' "$E/step1-main-prestate-rows.tsv" | cut -f1)
 ( "${D[@]}" exec -i "$container" psql -U feedgen -d feedgen_revalidate_rehearsal -X -q -v ON_ERROR_STOP=1 -c "BEGIN; SELECT uri FROM post WHERE uri='$lock_uri' FOR UPDATE; SELECT pg_sleep(25); COMMIT;" >/dev/null 2>&1 & ) ; sleep 2
 set +e; bash "$runner" restore main; rc=$?; set -e
 [[ $rc -ne 0 ]] || { echo "restore should have failed on the held lock"; exit 1; }
-[[ -f "$E/restore-main-rows-1-500-attempt-1.txt" && -f "$E/restore-main-rows-501-620-attempt-1.txt" ]] || { echo "restore receipts by row range missing after failure"; ls "$E" | grep restore || true; exit 1; }
+[[ -f "$E/restore-main-rows-1-500-attempt-1.txt" && -f "$E/restore-main-rows-501-1000-attempt-1.txt" ]] || { echo "restore receipts by row range missing after failure"; ls "$E" | grep restore || true; exit 1; }
 [[ "$(cat "$E/restore-main-cursor.txt")" == "501" ]] || { echo "cursor should point at 501 after the failed batch"; exit 1; }
 sleep 26
 step restore_main_resume bash "$runner" restore main
-[[ -f "$E/restore-main-rows-501-620-attempt-2.txt" ]] || { echo "resume did not produce attempt-2 receipt for rows 501-620"; exit 1; }
+[[ -f "$E/restore-main-rows-501-1000-attempt-2.txt" && -f "$E/restore-main-rows-2001-2120-attempt-2.txt" ]] || { echo "resume did not produce attempt-2 receipts for rows 501-1000 … 2001-2120"; exit 1; }
 step restore_be bash "$runner" restore be
 grep -q "identical_to_prestate" "$E/restore-main-result-attempt-1.txt" && grep -q "identical_to_prestate" "$E/restore-be-result-attempt-1.txt" || { echo "restore not identical"; exit 1; }
 # a no-op re-run of a completed restore must still produce a fresh attempt-2 verification receipt (post-loop path resume-safe)
 step restore_main_noop_rerun bash "$runner" restore main
-[[ -f "$E/restore-main-result-attempt-2.txt" ]] && grep -q "identical_to_prestate rows=620 batches_this_run=0 attempt=2" "$E/restore-main-result-attempt-2.txt" || { echo "no-op restore re-run receipt missing/wrong"; exit 1; }
+[[ -f "$E/restore-main-result-attempt-2.txt" ]] && grep -q "identical_to_prestate rows=2120 batches_this_run=0 attempt=2" "$E/restore-main-result-attempt-2.txt" || { echo "no-op restore re-run receipt missing/wrong"; exit 1; }
 step control bash "$runner" control
 [[ -f "$E/pg-control-2.txt" ]] || { echo "second control read missing"; exit 1; }
 step secret_scan bash "$runner" secret-scan
