@@ -63,8 +63,8 @@ export EXPECTED_TOOL_REFS="bsky-ops=$(tool_ref bsky-ops),blueskyranker=$(tool_re
 export PREREG_MAIN=placeholder PREREG_BE=placeholder
 prereg_out=$(bash "$runner" prereg); echo "$prereg_out" | sed 's/^/prereg: /'
 export PREREG_MAIN="$(echo "$prereg_out" | sed -n 's/^PREREG_MAIN=//p')" PREREG_BE="$(echo "$prereg_out" | sed -n 's/^PREREG_BE=//p')"
-[[ "$PREREG_MAIN" == "v1_valid_to_v2_valid=600,v1_invalid_to_v2_valid=10,v1_to_v2_invalid=10,createdat_extra=0" ]] || { echo "prereg main cells unexpected: $PREREG_MAIN"; exit 1; }
-[[ "$PREREG_BE" == "v1_valid_to_v2_valid=30,v1_invalid_to_v2_valid=5,v1_to_v2_invalid=5,createdat_extra=0" ]] || { echo "prereg be cells unexpected: $PREREG_BE"; exit 1; }
+[[ "$PREREG_MAIN" == "v1_valid_to_v2_valid=600,v1_invalid_to_v2_valid=10,v1_to_v2_invalid=10,createdat_extra=0,createdat_unchanged=0" ]] || { echo "prereg main cells unexpected: $PREREG_MAIN"; exit 1; }
+[[ "$PREREG_BE" == "v1_valid_to_v2_valid=30,v1_invalid_to_v2_valid=5,v1_to_v2_invalid=5,createdat_extra=0,createdat_unchanged=0" ]] || { echo "prereg be cells unexpected: $PREREG_BE"; exit 1; }
 rb=$(mktemp); now=$(date -u +%s); printf '{"schema_version":"bsr.ops.effective_config.readback.v1","raw_values_in_output":false,"artifact_metadata":{"generated_at":%s,"stale_at":%s},"bindings":{"reh-a":{"feed_ids":["newsflow-zz-1a"],"push_window_days":10,"time_column":"createdAt"},"reh-b":{"feed_ids":["newsflow-zz-1b"],"push_window_days":10,"time_column":"createdAt"}}}\n' "$now" "$((now+3600))" >"$rb"
 export READBACK_JSON="$rb"
 
@@ -84,7 +84,7 @@ step apply_be_full bash "$runner" apply be full
 step readback bash "$runner" readback
 grep -q "prestate_missing_in_poststate=0" "$E/step1-main-diff-attempt-1.txt" || { echo "readback diff main not closed"; exit 1; }
 # readback must be re-runnable even after a FAILED attempt (files of the failed attempt stay; the next attempt gets a new suffix)
-set +e; PREREG_MAIN="v1_valid_to_v2_valid=600,v1_invalid_to_v2_valid=10,v1_to_v2_invalid=11,createdat_extra=0" bash "$runner" readback >/dev/null 2>&1; rc=$?; set -e
+set +e; PREREG_MAIN="v1_valid_to_v2_valid=600,v1_invalid_to_v2_valid=10,v1_to_v2_invalid=11,createdat_extra=0,createdat_unchanged=0" bash "$runner" readback >/dev/null 2>&1; rc=$?; set -e
 [[ $rc -ne 0 && -f "$E/step1-main-preview-after-attempt-2.json" && ! -f "$E/readback-attempt-2.txt" ]] || { echo "forced readback failure did not behave (rc=$rc)"; exit 1; }
 step readback_after_failure bash "$runner" readback
 [[ -f "$E/readback-attempt-3.txt" ]] || { echo "readback attempt-3 receipt missing"; exit 1; }
@@ -99,7 +99,10 @@ sleep 26
 step restore_main_resume bash "$runner" restore main
 [[ -f "$E/restore-main-rows-501-620-attempt-2.txt" ]] || { echo "resume did not produce attempt-2 receipt for rows 501-620"; exit 1; }
 step restore_be bash "$runner" restore be
-grep -q "identical_to_prestate" "$E/restore-main-result.txt" && grep -q "identical_to_prestate" "$E/restore-be-result.txt" || { echo "restore not identical"; exit 1; }
+grep -q "identical_to_prestate" "$E/restore-main-result-attempt-1.txt" && grep -q "identical_to_prestate" "$E/restore-be-result-attempt-1.txt" || { echo "restore not identical"; exit 1; }
+# a no-op re-run of a completed restore must still produce a fresh attempt-2 verification receipt (post-loop path resume-safe)
+step restore_main_noop_rerun bash "$runner" restore main
+[[ -f "$E/restore-main-result-attempt-2.txt" ]] && grep -q "identical_to_prestate rows=620 batches_this_run=0 attempt=2" "$E/restore-main-result-attempt-2.txt" || { echo "no-op restore re-run receipt missing/wrong"; exit 1; }
 step control bash "$runner" control
 [[ -f "$E/pg-control-2.txt" ]] || { echo "second control read missing"; exit 1; }
 step secret_scan bash "$runner" secret-scan
