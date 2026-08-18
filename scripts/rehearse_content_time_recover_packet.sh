@@ -150,7 +150,7 @@ export E TREE="$repo_root" RUNNER=host \
 export EXPECTED_IMAGE_CT_SHA256="$EXPECTED_CT_SHA256"   # unused: SKIP_LIVE_IMAGE_CHECKS=1 never reads this
 export SKIP_LIVE_IMAGE_CHECKS=1
 export EXPECTED_TOOL_REFS="bsky-ops=rehearsal,blueskyranker=rehearsal,newsflows-bskyhealth=rehearsal"   # unused under SKIP_LIVE_IMAGE_CHECKS=1
-export RECOVER_DIDS="$pub_did" RECOVER_RKEY_PATTERN='newsflow-zz-.*' HORIZON_DAYS=10 SINCE UNTIL EXPECTED_RKEYS=newsflow-zz-2a
+export RECOVER_DIDS="$pub_did" RECOVER_RKEY_PATTERN='newsflow-zz-.*' HORIZON_DAYS=10 SINCE UNTIL EXPECTED_RKEYS=newsflow-zz-2a PERMIT_NEGATIVE_PROBE=1
 export API_BASE="http://127.0.0.1:${mock_port}"
 export PACKET_SHA="$(printf '2%.0s' $(seq 1 64))"
 rb=$(mktemp); now=$(date -u +%s)
