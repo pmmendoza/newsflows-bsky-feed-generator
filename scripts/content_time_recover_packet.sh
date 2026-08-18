@@ -63,6 +63,8 @@ SUBCMD="${1:-}"
 : "${EXPECTED_IMAGE_CT_SHA256:?EXPECTED_IMAGE_CT_SHA256 (validator module hash inside the live image) is required}"
 : "${PACKET_SHA:?PACKET_SHA (approved packet SHA-256) is required}"
 : "${EXPECTED_TOOL_REFS:?EXPECTED_TOOL_REFS (bsky-ops=<sha>,blueskyranker=<sha>,newsflows-bskyhealth=<sha>) is required}"
+: "${EXPECTED_RUNNER_SHA256:?EXPECTED_RUNNER_SHA256 (SHA-256 of this runner script as frozen in the packet) is required}"
+: "${EXPECTED_DSN_HELPER_SHA256:?EXPECTED_DSN_HELPER_SHA256 (SHA-256 of scripts/compose_feedgen_dsn.js) is required}"
 : "${RECOVER_DIDS:?RECOVER_DIDS (comma list of publisher DIDs) is required}"
 : "${RECOVER_RKEY_PATTERN:?RECOVER_RKEY_PATTERN (regex over feedgen_ops.feed_catalog.rkey) is required}"
 : "${HORIZON_DAYS:?HORIZON_DAYS is required}"
@@ -123,8 +125,24 @@ assert_tree() {  # hard integrity gate, run by preflight/apply/restore
   local d1 d2; d1=$(sha256sum "$TREE/dist/tools/backfill-publisher-posts.js" | cut -d' ' -f1); d2=$(sha256sum "$TREE/dist/util/content-time.js" | cut -d' ' -f1)
   [[ "$d1" == "$EXPECTED_DIST_SHA256" ]] || die "dist backfill hash $d1 != expected"
   [[ "$d2" == "$EXPECTED_CT_SHA256" ]] || die "dist content-time hash $d2 != expected"
+  # the script that is actually executing (not merely the tree copy) and the DSN helper must be the frozen ones
+  local r0 r1 h1; r0=$(sha256sum "${BASH_SOURCE[0]}" | cut -d' ' -f1); r1=$(sha256sum "$TREE/scripts/content_time_recover_packet.sh" | cut -d' ' -f1); h1=$(sha256sum "$TREE/scripts/compose_feedgen_dsn.js" | cut -d' ' -f1)
+  [[ "$r0" == "$EXPECTED_RUNNER_SHA256" && "$r1" == "$EXPECTED_RUNNER_SHA256" ]] || die "runner script hash (executing $r0 / tree $r1) != EXPECTED_RUNNER_SHA256 $EXPECTED_RUNNER_SHA256"
+  [[ "$h1" == "$EXPECTED_DSN_HELPER_SHA256" ]] || die "DSN helper hash $h1 != EXPECTED_DSN_HELPER_SHA256"
 }
-latest_control() { ls -1 "$E"/pg-control-*.txt 2>/dev/null | sort | tail -1; }
+# every subcommand after preflight must run with the SAME bound values preflight recorded (no re-binding of SINCE/UNTIL/
+# PREREG/PACKET_SHA/DIDs/pattern/horizon between invocations -- a readback with a narrowed window or re-bound cells is not a readback)
+assert_bound_env() {
+  local ss="$E/source-set.txt"; [[ -f "$ss" ]] || die "no source-set.txt in $E -- run preflight first"
+  local k v exp
+  for k in since until prereg packet_sha256 recover_dids recover_rkey_pattern horizon_days api_base; do
+    case "$k" in since) v=$SINCE;; until) v=$UNTIL;; prereg) v=$PREREG;; packet_sha256) v=$PACKET_SHA;; recover_dids) v=$RECOVER_DIDS;; recover_rkey_pattern) v=$RECOVER_RKEY_PATTERN;; horizon_days) v=$HORIZON_DAYS;; api_base) v=$API_BASE;; esac
+    exp=$(sed -n "s/^$k=//p" "$ss" | head -1)
+    [[ -n "$exp" ]] || die "source-set.txt lacks $k"
+    [[ "$exp" == "$v" ]] || die "bound-value mismatch for $k: preflight recorded '$exp', this invocation has '$v' -- STOP (values may not be re-bound between invocations)"
+  done
+}
+latest_control() { ls -1 "$E"/pg-control-*.txt 2>/dev/null | sort -V | tail -1; }
 control_rates() {  # prints "wal_per_s rel_per_s dead_per_s" from the latest control file (clamped at 0)
   local f; f=$(latest_control); [[ -n "$f" ]] || die "no control read yet"
   awk -F'|' '/^read1 /{sub(/^read1 /,""); w1=$1; r1=$2; d1=$3; t1=$5} /^read2 /{sub(/^read2 /,""); w2=$1; r2=$2; d2=$3; t2=$5}
@@ -168,7 +186,7 @@ run_tool_scratch() {  # run_tool_scratch <dir> <outname> <tool args...>  -> <dir
 }
 jsonq() { node -e 'const j=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8"));const v=process.argv[2].split(".").reduce((a,k)=>a==null?a:a[k],j);console.log(v===undefined||v===null?"":(typeof v==="object"?JSON.stringify(v):v))' "$1" "$2"; }
 
-CATALOG_SQL="SELECT rkey, publisher_did, publisher_post_max_age_days FROM feedgen_ops.feed_catalog WHERE enabled AND rkey ~ '$RECOVER_RKEY_PATTERN' ORDER BY 1;"
+CATALOG_SQL="SELECT rkey, publisher_did, publisher_post_max_age_days, publisher_time_clock FROM feedgen_ops.feed_catalog WHERE enabled AND rkey ~ '^($RECOVER_RKEY_PATTERN)$' ORDER BY 1;"
 POP_SQL="SELECT c.rkey,
  count(*) FILTER (WHERE p.\"indexedAt\" >= '$SINCE' AND p.\"indexedAt\" < '$UNTIL') AS total,
  count(*) FILTER (WHERE p.\"indexedAt\" >= '$SINCE' AND p.\"indexedAt\" < '$UNTIL' AND p.content_time_status='source_valid' AND p.content_time_validator_version='$V2') AS v2_valid,
@@ -176,14 +194,17 @@ POP_SQL="SELECT c.rkey,
  count(*) FILTER (WHERE p.\"indexedAt\" >= '$SINCE' AND p.\"indexedAt\" < '$UNTIL' AND p.content_time_validator_version='$V1') AS v1,
  count(*) FILTER (WHERE p.\"indexedAt\" >= '$SINCE' AND p.\"indexedAt\" < '$UNTIL' AND p.created_at_source_raw IS NULL AND (p.content_time_status IS NULL OR p.content_time_status='legacy_unknown')) AS legacy
 FROM feedgen_ops.feed_catalog c JOIN post p ON p.author = c.publisher_did
-WHERE c.enabled AND c.rkey ~ '$RECOVER_RKEY_PATTERN'
+WHERE c.enabled AND c.rkey ~ '^($RECOVER_RKEY_PATTERN)$'
 GROUP BY c.rkey ORDER BY c.rkey;"
 SCOPE_SQL="SELECT 'legacy_in_window', count(*) FROM public.post p WHERE p.author = ANY($(sql_array "$RECOVER_DIDS")::text[]) AND p.\"indexedAt\" >= '$SINCE' AND p.\"indexedAt\" < '$UNTIL' AND p.created_at_source_raw IS NULL AND (p.content_time_status IS NULL OR p.content_time_status='legacy_unknown')
 UNION ALL SELECT 'legacy_outside_window', count(*) FROM public.post p WHERE p.author = ANY($(sql_array "$RECOVER_DIDS")::text[]) AND NOT (p.\"indexedAt\" >= '$SINCE' AND p.\"indexedAt\" < '$UNTIL') AND p.created_at_source_raw IS NULL AND (p.content_time_status IS NULL OR p.content_time_status='legacy_unknown')
-UNION ALL SELECT 'legacy_all_time', count(*) FROM public.post p WHERE p.author = ANY($(sql_array "$RECOVER_DIDS")::text[]) AND p.created_at_source_raw IS NULL AND (p.content_time_status IS NULL OR p.content_time_status='legacy_unknown');"
+UNION ALL SELECT 'legacy_all_time', count(*) FROM public.post p WHERE p.author = ANY($(sql_array "$RECOVER_DIDS")::text[]) AND p.created_at_source_raw IS NULL AND (p.content_time_status IS NULL OR p.content_time_status='legacy_unknown')
+UNION ALL SELECT 'legacy_after_until', count(*) FROM public.post p WHERE p.author = ANY($(sql_array "$RECOVER_DIDS")::text[]) AND p.\"indexedAt\" >= '$UNTIL' AND p.created_at_source_raw IS NULL AND (p.content_time_status IS NULL OR p.content_time_status='legacy_unknown')
+UNION ALL SELECT 'wrong_version_in_rolling_horizon', count(*) FROM public.post p WHERE p.author = ANY($(sql_array "$RECOVER_DIDS")::text[]) AND p.\"indexedAt\" >= to_char(now() at time zone 'utc' - interval '$HORIZON_DAYS days', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"') AND p.\"indexedAt\" < '$UNTIL' AND NOT (p.created_at_source_raw IS NULL AND (p.content_time_status IS NULL OR p.content_time_status='legacy_unknown')) AND (p.content_time_validator_version IS DISTINCT FROM 'newsflows-content-time/v2')
+UNION ALL SELECT 'unclassified_or_wrong_version_in_rolling_horizon_after_until', count(*) FROM public.post p WHERE p.author = ANY($(sql_array "$RECOVER_DIDS")::text[]) AND p.\"indexedAt\" >= '$UNTIL' AND (p.content_time_validator_version IS DISTINCT FROM 'newsflows-content-time/v2');"
 PREREG_RKEY_SQL="SELECT c.rkey, count(*) AS legacy_in_window
 FROM feedgen_ops.feed_catalog c JOIN post p ON p.author = c.publisher_did
-WHERE c.enabled AND c.rkey ~ '$RECOVER_RKEY_PATTERN'
+WHERE c.enabled AND c.rkey ~ '^($RECOVER_RKEY_PATTERN)$'
   AND p.\"indexedAt\" >= '$SINCE' AND p.\"indexedAt\" < '$UNTIL'
   AND p.created_at_source_raw IS NULL AND (p.content_time_status IS NULL OR p.content_time_status = 'legacy_unknown')
 GROUP BY c.rkey ORDER BY c.rkey;"
@@ -197,7 +218,7 @@ plan_uris_path() {  # the immutable plan (URIs of the prestate legacy rows), as 
 }
 snapshot_by_uris() {  # snapshot_by_uris <urifile> -> stdout tab-text rows, SAME columns/order as snapshot_sql_legacy, for exactly the given URIs
   local urifile=$1
-  { echo "BEGIN; SET default_transaction_read_only = on; SET statement_timeout = '120s';"
+  { echo "BEGIN; SET statement_timeout = '120s';"  # (a temp table of URIs is created; the path issues no writes to public.* -- READ ONLY cannot be set because CREATE TEMP TABLE is refused in a read-only txn)
     echo "CREATE TEMP TABLE want_uris(uri text);"
     echo "COPY want_uris FROM STDIN WITH (FORMAT text);"
     cut -f1 "$urifile"
@@ -230,6 +251,7 @@ gate_recover_preview() {  # gate_recover_preview <jsonfile> -- gates every PRERE
   local candidates unretr legacy rows notinplan
   candidates=$(jsonq "$f" preview.candidates); unretr=$(jsonq "$f" unretrievable); legacy=$(jsonq "$f" db_legacy_in_window); rows=$(wc -l <"$E/step1-be-prestate-rows.tsv")
   [[ $(( candidates + unretr )) == "$legacy" && "$legacy" == "$rows" ]] || die "gate consistency: candidates($candidates)+unretrievable($unretr) must equal legacy_in_window($legacy) and prestate rows($rows)"
+  [[ "$(jsonq "$f" plan_uris_not_in_db)" == "0" ]] || die "gate: plan_uris_not_in_db=$(jsonq "$f" plan_uris_not_in_db) (frozen plan URIs missing from the DB)"
   notinplan=$(jsonq "$f" preview.db_legacy_not_in_plan)
   [[ "$notinplan" == "$unretr" ]] || die "gate consistency: preview.db_legacy_not_in_plan($notinplan) != unretrievable($unretr)"
   log "gate recover preview ok: candidates=$candidates unretrievable=$unretr legacy_in_window=$legacy"
@@ -287,7 +309,11 @@ cmd_preflight() {
   [[ "$cat_dids" == "$cfg_dids" ]] || die "catalog publisher DIDs ($cat_dids) != configured RECOVER_DIDS ($cfg_dids)"
   local max_age; max_age=$(awk -F'|' 'NR>1 {if($3+0>m)m=$3+0} END{print m+0}' "$E/catalog-readback.tsv")
   (( HORIZON_DAYS >= max_age )) || die "HORIZON_DAYS ($HORIZON_DAYS) below catalog publisher_post_max_age_days ($max_age)"
-  local rb_push="n/a"
+  # participant-safety gate: every enabled feed of the pattern must SERVE on receipt_time (the columns this packet writes are
+  # then read by nothing that orders/filters/scores posts) -- verified from the feedgen-owned catalog value, not from prose
+  local clocks; clocks=$(awk -F'|' 'NR>1 && $4!="" {print $4}' "$E/catalog-readback.tsv" | sort -u | tr '\n' ',' | sed 's/,$//')
+  [[ "$clocks" == "receipt_time" ]] || die "publisher_time_clock for '$RECOVER_RKEY_PATTERN' is '$clocks' (must be exactly receipt_time on every enabled row); a content-time clock makes this packet a serving change -- STOP"
+  local rb_push="n/a" rb_timecol="n/a"
   if [[ "$SKIP_LIVE_IMAGE_CHECKS" != "1" ]]; then
     [[ -f "$READBACK_JSON" ]] || die "READBACK_JSON $READBACK_JSON missing — BSR effective-config readback is a prerequisite"
     local rb_stale rb_now; rb_stale=$(sudo -n node -e 'const j=JSON.parse(require("fs").readFileSync(process.argv[1]));const v=(j.artifact_metadata||{}).stale_at;const n=typeof v==="number"?v:(typeof v==="string"&&/^\d+$/.test(v)?Number(v):(typeof v==="string"?Math.floor(Date.parse(v)/1000):NaN));console.log(Number.isFinite(n)?n:"unparseable")' "$READBACK_JSON"); rb_now=$(date -u +%s)
@@ -296,6 +322,9 @@ cmd_preflight() {
     rb_push=$(sudo -n node -e 'const j=JSON.parse(require("fs").readFileSync(process.argv[1]));const re=new RegExp("^"+process.argv[2]+"$");let m=0;for(const b of Object.values(j.bindings||{})){if((b.feed_ids||[]).some(f=>re.test(f)))m=Math.max(m,b.push_window_days||0)}console.log(m)' "$READBACK_JSON" "$RECOVER_RKEY_PATTERN")
     [[ "$rb_push" =~ ^[0-9]+$ ]] && (( rb_push > 0 )) || die "BSR readback did not yield a positive push window for RECOVER_RKEY_PATTERN (got '$rb_push'): bindings/feed_ids shape mismatch"
     (( HORIZON_DAYS >= rb_push )) || die "HORIZON_DAYS ($HORIZON_DAYS) below BSR push window ($rb_push)"
+    # the ranker side of the same claim: BSR must rank the pattern's feeds on createdAt (the receipt/record clock), not on content time
+    rb_timecol=$(sudo -n node -e 'const j=JSON.parse(require("fs").readFileSync(process.argv[1]));const re=new RegExp("^"+process.argv[2]+"$");const cols=new Set();for(const b of Object.values(j.bindings||{})){if((b.feed_ids||[]).some(f=>re.test(f)))cols.add(String(b.time_column||""))}console.log([...cols].sort().join(","))' "$READBACK_JSON" "$RECOVER_RKEY_PATTERN")
+    [[ "$rb_timecol" == "createdAt" ]] || die "BSR effective-config time_column for '$RECOVER_RKEY_PATTERN' is '$rb_timecol' (must be exactly createdAt); a content-time ranking clock makes this packet a ranking change -- STOP"
     sudo -n sha256sum "$READBACK_JSON" | emit effective-config-readback.sha256
   fi
   local now_iso; now_iso=$(date -u +%Y-%m-%dT%H:%M:%S.000Z)
@@ -307,8 +336,11 @@ cmd_preflight() {
   { [[ "$SINCE" < "$horizon_boundary" ]] || [[ "$SINCE" == "$horizon_boundary" ]]; } || die "SINCE=$SINCE is later than the rolling $HORIZON_DAYS-day boundary $horizon_boundary"
   echo "$SINCE" | emit since.txt
   echo "$UNTIL" | emit until.txt
-  { echo "generated_at=$(ts)"; echo "tree=$TREE"; echo "source_sha=$sha"; echo "runner_script_sha256=$runner_sha"; echo "dsn_helper_sha256=$helper_sha"; echo "dist_backfill_sha256=$EXPECTED_DIST_SHA256"; echo "dist_content_time_sha256=$EXPECTED_CT_SHA256"; echo "image=$IMG"; echo "image_validator_sha256=$img_ct"; echo "feedgen_retention_enabled=$ret"; echo "runner=$RUNNER"; echo "packet_sha256=$PACKET_SHA"; echo "network=$NETWORK"; echo "env_file=$ENV_FILE"; echo "db_container=$DB_CONTAINER"; echo "mode=recover"; echo "recover_dids=$RECOVER_DIDS"; echo "recover_rkey_pattern=$RECOVER_RKEY_PATTERN"; echo "horizon_days=$HORIZON_DAYS"; echo "catalog_max_age=$max_age readback_push_window=$rb_push"; echo "api_base=$API_BASE"; echo "ceilings wal<=max($CEIL_WAL_FLOOR_BYTES, $CEIL_WAL_BASELINE_MULTIPLE x baseline_rate x (batch_elapsed+${PAUSE_SECONDS}s)) relation<=$CEIL_REL_BYTES dead<=2 x recovered rows"; echo "since=$SINCE until=$UNTIL"; echo "prereg=$PREREG (exact)"; echo "expected_tool_refs=$EXPECTED_TOOL_REFS"; } | emit source-set.txt
+  { echo "generated_at=$(ts)"; echo "tree=$TREE"; echo "source_sha=$sha"; echo "runner_script_sha256=$runner_sha"; echo "dsn_helper_sha256=$helper_sha"; echo "dist_backfill_sha256=$EXPECTED_DIST_SHA256"; echo "dist_content_time_sha256=$EXPECTED_CT_SHA256"; echo "image=$IMG"; echo "image_validator_sha256=$img_ct"; echo "feedgen_retention_enabled=$ret"; echo "runner=$RUNNER"; echo "packet_sha256=$PACKET_SHA"; echo "network=$NETWORK"; echo "env_file=$ENV_FILE"; echo "db_container=$DB_CONTAINER"; echo "mode=recover"; echo "recover_dids=$RECOVER_DIDS"; echo "recover_rkey_pattern=$RECOVER_RKEY_PATTERN"; echo "horizon_days=$HORIZON_DAYS"; echo "catalog_max_age=$max_age readback_push_window=$rb_push"; echo "api_base=$API_BASE"; echo "ceilings wal<=max($CEIL_WAL_FLOOR_BYTES, $CEIL_WAL_BASELINE_MULTIPLE x baseline_rate x (batch_elapsed+${PAUSE_SECONDS}s)) relation<=$CEIL_REL_BYTES dead<=2 x recovered rows"; echo "since=$SINCE"; echo "until=$UNTIL"; echo "prereg=$PREREG"; echo "expected_tool_refs=$EXPECTED_TOOL_REFS"; echo "catalog_publisher_time_clock=$clocks"; echo "bsr_readback_time_column=$rb_timecol"; echo "expected_runner_sha256=$EXPECTED_RUNNER_SHA256"; echo "expected_dsn_helper_sha256=$EXPECTED_DSN_HELPER_SHA256"; echo "wal_rule_note=at CEIL_WAL_BASELINE_MULTIPLE=1.0 with the adaptive pause paid the WAL ceiling is implied (ceiling >= LSN advance + baseline x elapsed >= attributed); the effective per-batch bound is the PAID pause (wal_batches_unpaid=0) plus the per-batch relation-growth and dead-tuple ceilings; the ceiling can only fail when the 30-min deadline clips a pause or the multiple is lowered"; } | emit source-set.txt
   psql_ro -c "$SCOPE_SQL" | emit prestate-scope.tsv
+  local lau wv wvu; lau=$(awk -F'|' '$1=="legacy_after_until"{print $2}' "$E/prestate-scope.tsv"); wv=$(awk -F'|' '$1=="wrong_version_in_rolling_horizon"{print $2}' "$E/prestate-scope.tsv"); wvu=$(awk -F'|' '$1=="unclassified_or_wrong_version_in_rolling_horizon_after_until"{print $2}' "$E/prestate-scope.tsv")
+  [[ "$lau" == "0" ]] || die "legacy rows at or after UNTIL: $lau (the fixed window must cover the whole legacy population inside the horizon; widen UNTIL and re-approve)"
+  [[ "$wv" == "0" && "$wvu" == "0" ]] || die "non-legacy rows of the actors inside the rolling $HORIZON_DAYS-day horizon that are not validator v2: $wv (before UNTIL) / $wvu (at/after UNTIL) -- D1 readiness precondition broken; STOP"
   psql_ro -c "$POP_SQL" | emit prestate-populations.tsv
   psql_copy "$(snapshot_sql_legacy)" | emit step1-be-prestate-rows.tsv
   # the plan is frozen here: exactly the prestate URIs; every later invocation (preview/apply/readback) passes this file so
@@ -321,9 +353,10 @@ cmd_preflight() {
   pgstat_read | emit pg-prestate.txt
   log "preflight complete: be prestate rows=$(wc -l <"$E/step1-be-prestate-rows.tsv")"
 }
-cmd_control() { local n; n=$(( $(ls -1 "$E"/pg-control-*.txt 2>/dev/null | wc -l) + 1 )); take_control "pg-control-$n.txt"; }
+cmd_control() { assert_bound_env; local n; n=$(( $(ls -1 "$E"/pg-control-*.txt 2>/dev/null | wc -l) + 1 )); take_control "pg-control-$n.txt"; }
 
 cmd_preview() {
+  assert_bound_env
   local rc; rc=$(run_tool step1-be-preview --mode recover --plan-from-db --plan-uris-file "$(plan_uris_path)" --no-insert --actors "$RECOVER_DIDS" --since "$SINCE" --until "$UNTIL" --api-base "$API_BASE" --packet-sha256 "$PACKET_SHA" --json)
   [[ "$rc" == "0" ]] || die "preview exit=$rc (see step1-be-preview.err)"
   gate_recover_preview "$E/step1-be-preview.json"
@@ -333,6 +366,7 @@ cmd_preview() {
 cmd_apply() {
   local label=$1 maxb=${2:-}
   assert_tree
+  assert_bound_env
   local ckpt="/evidence/step1-be-checkpoint.json"; [[ "$RUNNER" == "host" ]] && ckpt="$E/step1-be-checkpoint.json"
   pgstat_read | emit "pg-be-$label-before.txt"
   # ADAPTIVE PAUSE (D4-b): identical rule to the revalidate packet -- the tool pauses after every batch for
@@ -341,9 +375,12 @@ cmd_apply() {
   (( wps0 >= 1 )) || die "apply be/$label: control baseline write rate is $wps0 B/s (stalled or missing control read) -- run '$0 control' first"
   local rc; rc=$(run_tool "step1-be-apply-$label" --mode recover --plan-from-db --plan-uris-file "$(plan_uris_path)" --no-insert --apply --actors "$RECOVER_DIDS" --since "$SINCE" --until "$UNTIL" --api-base "$API_BASE" --checkpoint-file "$ckpt" --packet-sha256 "$PACKET_SHA" ${maxb:+--max-batches "$maxb"} --pause-baseline-bytes-per-s "$wps0" --json)
   pgstat_read | emit "pg-be-$label-after.txt"
+  [[ -f "$E/step1-be-checkpoint.json" ]] && sudo -n chown root:newsflows "$E/step1-be-checkpoint.json" 2>/dev/null && sudo -n chmod 0640 "$E/step1-be-checkpoint.json" 2>/dev/null || true
   local f="$E/step1-be-apply-$label.json"
   [[ "$rc" == "0" || "$rc" == "3" ]] || die "apply be/$label exit=$rc (see .err); STOP + escalation"
   [[ "$(jsonq "$f" operation)" == "publisher-post-recover" && "$(jsonq "$f" mode)" == "apply" ]] || die "apply be/$label did not run the recover apply path"
+  [[ "$(jsonq "$f" plan_source)" == "plan-uris-file+getPosts" && "$(jsonq "$f" plan_uris_not_in_db)" == "0" ]] || die "apply be/$label: plan_source=$(jsonq "$f" plan_source) plan_uris_not_in_db=$(jsonq "$f" plan_uris_not_in_db) (must be the frozen plan, all URIs present)"
+  [[ "$(jsonq "$f" unretrievable)" == "$(prereg_value unretrievable)" && "$(jsonq "$f" preview)" == "" ]] || die "apply be/$label: unretrievable=$(jsonq "$f" unretrievable) != pre-registered $(prereg_value unretrievable)"
   local nb; nb=$(node -e 'const j=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8"));console.log((j.recovery&&j.recovery.batches||[]).length)' "$f")
   local b a; b=$(cat "$E/pg-be-$label-before.txt"); a=$(cat "$E/pg-be-$label-after.txt")
   local dw dr dd dur; dw=$(( $(echo "$a"|cut -d'|' -f1) - $(echo "$b"|cut -d'|' -f1) )); dr=$(( $(echo "$a"|cut -d'|' -f2) - $(echo "$b"|cut -d'|' -f2) )); dd=$(( $(echo "$a"|cut -d'|' -f3) - $(echo "$b"|cut -d'|' -f3) )); dur=$(( $(echo "$a"|cut -d'|' -f5) - $(echo "$b"|cut -d'|' -f5) )); (( dur < 1 )) && dur=1
@@ -354,12 +391,16 @@ cmd_apply() {
     # PER-BATCH enforcement, identical rule/format to the revalidate packet v10: each batch's attributed WAL (its own
     # LSN advance minus baseline x its own elapsed) must be <= max(floor, multiple x baseline x (its own elapsed + paid
     # pause)); the verdict is the conjunction over batches. j.recovery mirrors j.revalidation field-for-field.
-    local perbatch; perbatch=$(node -e 'const j=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8"));const b=(j.recovery&&j.recovery.batches)||[];const [r,m,p,fl]=process.argv.slice(2).map(Number);let worst=0,worstRatio=0,fail=0,unpaid=0,lines=[];for(const x of b){if(typeof x.wal_bytes!=="number"){lines.push(`batch=${x.batch} wal_bytes=missing`);fail++;continue;}const ms=x.elapsed_ms||0;const paidMs=(typeof x.pause_ms==="number")?x.pause_ms:Math.round(p*1000);const reqMs=(typeof x.pause_required_ms==="number")?x.pause_required_ms:Math.round(p*1000);const owedMs=(x.candidates===0)?0:Math.max(Math.round(p*1000),Math.ceil(x.wal_bytes*1000/r));const paid=paidMs>=owedMs;if(!paid)unpaid++;const adj=Math.max(0,x.wal_bytes-Math.round(r*ms/1000));const ceil=Math.max(fl,Math.round(m*r*(ms/1000+paidMs/1000)));const ok=adj<=ceil&&paid;if(!ok)fail++;const ratio=ceil?adj/ceil:0;if(ratio>worstRatio){worstRatio=ratio;worst=adj;}lines.push(`batch=${x.batch} elapsed_ms=${ms} lsn_advance=${x.wal_bytes} attributed=${adj} pause_owed_ms=${owedMs} pause_paid_ms=${paidMs} ceiling=${ceil} ratio=${ratio.toFixed(2)} ${paid?"paid":"UNPAID"} ${adj<=ceil?"ok":"BREACH"}`);}console.log(JSON.stringify({fail,unpaid,worst,worstRatio:worstRatio.toFixed(2),lines}))' "$f" "$wps0" "$CEIL_WAL_BASELINE_MULTIPLE" "$PAUSE_SECONDS" "$CEIL_WAL_FLOOR_BYTES")
+    local perbatch; perbatch=$(node -e 'const j=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8"));const b=(j.recovery&&j.recovery.batches)||[];const [r,m,p,fl,rr,relCap]=process.argv.slice(2).map(Number);let worst=0,worstRatio=0,fail=0,unpaid=0,relFail=0,relWorst=0,lines=[];for(const x of b){if(typeof x.wal_bytes!=="number"){lines.push(`batch=${x.batch} wal_bytes=missing`);fail++;continue;}const ms=x.elapsed_ms||0;const paidMs=(typeof x.pause_ms==="number")?x.pause_ms:Math.round(p*1000);const owedMs=(x.candidates===0)?0:Math.max(Math.round(p*1000),Math.ceil(x.wal_bytes*1000/r));const paid=paidMs>=owedMs;if(!paid)unpaid++;const adj=Math.max(0,x.wal_bytes-Math.round(r*ms/1000));const ceil=Math.max(fl,Math.round(m*r*(ms/1000+paidMs/1000)));const okWal=adj<=ceil&&paid;if(!okWal)fail++;const ratio=ceil?adj/ceil:0;if(ratio>worstRatio){worstRatio=ratio;worst=adj;}const relDelta=(typeof x.relation_bytes_after==="number"&&typeof x.relation_bytes_before==="number")?(x.relation_bytes_after-x.relation_bytes_before):NaN;const relAdj=Number.isFinite(relDelta)?Math.max(0,relDelta-Math.round(rr*ms/1000)):NaN;const okRel=Number.isFinite(relAdj)&&relAdj<=relCap;if(!okRel)relFail++;if(Number.isFinite(relAdj)&&relAdj>relWorst)relWorst=relAdj;lines.push(`batch=${x.batch} elapsed_ms=${ms} lsn_advance=${x.wal_bytes} attributed=${adj} pause_owed_ms=${owedMs} pause_paid_ms=${paidMs} ceiling=${ceil} ratio=${ratio.toFixed(2)} ${paid?"paid":"UNPAID"} ${adj<=ceil?"ok":"BREACH"} relation_growth=${Number.isFinite(relAdj)?relAdj:"missing"} rel_cap=${relCap} ${okRel?"rel_ok":"REL_BREACH"}`);}console.log(JSON.stringify({fail,unpaid,relFail,relWorst,worst,worstRatio:worstRatio.toFixed(2),lines}))' "$f" "$wps0" "$CEIL_WAL_BASELINE_MULTIPLE" "$PAUSE_SECONDS" "$CEIL_WAL_FLOOR_BYTES" "$rps0" "$CEIL_REL_BYTES")
     local wal_fail wal_worst wal_ratio wal_lines wal_unpaid
     wal_fail=$(node -e 'console.log(JSON.parse(process.argv[1]).fail)' "$perbatch"); wal_unpaid=$(node -e 'console.log(JSON.parse(process.argv[1]).unpaid)' "$perbatch"); wal_worst=$(node -e 'console.log(JSON.parse(process.argv[1]).worst)' "$perbatch"); wal_ratio=$(node -e 'console.log(JSON.parse(process.argv[1]).worstRatio)' "$perbatch"); wal_lines=$(node -e 'console.log(JSON.parse(process.argv[1]).lines.join("\n"))' "$perbatch")
-    local dead_ceiling=$(( 2 * $(jsonq "$f" recovery.recovered) / nb ))
-    (( wal_fail == 0 && pr <= CEIL_REL_BYTES && pd <= dead_ceiling )) || verdict="BREACH"
-    { echo "batches=$nb exit=$rc recovered=$(jsonq "$f" recovery.recovered) complete=$(jsonq "$f" recovery.complete) invocation_seconds=$dur"; echo "delta_wal_bytes=$dw delta_relation_bytes=$dr delta_dead_tuples=$dd"; echo "control_file=$(basename "$(latest_control)") control_rate_per_s wal=$wps relation=$rps dead=$dps (clamped at 0)"; echo "per_batch_relation_minus_control=$pr per_batch_dead_minus_control=$pd (invocation deltas minus baseline x duration, / batches)"; echo "wal_rule=per batch: attributed (LSN advance - baseline x elapsed) <= max(floor $CEIL_WAL_FLOOR_BYTES, $CEIL_WAL_BASELINE_MULTIPLE x baseline $wps0 B/s x (elapsed + paid pause)); adaptive pause owed = max(${PAUSE_SECONDS}s, LSN advance / baseline $wps0 B/s) and must be paid (tool --pause-baseline-bytes-per-s $wps0); cluster-wide LSN, concurrent writers included then subtracted"; echo "$wal_lines"; echo "wal_batches_failing=$wal_fail wal_batches_unpaid=$wal_unpaid wal_worst_attributed=$wal_worst wal_worst_ratio=$wal_ratio"; echo "ceilings relation<=$CEIL_REL_BYTES dead<=$dead_ceiling (=2 x recovered rows per batch)"; echo "verdict=$verdict"; } | emit "ceiling-be-$label.txt"
+    local recovered_n; recovered_n=$(jsonq "$f" recovery.recovered)
+    local dead_ceiling=$(( 2 * recovered_n / nb )); (( recovered_n > 0 )) || pd=0   # nothing written -> no dead tuples of ours to bound (already_current-only resume)
+    local rel_fail rel_worst; rel_fail=$(node -e 'console.log(JSON.parse(process.argv[1]).relFail)' "$perbatch"); rel_worst=$(node -e 'console.log(JSON.parse(process.argv[1]).relWorst)' "$perbatch")
+    # verdict = conjunction over batches for WAL (paid + ceiling) AND relation growth (per batch, baseline-adjusted); dead tuples
+    # are only available as an invocation delta (pg_stat) and stay per-invocation-mean against 2 x recovered / batches
+    (( wal_fail == 0 && rel_fail == 0 && pd <= dead_ceiling )) || verdict="BREACH"
+    { echo "batches=$nb exit=$rc recovered=$(jsonq "$f" recovery.recovered) complete=$(jsonq "$f" recovery.complete) invocation_seconds=$dur"; echo "delta_wal_bytes=$dw delta_relation_bytes=$dr delta_dead_tuples=$dd"; echo "control_file=$(basename "$(latest_control)") control_rate_per_s wal=$wps relation=$rps dead=$dps (clamped at 0)"; echo "per_batch_relation_minus_control=$pr per_batch_dead_minus_control=$pd (invocation deltas minus baseline x duration, / batches)"; echo "wal_rule=per batch: attributed (LSN advance - baseline x elapsed) <= max(floor $CEIL_WAL_FLOOR_BYTES, $CEIL_WAL_BASELINE_MULTIPLE x baseline $wps0 B/s x (elapsed + paid pause)); adaptive pause owed = max(${PAUSE_SECONDS}s, LSN advance / baseline $wps0 B/s) and must be paid (tool --pause-baseline-bytes-per-s $wps0); cluster-wide LSN, concurrent writers included then subtracted"; echo "$wal_lines"; echo "wal_batches_failing=$wal_fail wal_batches_unpaid=$wal_unpaid wal_worst_attributed=$wal_worst wal_worst_ratio=$wal_ratio relation_batches_failing=$rel_fail relation_worst_growth=$rel_worst"; echo "wal_rule_note=at multiple $CEIL_WAL_BASELINE_MULTIPLE with the pause paid the WAL ceiling is implied by construction (ceiling >= LSN advance + baseline x elapsed >= attributed): the effective bound is the paid pause; it can only fail if the deadline clips a pause or the multiple is lowered"; echo "ceilings relation<=$CEIL_REL_BYTES dead<=$dead_ceiling (=2 x recovered rows per batch)"; echo "verdict=$verdict"; } | emit "ceiling-be-$label.txt"
   else
     echo "batches=0 exit=$rc verdict=no_batches" | emit "ceiling-be-$label.txt"
   fi
@@ -368,6 +409,7 @@ cmd_apply() {
 }
 
 cmd_readback() {  # re-runnable: every attempt gets its own suffix
+  assert_bound_env
   local a=1; while [[ -e "$E/step1-be-preview-after-attempt-$a.json" || -e "$E/step1-be-preview-after-attempt-$a.err" ]]; do a=$(( a + 1 )); done; local sfx="attempt-$a"
   local rc; rc=$(run_tool "step1-be-preview-after-$sfx" --mode recover --plan-from-db --plan-uris-file "$(plan_uris_path)" --no-insert --actors "$RECOVER_DIDS" --since "$SINCE" --until "$UNTIL" --api-base "$API_BASE" --packet-sha256 "$PACKET_SHA" --json)
   local f="$E/step1-be-preview-after-$sfx.json"
@@ -390,7 +432,7 @@ for(const r of pre){
   if(q[4]!==r[4])cidChanged++; if(q[2]!==r[2])indexedChanged++; if(q[3]!==r[3])createdChanged++;
   const rawNonEmpty=!isNull(q[5]); const isV2=q[9]==="newsflows-content-time/v2";
   if(rawNonEmpty && isV2 && (q[7]==="source_valid"||q[7]==="source_invalid")){ if(q[7]==="source_valid")recoveredValid++; else recoveredInvalid++; }
-  else if(!rawNonEmpty && isNull(q[9]) && isNull(q[7])) stillLegacy++;
+  else if(!rawNonEmpty && isNull(q[9]) && (isNull(q[7])||q[7]==="legacy_unknown")) stillLegacy++;
   else badRecovered++;
 }
 console.log(`prestate_rows=${pre.length} poststate_rows=${post.length} missing=${missing} cid_changed=${cidChanged} indexedAt_changed=${indexedChanged} createdAt_changed=${createdChanged} recovered_valid=${recoveredValid} recovered_invalid=${recoveredInvalid} still_legacy=${stillLegacy} bad_recovered=${badRecovered} expected_valid=${expValid} expected_invalid=${expInvalid} expected_unretrievable=${expUnret}`);
@@ -404,12 +446,15 @@ process.exit(ok?0:2)' "$E/step1-be-prestate-rows.tsv" "$E/step1-be-poststate-row
   pre_out=$(awk -F'|' '$1=="legacy_outside_window"{print $2}' "$E/prestate-scope.tsv"); post_out=$(awk -F'|' '$1=="legacy_outside_window"{print $2}' "$E/poststate-scope-$sfx.tsv")
   pre_all=$(awk -F'|' '$1=="legacy_all_time"{print $2}' "$E/prestate-scope.tsv"); post_all=$(awk -F'|' '$1=="legacy_all_time"{print $2}' "$E/poststate-scope-$sfx.tsv")
   [[ "$pre_out" == "$post_out" ]] || die "readback: legacy_outside_window changed ($pre_out -> $post_out)"
+  local post_lau post_wvu; post_lau=$(awk -F'|' '$1=="legacy_after_until"{print $2}' "$E/poststate-scope-$sfx.tsv"); post_wvu=$(awk -F'|' '$1=="unclassified_or_wrong_version_in_rolling_horizon_after_until"{print $2}' "$E/poststate-scope-$sfx.tsv")
+  [[ "$post_lau" == "0" && "$post_wvu" == "0" ]] || die "readback: rows at/after UNTIL that are legacy ($post_lau) or not v2 ($post_wvu) -- the horizon is not 100% v2-classified"
   [[ $(( pre_all - post_all )) == "$exp_recover" ]] || die "readback: legacy_all_time moved by $(( pre_all - post_all )), expected $exp_recover"
   { echo "readback=$sfx"; cat "$E/step1-be-diff-$sfx.txt"; echo "sum_recovered=$sum_recovered would_recover=$exp_recover"; echo "legacy_outside_window before=$pre_out after=$post_out"; echo "legacy_all_time before=$pre_all after=$post_all"; } | emit "readback-$sfx.txt"
   log "readback ok ($sfx)"
 }
 
 cmd_restore() {  # bounded CAS restore from the prestate snapshot; keyset batches of 500; resumable; batch index derived from the cursor
+  assert_bound_env
   assert_tree
   local pre="$E/step1-be-prestate-rows.tsv" cur="$E/restore-be-cursor.txt" total batch=0
   [[ -f "$pre" ]] || die "no prestate snapshot for be"
@@ -420,6 +465,7 @@ cmd_restore() {  # bounded CAS restore from the prestate snapshot; keyset batche
     local end=$(( start + 499 )); (( end > total )) && end=$total; batch=$(( (start - 1) / 500 + 1 ))
     local rtmp; rtmp=$(mktemp)
     local attempt=1 rname; while [[ -e "$E/restore-be-rows-$start-$end-attempt-$attempt.txt" ]]; do attempt=$(( attempt + 1 )); done; rname="restore-be-rows-$start-$end-attempt-$attempt.txt"
+    (( attempt <= 2 )) || die "restore be rows $start-$end: a third attempt is prohibited (contract: a failed restore adapter is a P1 incident) -- STOP + escalation"
     { echo "BEGIN; SET lock_timeout='5s'; SET statement_timeout='30s';"; echo "CREATE TEMP TABLE prestate(uri text, author text, indexed_at text, created_at text, cid text, raw_hex text, content_time_utc text, status text, reason text, version text);"; echo "COPY prestate FROM STDIN WITH (FORMAT text);"; sed -n "${start},${end}p" "$pre"; echo '\.'; cat <<'SQL'
 UPDATE public.post AS t SET created_at_source_raw=decode(s.raw_hex,'hex'), content_time_utc=s.content_time_utc, content_time_status=s.status, content_time_clamp_reason=s.reason, content_time_validator_version=s.version
 FROM prestate s WHERE t.uri=s.uri AND t.content_time_validator_version='newsflows-content-time/v2' AND t.created_at_source_raw IS NOT NULL;
@@ -439,6 +485,7 @@ SQL
 }
 
 cmd_secret_scan() {
+  assert_bound_env
   # Only values of SECRET-bearing keys are hunted (fixed-string, len>=8); configuration values the runner records itself
   # (hosts, DB names, DIDs) are not secrets and would collide with source-set.txt / snapshots. The scan fails closed if no
   # secret-key value could be extracted. Each grep is failure-tolerant so the loop can never abort early.
@@ -462,6 +509,7 @@ cmd_secret_scan() {
 }
 
 cmd_finalize() {
+  assert_bound_env
   local wstart=${1:-unset} wend=${2:-unset}
   { [[ -f "$E/secret-scan.txt" ]] && grep -q '^hits=0$' "$E/secret-scan.txt"; } || die "finalize requires a clean secret-scan first"
   local rtmp; rtmp=$(mktemp)
