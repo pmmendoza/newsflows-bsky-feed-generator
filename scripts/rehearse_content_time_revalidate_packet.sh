@@ -77,16 +77,18 @@ step preview_main bash "$runner" preview main
 step preview_be bash "$runner" preview be
 step apply_main_b1 bash "$runner" apply main b1 1
 grep -q "batches=1 exit=3" "$E/ceiling-main-b1.txt" || { echo "b1 did not stop after one batch with exit 3"; exit 1; }
-grep -q "wal_batches_failing=0" "$E/ceiling-main-b1.txt" && grep -q "^batch=1 elapsed_ms=" "$E/ceiling-main-b1.txt" || { echo "b1 per-batch WAL rule not evaluated"; exit 1; }
-# NEGATIVE: floor 1 B and multiple 1.0 on the idle DB -> the batch's own attributed WAL exceeds its ceiling -> BREACH must stop the invocation (non-zero exit)
-set +e; CEIL_WAL_FLOOR_BYTES=1 bash "$runner" apply main neg 1; rc=$?; set -e
+grep -q "wal_batches_failing=0" "$E/ceiling-main-b1.txt" && grep -q "wal_batches_unpaid=0" "$E/ceiling-main-b1.txt" && grep -q "^batch=1 elapsed_ms=.* pause_owed_ms=[0-9]* pause_paid_ms=[0-9]* .* paid ok$" "$E/ceiling-main-b1.txt" || { echo "b1 per-batch WAL rule / adaptive pause not evaluated"; cat "$E/ceiling-main-b1.txt"; exit 1; }
+# the adaptive pause must have been PAID: pause_paid_ms >= pause_owed_ms = max(1 s, LSN advance / idle baseline) -- on the idle disposable DB that is ~2 minutes per batch
+[[ $(sed -n 's/^batch=1 .* pause_owed_ms=\([0-9]*\) pause_paid_ms=\([0-9]*\) .*/\1 \2/p' "$E/ceiling-main-b1.txt" | awk '{print ($2>=$1 && $1>1000)?"yes":"no"}') == "yes" ]] || { echo "b1 adaptive pause not paid / not adaptive"; cat "$E/ceiling-main-b1.txt"; exit 1; }
+# NEGATIVE: floor 1 B and multiple 0.5 -> the ceiling is half the estate's rate x (elapsed + paid pause) while the batch wrote ~1x -> BREACH must stop the invocation (non-zero exit)
+set +e; CEIL_WAL_FLOOR_BYTES=1 CEIL_WAL_BASELINE_MULTIPLE=0.5 bash "$runner" apply main neg 1; rc=$?; set -e
 [[ $rc -ne 0 ]] || { echo "negative apply (floor=1) should have stopped on BREACH"; exit 1; }
-grep -q "verdict=BREACH" "$E/ceiling-main-neg.txt" && grep -q "wal_batches_failing=1" "$E/ceiling-main-neg.txt" && grep -q "^batch=1 .* BREACH$" "$E/ceiling-main-neg.txt" || { echo "negative apply receipt does not show the per-batch BREACH"; cat "$E/ceiling-main-neg.txt"; exit 1; }
-# MULTI-BATCH + baseline-scaled branch governing: floor 1 B, multiple 1000 -> ceiling = 1000 x idle baseline x (elapsed+1s) (a few MB) > per-batch attributed WAL; 2 batches
-step apply_main_b2 env CEIL_WAL_FLOOR_BYTES=1 CEIL_WAL_BASELINE_MULTIPLE=1000 bash "$runner" apply main b2 2
+grep -q "verdict=BREACH" "$E/ceiling-main-neg.txt" && grep -q "wal_batches_failing=1" "$E/ceiling-main-neg.txt" && grep -q "^batch=1 .* paid BREACH$" "$E/ceiling-main-neg.txt" || { echo "negative apply receipt does not show the per-batch BREACH"; cat "$E/ceiling-main-neg.txt"; exit 1; }
+# MULTI-BATCH + baseline-scaled branch governing: floor 1 B, multiple 1.0 -> ceiling = idle baseline x (elapsed + the paid adaptive pause) >= per-batch attributed WAL by construction; 2 batches
+step apply_main_b2 env CEIL_WAL_FLOOR_BYTES=1 bash "$runner" apply main b2 2
 grep -q "batches=2 exit=3" "$E/ceiling-main-b2.txt" && [[ $(grep -c "^batch=[0-9]* elapsed_ms=" "$E/ceiling-main-b2.txt") -eq 2 ]] || { echo "b2 did not run exactly two batches"; cat "$E/ceiling-main-b2.txt"; exit 1; }
-grep -q "wal_batches_failing=0" "$E/ceiling-main-b2.txt" && ! grep -q "ceiling=614400 " "$E/ceiling-main-b2.txt" && ! grep -q "ceiling=1 " "$E/ceiling-main-b2.txt" || { echo "b2 baseline-scaled branch did not govern both batches"; cat "$E/ceiling-main-b2.txt"; exit 1; }
-[[ $(grep "^batch=" "$E/ceiling-main-b2.txt" | sed 's/.*elapsed_ms=\([0-9]*\).*/\1/' | sort -u | wc -l) -ge 1 ]]
+grep -q "wal_batches_failing=0" "$E/ceiling-main-b2.txt" && grep -q "wal_batches_unpaid=0" "$E/ceiling-main-b2.txt" && ! grep -q "ceiling=614400 " "$E/ceiling-main-b2.txt" && ! grep -q "ceiling=1 " "$E/ceiling-main-b2.txt" || { echo "b2 baseline-scaled branch did not govern both batches"; cat "$E/ceiling-main-b2.txt"; exit 1; }
+[[ $(grep "^batch=" "$E/ceiling-main-b2.txt" | sed 's/.*ceiling=\([0-9]*\).*/\1/' | sort -u | wc -l) -eq 2 ]] || { echo "b2 batches did not get distinct ceilings from their own durations"; cat "$E/ceiling-main-b2.txt"; exit 1; }
 step apply_main_full bash "$runner" apply main full
 grep -q "exit=0" "$E/ceiling-main-full.txt" || { echo "full apply did not exit 0"; exit 1; }
 step apply_be_full bash "$runner" apply be full

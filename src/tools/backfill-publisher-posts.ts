@@ -656,6 +656,11 @@ export type ContentTimeRevalidationBatchSummary = {
   wal_bytes: number
   relation_bytes_before: number
   relation_bytes_after: number
+  // Adaptive pause (D4-b, 2026-08-18): after this batch the tool slept
+  // pause_ms = max(pauseMs, wal_bytes / pauseBaselineBytesPerSecond) so the
+  // backfill never averages faster than the estate's own write rate.
+  pause_ms: number
+  pause_required_ms: number
 }
 
 export type ContentTimeRevalidationResult = ContentTimeRevalidationProgress & {
@@ -680,6 +685,10 @@ export type ContentTimeRevalidationOptions = {
   maxBatches?: number
   maxDurationMs: number
   pauseMs: number
+  // When set (> 0), the inter-batch pause becomes adaptive: at least
+  // wal_bytes_of_the_batch / pauseBaselineBytesPerSecond seconds (floored at
+  // pauseMs) -- the batch "pays back" its WAL at the estate's baseline rate.
+  pauseBaselineBytesPerSecond?: number
   lockTimeoutMs: number
   statementTimeoutMs: number
   onProgress?: (progress: ContentTimeRevalidationProgress) => void
@@ -972,6 +981,17 @@ export async function runContentTimeRevalidation(
     lastRelationBytesBefore = result.relationBytesBefore
     lastRelationBytesAfter = result.relationBytesAfter
     const batchElapsedMs = Date.now() - batchStartedAt
+    // Adaptive pause: pay this batch's WAL back at the baseline rate before
+    // anything else happens (also after the final batch of an invocation, so
+    // every batch is paid). Clipped by the hard deadline; the receipt records
+    // both the required and the actually slept duration.
+    const pauseRequiredMs = result.candidates === 0
+      ? 0 // an empty (terminal) batch wrote nothing and owes nothing
+      : options.pauseBaselineBytesPerSecond && options.pauseBaselineBytesPerSecond > 0
+        ? Math.max(options.pauseMs, Math.ceil((result.walBytes * 1000) / options.pauseBaselineBytesPerSecond))
+        : options.pauseMs
+    const pauseSleptMs = Math.min(pauseRequiredMs, Math.max(0, deadlineMs - Date.now()))
+    if (pauseSleptMs > 0) await sleep(pauseSleptMs)
     batches.push({
       batch,
       candidates: result.candidates,
@@ -984,6 +1004,8 @@ export async function runContentTimeRevalidation(
       wal_bytes: result.walBytes,
       relation_bytes_before: result.relationBytesBefore,
       relation_bytes_after: result.relationBytesAfter,
+      pause_ms: pauseSleptMs,
+      pause_required_ms: pauseRequiredMs,
     })
 
     const progress: ContentTimeRevalidationProgress = {
@@ -1015,9 +1037,7 @@ export async function runContentTimeRevalidation(
       complete = true
       break
     }
-    if (options.pauseMs > 0) {
-      await sleep(Math.min(options.pauseMs, Math.max(0, deadlineMs - Date.now())))
-    }
+    // (the inter-batch pause was already taken above, right after the batch)
   }
 
   return {
@@ -1235,6 +1255,7 @@ export type RevalidateCliOptions = {
   maxPreviewRows: number
   packetSha256?: string
   maxBatches?: number
+  pauseBaselineBytesPerSecond?: number
 }
 
 export function parseRevalidateCliArgs(argv: string[]): RevalidateCliOptions {
@@ -1292,6 +1313,15 @@ export function parseRevalidateCliArgs(argv: string[]): RevalidateCliOptions {
     }
   }
 
+  const pauseBaselineRaw = flags.get('pause-baseline-bytes-per-s')?.at(-1)
+  let pauseBaselineBytesPerSecond: number | undefined
+  if (pauseBaselineRaw !== undefined) {
+    pauseBaselineBytesPerSecond = Number.parseInt(pauseBaselineRaw, 10)
+    if (!Number.isInteger(pauseBaselineBytesPerSecond) || String(pauseBaselineBytesPerSecond) !== pauseBaselineRaw.trim() || pauseBaselineBytesPerSecond < 1) {
+      throw new Error('--pause-baseline-bytes-per-s must be a positive integer (bytes of WAL per second)')
+    }
+  }
+
   return {
     actors: actorsCsv.length ? actorsCsv : undefined,
     since,
@@ -1302,6 +1332,7 @@ export function parseRevalidateCliArgs(argv: string[]): RevalidateCliOptions {
     maxPreviewRows,
     packetSha256,
     maxBatches,
+    pauseBaselineBytesPerSecond,
   }
 }
 
@@ -1363,6 +1394,7 @@ async function mainRevalidate(argv: string[]) {
         maxBatches: options.maxBatches,
         maxDurationMs: remainingMs,
         pauseMs: REVALIDATION_LIMITS.pauseMs,
+        pauseBaselineBytesPerSecond: options.pauseBaselineBytesPerSecond,
         lockTimeoutMs: REVALIDATION_LIMITS.lockTimeoutMs,
         statementTimeoutMs: Math.min(REVALIDATION_LIMITS.statementTimeoutMs, remainingMs),
         onProgress: (progress) => console.error(JSON.stringify({ event: 'revalidate_batch', ...progress })),
