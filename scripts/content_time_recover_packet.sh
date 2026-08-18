@@ -311,7 +311,7 @@ cmd_preflight() {
   (( HORIZON_DAYS >= max_age )) || die "HORIZON_DAYS ($HORIZON_DAYS) below catalog publisher_post_max_age_days ($max_age)"
   # participant-safety gate: every enabled feed of the pattern must SERVE on receipt_time (the columns this packet writes are
   # then read by nothing that orders/filters/scores posts) -- verified from the feedgen-owned catalog value, not from prose
-  local clocks; clocks=$(awk -F'|' 'NR>1 {print $4}' "$E/catalog-readback.tsv" | sort -u | tr '\n' ',' | sed 's/,$//')
+  local clocks; clocks=$(awk -F'|' 'NR>1 && $4!="" {print $4}' "$E/catalog-readback.tsv" | sort -u | tr '\n' ',' | sed 's/,$//')
   [[ "$clocks" == "receipt_time" ]] || die "publisher_time_clock for '$RECOVER_RKEY_PATTERN' is '$clocks' (must be exactly receipt_time on every enabled row); a content-time clock makes this packet a serving change -- STOP"
   local rb_push="n/a" rb_timecol="n/a"
   if [[ "$SKIP_LIVE_IMAGE_CHECKS" != "1" ]]; then
