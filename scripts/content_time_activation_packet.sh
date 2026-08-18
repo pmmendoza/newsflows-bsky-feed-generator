@@ -118,7 +118,8 @@ cmd_battery() {  # <label>: per-invocation subdir; fresh authenticated requests 
   # (6) rollback dry-run (D3(v)): the restore body must be valid against the activated rows -- only after apply
   [[ "$EXPECTED_CLOCK" == "content_time_v1" && -f "$E0/feedgen-bulk-rollback.json" && -f "$E0/apply-transport.txt" ]] && { E=$E0 cmd_rollback_dryrun; }
   # (7) conformance summary (sudo scan) -- fail closed if the scan itself fails
-  local cs; cs=$("$BSKYOPS" ecosystem conformance scan --json 2>/dev/null | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{const j=JSON.parse(s);console.log(JSON.stringify(j.summary))})') || die "conformance scan failed"; echo "$cs" | emit conformance.txt
+  local cs rc=0; cs=$(bskyops_env "$BSKYOPS" ecosystem conformance scan --json 2>/dev/null) || rc=$?   # rc=1 means "drift" (a verdict, not a failure); no JSON = failure
+  echo "$cs" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{const j=JSON.parse(s);const items=Object.values(j.checks||j.items||{});const bad=(Array.isArray(items)?items:[]).filter(x=>x&&x.status&&x.status!=="ok").map(x=>x.name+"="+x.status);console.log("summary="+JSON.stringify(j.summary)+" rc='"+process.argv[1]+"' non_ok="+bad.join(","))})' "$rc" | emit conformance.txt || die "conformance scan produced no JSON"
   E=$E0; log "battery $L complete: all gates passed (receipts in $B)"
 }
 case "${1:-}" in preview) cmd_preview;; apply) cmd_apply;; parity) cmd_parity;; rollback-dryrun) cmd_rollback_dryrun;; rollback) cmd_rollback;; battery) cmd_battery "${2:?label}";; *) echo "usage: $0 preview|apply|parity|rollback-dryrun|rollback|battery <label>" >&2; exit 2;; esac
