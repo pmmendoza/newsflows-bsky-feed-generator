@@ -45,7 +45,7 @@
 # `prereg` (read-only) prints the SINCE bounds for the current horizons plus the cells, for the ledger approval entry.
 # Optional env (production defaults): IMG NETWORK ENV_FILE DB_CONTAINER PSQL_DB PSQL_USER
 #   MAIN_DIDS BE_DID HORIZON_MAIN_DAYS HORIZON_BE_DAYS DOCKER FEEDGEN_CONTAINER RUNNER
-#   (container|host; host = rehearsal with HOST_DSN) CEIL_WAL_BYTES CEIL_REL_BYTES CEIL_DEAD
+#   (container|host; host = rehearsal with HOST_DSN) CEIL_WAL_BASELINE_MULTIPLE CEIL_WAL_FLOOR_BYTES CEIL_REL_BYTES
 #   RANKED_RKEYS MAIN_RKEY_PATTERN BE_RKEY_PATTERN READBACK_JSON (BSR effective-config readback)
 #   (READBACK_JSON is required to exist and be fresh: stale_at > now)
 #   SECRET_KEY_REGEX (default: keys matching PASSWORD|SECRET|TOKEN|KEY|PASS) selects which env-file values the secret scan hunts for
@@ -77,9 +77,13 @@ HORIZON_MAIN_DAYS="${HORIZON_MAIN_DAYS:-3}"
 HORIZON_BE_DAYS="${HORIZON_BE_DAYS:-10}"
 FEEDGEN_CONTAINER="${FEEDGEN_CONTAINER:-feedgen}"
 RUNNER="${RUNNER:-container}"
-CEIL_WAL_BYTES="${CEIL_WAL_BYTES:-614400}"
+# WAL ceiling (D4 amended 2026-08-18, owner): a batch's attributed WAL may not exceed the estate's own baseline write
+# rate (fresh control read) x the batch's duration incl. the inter-batch pause, i.e. the backfill never writes faster
+# than the estate already writes; a small absolute floor keeps idle systems (rehearsal) from tripping on noise.
+CEIL_WAL_BASELINE_MULTIPLE="${CEIL_WAL_BASELINE_MULTIPLE:-1.0}"
+CEIL_WAL_FLOOR_BYTES="${CEIL_WAL_FLOOR_BYTES:-614400}"
+PAUSE_SECONDS="${PAUSE_SECONDS:-1}"
 CEIL_REL_BYTES="${CEIL_REL_BYTES:-409600}"
-CEIL_DEAD="${CEIL_DEAD:-1000}"
 READBACK_JSON="${READBACK_JSON:-/opt/newsflows/blueskyranker_v2/logs/effective_config_readback.json}"
 SKIP_LIVE_IMAGE_CHECKS="${SKIP_LIVE_IMAGE_CHECKS:-0}"
 SECRET_KEY_REGEX="${SECRET_KEY_REGEX:-(PASSWORD|SECRET|TOKEN|_KEY|APIKEY|PASS)}"
@@ -263,7 +267,7 @@ cmd_preflight() {
     (( HORIZON_MAIN_DAYS >= rb_main && HORIZON_BE_DAYS >= rb_be )) || die "horizon below BSR push window (readback main $rb_main / be $rb_be)"
     sudo -n sha256sum "$READBACK_JSON" | emit effective-config-readback.sha256
   fi
-  { echo "generated_at=$(ts)"; echo "tree=$TREE"; echo "source_sha=$sha"; echo "runner_script_sha256=$runner_sha"; echo "dsn_helper_sha256=$helper_sha"; echo "dist_backfill_sha256=$EXPECTED_DIST_SHA256"; echo "dist_content_time_sha256=$EXPECTED_CT_SHA256"; echo "image=$IMG"; echo "image_validator_sha256=$img_ct"; echo "feedgen_retention_enabled=$ret"; echo "runner=$RUNNER"; echo "packet_sha256=$PACKET_SHA"; echo "network=$NETWORK"; echo "env_file=$ENV_FILE"; echo "db_container=$DB_CONTAINER"; echo "main_dids=$MAIN_DIDS"; echo "be_did=$BE_DID"; echo "horizon_main_days=$HORIZON_MAIN_DAYS"; echo "horizon_be_days=$HORIZON_BE_DAYS"; echo "catalog_max_age_main=$max_main catalog_max_age_be=$max_be readback_push_main=$rb_main readback_push_be=$rb_be"; echo "ceilings wal<=$CEIL_WAL_BYTES relation<=$CEIL_REL_BYTES dead<=$CEIL_DEAD"; echo "since_main=$SINCE_MAIN since_be=$SINCE_BE"; echo "prereg_main=$PREREG_MAIN prereg_be=$PREREG_BE (exact)"; echo "expected_tool_refs=$EXPECTED_TOOL_REFS"; } | emit source-set.txt
+  { echo "generated_at=$(ts)"; echo "tree=$TREE"; echo "source_sha=$sha"; echo "runner_script_sha256=$runner_sha"; echo "dsn_helper_sha256=$helper_sha"; echo "dist_backfill_sha256=$EXPECTED_DIST_SHA256"; echo "dist_content_time_sha256=$EXPECTED_CT_SHA256"; echo "image=$IMG"; echo "image_validator_sha256=$img_ct"; echo "feedgen_retention_enabled=$ret"; echo "runner=$RUNNER"; echo "packet_sha256=$PACKET_SHA"; echo "network=$NETWORK"; echo "env_file=$ENV_FILE"; echo "db_container=$DB_CONTAINER"; echo "main_dids=$MAIN_DIDS"; echo "be_did=$BE_DID"; echo "horizon_main_days=$HORIZON_MAIN_DAYS"; echo "horizon_be_days=$HORIZON_BE_DAYS"; echo "catalog_max_age_main=$max_main catalog_max_age_be=$max_be readback_push_main=$rb_main readback_push_be=$rb_be"; echo "ceilings wal<=max($CEIL_WAL_FLOOR_BYTES, $CEIL_WAL_BASELINE_MULTIPLE x baseline_rate x (batch_elapsed+${PAUSE_SECONDS}s)) relation<=$CEIL_REL_BYTES dead<=2 x updated rows"; echo "since_main=$SINCE_MAIN since_be=$SINCE_BE"; echo "prereg_main=$PREREG_MAIN prereg_be=$PREREG_BE (exact)"; echo "expected_tool_refs=$EXPECTED_TOOL_REFS"; } | emit source-set.txt
   # the absolute bounds must be at or before the rolling horizon boundary of this instant (a fixed older bound is a superset)
   local g; for g in main be; do [[ "$(group_since "$g")" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{3}Z$ ]] || die "SINCE_${g^^} must be ISO-8601 with milliseconds and Z"; [[ "$(group_since "$g")" < "$(horizon_since "$g")" || "$(group_since "$g")" == "$(horizon_since "$g")" ]] || die "SINCE_${g^^}=$(group_since "$g") is later than the rolling $(group_horizon "$g")-day boundary $(horizon_since "$g")"; done
   echo "$(group_since main)" | emit since-main.txt
@@ -319,8 +323,12 @@ cmd_apply() {
     local twal; twal=$(node -e 'const j=JSON.parse(require("fs").readFileSync(process.argv[1]));const b=(j.revalidation&&j.revalidation.batches)||[];const w=b.map(x=>[x.wal_bytes,x.elapsed_ms]).filter(x=>typeof x[0]==="number");if(!w.length){console.log("");process.exit(0)}const r=Number(process.argv[2]);const adj=w.map(([wb,ms])=>Math.max(0,wb-Math.round(r*(ms||0)/1000)));console.log(Math.max(...adj))' "$f" "$wps")
     local wal_used=$pw wal_source="pg_stat_wal_delta_minus_control_rate_x_duration"
     [[ -n "$twal" ]] && { wal_used=$twal; wal_source="tool_in_transaction_lsn_advance_minus_control_rate_x_batch_elapsed (cluster-wide insert LSN; concurrent writers included then subtracted)"; }
-    (( wal_used <= CEIL_WAL_BYTES && pr <= CEIL_REL_BYTES && pd <= CEIL_DEAD )) || verdict="BREACH"
-    { echo "batches=$nb exit=$rc updated=$(jsonq "$f" revalidation.updated) complete=$(jsonq "$f" revalidation.complete) invocation_seconds=$dur"; echo "delta_wal_bytes=$dw delta_relation_bytes=$dr delta_dead_tuples=$dd"; echo "control_file=$(basename "$(latest_control)") control_rate_per_s wal=$wps relation=$rps dead=$dps (clamped at 0)"; echo "per_batch_wal_minus_control=$pw per_batch_relation_minus_control=$pr per_batch_dead_minus_control=$pd"; echo "wal_used_for_verdict=$wal_used wal_source=$wal_source"; echo "ceilings wal<=$CEIL_WAL_BYTES relation<=$CEIL_REL_BYTES dead<=$CEIL_DEAD"; echo "verdict=$verdict"; } | emit "ceiling-$g-$label.txt"
+    # baseline-scaled WAL ceiling: multiple x baseline rate x (max batch elapsed + pause), floored at CEIL_WAL_FLOOR_BYTES
+    local max_ms; max_ms=$(node -e 'const j=JSON.parse(require("fs").readFileSync(process.argv[1]));const b=(j.revalidation&&j.revalidation.batches)||[];console.log(Math.max(0,...b.map(x=>x.elapsed_ms||0)))' "$f")
+    local wal_ceiling; wal_ceiling=$(node -e 'const [m,r,ms,p,fl]=process.argv.slice(1).map(Number);console.log(Math.max(fl,Math.round(m*r*(ms/1000+p))))' "$CEIL_WAL_BASELINE_MULTIPLE" "$wps" "$max_ms" "$PAUSE_SECONDS" "$CEIL_WAL_FLOOR_BYTES")
+    local dead_ceiling=$(( 2 * $(jsonq "$f" revalidation.updated) / nb ))
+    (( wal_used <= wal_ceiling && pr <= CEIL_REL_BYTES && pd <= dead_ceiling )) || verdict="BREACH"
+    { echo "batches=$nb exit=$rc updated=$(jsonq "$f" revalidation.updated) complete=$(jsonq "$f" revalidation.complete) invocation_seconds=$dur max_batch_elapsed_ms=$max_ms"; echo "delta_wal_bytes=$dw delta_relation_bytes=$dr delta_dead_tuples=$dd"; echo "control_file=$(basename "$(latest_control)") control_rate_per_s wal=$wps relation=$rps dead=$dps (clamped at 0)"; echo "per_batch_wal_minus_control=$pw per_batch_relation_minus_control=$pr per_batch_dead_minus_control=$pd"; echo "wal_used_for_verdict=$wal_used wal_source=$wal_source"; echo "ceilings wal<=$wal_ceiling (=max(floor $CEIL_WAL_FLOOR_BYTES, $CEIL_WAL_BASELINE_MULTIPLE x baseline $wps B/s x ($max_ms ms + ${PAUSE_SECONDS}s))) relation<=$CEIL_REL_BYTES dead<=$dead_ceiling (=2 x updated rows per batch)"; echo "verdict=$verdict"; } | emit "ceiling-$g-$label.txt"
   else
     echo "batches=0 exit=$rc verdict=no_batches" | emit "ceiling-$g-$label.txt"
   fi
