@@ -379,7 +379,7 @@ cmd_apply() {
   [[ "$label" =~ ^neg ]] && export ALLOW_CEILING_OVERRIDE=1 || export ALLOW_CEILING_OVERRIDE=0
   assert_bound_env
   # breach cap (contract: one re-measure, a third repair attempt is prohibited): count prior BREACH receipts
-  local nb_breach; nb_breach=$(grep -l '^verdict=BREACH$' "$E"/ceiling-be-*.txt 2>/dev/null | grep -v -- '-neg' | wc -l | tr -d ' ')
+  local nb_breach; nb_breach=$( { grep -l '^verdict=BREACH$' "$E"/ceiling-be-*.txt 2>/dev/null || true; } | { grep -v -- '-neg' || true; } | wc -l | tr -d ' ')
   if (( nb_breach >= 2 )); then die "two consecutive ceiling breaches already recorded in $E -- STOP FOR GOOD + escalation (a third repair attempt is prohibited)"; fi
   if (( nb_breach == 1 )); then [[ "$label" =~ r$ && "$maxb" == "1" ]] || die "after a BREACH the only permitted invocation is the single re-measure 'apply <label>r 1'"; fi
   # BEFORE THE MUTATION: re-read the participant-safety facts and the running image; any change since preflight is a STOP
