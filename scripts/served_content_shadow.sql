@@ -3,7 +3,9 @@
 -- the feed's publisher DID), and check (a) every served publisher row is content-time valid v2 and inside the content window,
 -- (b) the served publisher rows appear in the same relative order as the content shadow (score desc, content_time desc,
 -- indexedAt desc, uri desc) -> zero inversions, (c) the served request carried the new clock/revision.
--- Params via psql -v: rkeys='newsflow-nl-2,newsflow-fr-2,newsflow-cz-2,newsflow-ir-2'
+-- Params via psql -v: rkeys='newsflow-nl-2,…', requester_sha='<sha256 of the health bot DID>', bstart='<ISO time of the battery fetch start>'
+-- The analysed request is the LATEST request BY THAT REQUESTER at/after bstart (never "the latest by anyone"): participant traffic can neither
+-- be analysed nor mask the fresh authenticated fetch; a feed with no such row yields NULLs (the runner classifies that as a precondition).
 \set ON_ERROR_STOP on
 \pset format unaligned
 \pset fieldsep '\t'
@@ -20,6 +22,7 @@ WITH target AS (
   SELECT DISTINCT ON (rl.algo) rl.algo AS rkey, rl.id AS request_id, rl.timestamp AS ts, encode(digest(rl.requester_did, 'sha256'), 'hex') AS requester_sha256,
          rl.publisher_time_clock AS served_clock, rl.feed_catalog_revision AS served_revision, rl.request_reference_time AS ref
   FROM request_log rl JOIN target t ON t.rkey = rl.algo
+  WHERE encode(digest(rl.requester_did, 'sha256'), 'hex') = :'requester_sha' AND rl.timestamp >= :'bstart'::timestamptz
   ORDER BY rl.algo, rl.timestamp DESC
 ), served_all AS (  -- every served row of the latest request; publisher rows are those whose post.author is the feed's publisher
   SELECT l.rkey, rp.position, rp.post_uri AS uri, p.uri IS NULL AS unjoined, (p.author = t.publisher_did) AS is_publisher,
