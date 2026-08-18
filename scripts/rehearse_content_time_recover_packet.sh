@@ -62,7 +62,7 @@ INSERT INTO feedgen_ops.feed_catalog
   (feed_id, rkey, display_name, country, publisher_did, algo_policy_id, access_policy_id, enabled)
 VALUES
   ('newsflow-zz-2-a', 'newsflow-zz-2a', 'Rehearsal Recover', 'ZZ', '$pub_did', 'chronological', 'subscriber-default', true);
-UPDATE feedgen_ops.feed_catalog SET publisher_post_max_age_days = 10 WHERE rkey = 'newsflow-zz-2a';
+UPDATE feedgen_ops.feed_catalog SET publisher_post_max_age_days = 10, publisher_post_max_age_source = 'study_default' WHERE rkey = 'newsflow-zz-2a';
 DELETE FROM public.post WHERE uri LIKE 'at://%/app.bsky.feed.post/rec-%';
 INSERT INTO public.post (
   uri, cid, "indexedAt", "createdAt", author, text, "rootUri", "rootCid",
