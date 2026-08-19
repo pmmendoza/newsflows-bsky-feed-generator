@@ -65,7 +65,7 @@ assert_bindings_minimal() {  # what a RESTORE needs and nothing more: the approv
   [[ "$(sha256sum "${BASH_SOURCE[0]}" | cut -d' ' -f1)" == "$EXPECTED_RUNNER_SHA" ]] || die "executing runner hash != EXPECTED_RUNNER_SHA"
   [[ "$(sha256sum "$d/scripts/served_content_shadow.sql" | cut -d' ' -f1)" == "$EXPECTED_SHADOW_SQL_SHA" ]] || die "served_content_shadow.sql hash != EXPECTED_SHADOW_SQL_SHA"
   [[ "$(sha256sum "$d/scripts/served_latency_from_logs.sh" | cut -d' ' -f1)" == "$EXPECTED_LATENCY_SH_SHA" ]] || die "served_latency_from_logs.sh hash != EXPECTED_LATENCY_SH_SHA"
-  for v in "$EXPECTED_RUNNER_SHA" "$EXPECTED_SHADOW_SQL_SHA" "$EXPECTED_LATENCY_SH_SHA" "$EXPECTED_REQUESTER_SHA" "$EXPECTED_FEEDGEN_IMAGE" "$EXPECTED_SCORE_BACKED_FLOOR"; do grep -qF -- "$v" "$PACKET_PATH" || die "value '$v' does not appear in the approved packet"; done
+  for v in "$EXPECTED_RUNNER_SHA" "$EXPECTED_SHADOW_SQL_SHA" "$EXPECTED_LATENCY_SH_SHA" "$EXPECTED_REQUESTER_SHA" "$EXPECTED_FEEDGEN_IMAGE" "$EXPECTED_SCORE_BACKED_FLOOR" "BSR_UNIT=$BSR_UNIT" "EXPECTED_BSR_HANDLES=$EXPECTED_BSR_HANDLES"; do grep -qF -- "$v" "$PACKET_PATH" || die "value '$v' does not appear in the approved packet"; done
   if [[ -f "$E/feedgen-bulk-rollback.json" ]]; then : "${EXPECTED_ROLLBACK_SHA:?EXPECTED_ROLLBACK_SHA is required once a rollback body exists}"; local rb; rb=$(sha256sum "$E/feedgen-bulk-rollback.json" | cut -d' ' -f1); [[ "$rb" == "$EXPECTED_ROLLBACK_SHA" ]] || die "rollback body hash $rb != EXPECTED_ROLLBACK_SHA $EXPECTED_ROLLBACK_SHA"; fi
 }
 assert_bindings() {  # full: minimal + catalog identity (deployed == origin@CATALOG_SOURCE_SHA == expected file hash), predecessor, readback TTL
@@ -212,7 +212,7 @@ cmd_battery() {  # <label>: per-invocation subdir; fresh authenticated requests 
   bindings_capture || die_precondition "battery bindings/readback freshness not satisfied -- fix and re-run"
   [[ "$(docker inspect feedgen --format '{{.Image}}')" == "$EXPECTED_FEEDGEN_IMAGE" ]] || die "GATE FAIL: running feedgen image changed (!= EXPECTED_FEEDGEN_IMAGE)"
   local B="battery-$L-$(date -u +%Y%m%dT%H%M%SZ)"; install -d -o root -g newsflows -m 750 "$E/$B"; local E0=$E; E="$E/$B"
-  { echo "label=$L"; echo "started_at=$(ts)"; echo "applied_at=$APPLIED_AT"; tool_refs_line; } | emit meta.txt
+  { echo "label=$L"; echo "started_at=$(ts)"; echo "applied_at=$APPLIED_AT"; echo "bsr_unit=$BSR_UNIT"; echo "bsr_handles=$EXPECTED_BSR_HANDLES"; tool_refs_line; } | emit meta.txt
   # (0) fresh AUTHENTICATED served requests for every feed: run the canonical appview feed-health check now (it fetches each
   #     feed via the AppView relay as the health bot account -> new request_log rows, e2e latency in feed_health_latest.json)
   # wait for any in-flight standing run of the health fetch to finish, then start OUR run and prove it started after BSTART
