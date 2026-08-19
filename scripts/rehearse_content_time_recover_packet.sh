@@ -174,6 +174,12 @@ rb_bad=$(mktemp); sed 's/"time_column":"createdAt"/"time_column":"content_time_u
 set +e; E="$E-neg-timecol" READBACK_JSON="$rb_bad" bash "$runner" preflight >/dev/null 2>&1; rc=$?; set -e
 [[ $rc -ne 0 && ! -f "$E-neg-timecol/step1-be-prestate-rows.tsv" ]] || { echo "BSR time_column=content_time_utc did not stop preflight pre-artifact (rc=$rc)"; exit 1; }
 rm -f "$rb_bad"; sudo -n rm -rf "$E-neg-clock" "$E-neg-timecol"; echo "status=participant_safety_negatives ok"
+# production-path negative: with permit_negative_probe=0 pinned at preflight, a ^neg apply must be refused before any receipt
+set +e; E="$E-neg-permit" PERMIT_NEGATIVE_PROBE=0 bash "$runner" preflight >/dev/null 2>&1; rc=$?; set -e
+[[ $rc -eq 0 ]] || { echo "preflight with permit_negative_probe=0 should pass (rc=$rc)"; exit 1; }
+set +e; E="$E-neg-permit" PERMIT_NEGATIVE_PROBE=0 CEIL_WAL_FLOOR_BYTES=1 CEIL_WAL_BASELINE_MULTIPLE=0.5 bash "$runner" apply neg 1 >/dev/null 2>&1; rc=$?; set -e
+[[ $rc -ne 0 && ! -f "$E-neg-permit/step1-be-apply-neg.json" && ! -f "$E-neg-permit/ceiling-be-neg.txt" ]] || { echo "neg apply was not refused pre-artifact under permit_negative_probe=0 (rc=$rc)"; exit 1; }
+sudo -n rm -rf "$E-neg-permit"; echo "status=negative_probe_refused_on_production_path ok"
 step preflight bash "$runner" preflight
 [[ $(wc -l <"$E/step1-be-prestate-rows.tsv") -eq 1260 ]] || { echo "prestate snapshot count unexpected"; exit 1; }
 grep -q "^mode=recover$" "$E/source-set.txt" || { echo "mode=recover not recorded"; exit 1; }
