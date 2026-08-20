@@ -181,6 +181,72 @@ function testValidPolicyFieldUpdate() {
   assertEqual(update.ifCurrent?.algo_policy_id, 'chronological', 'if_current algo_policy_id')
 }
 
+function testContentTimeWithoutExpiryIsPermanent() {
+  // FT-FU-6: an absent transition expiry means the content-time arrangement is
+  // permanent -- the target state -- so the merged row must pass the age rules.
+  const live: FeedCatalog = {
+    ...baseFeed,
+    publisher_time_clock: 'content_time_v1',
+    publisher_time_transition_expires_at: '2026-09-01T18:00:00Z',
+    content_time_cutover_min_valid_share: 0.8,
+    content_time_contract_version: 'newsflows-content-time/v2',
+  }
+  const dryRun = buildFeedCatalogDryRun(
+    live,
+    validUpdate({ rkey: 'newsflow-nl-1', publisher_time_transition_expires_at: null }),
+    { studyExists: true },
+  )
+  assertEqual(dryRun.proposed.publisher_time_transition_expires_at, null, 'expiry cleared in proposal')
+  assertJsonEqual(
+    dryRun.blockers.filter((b: { code: string }) => b.code === 'invalid-publisher-age'),
+    [],
+    'clearing the expiry must not be blocked',
+  )
+}
+
+function testContentTimeStillRequiresFloorAndContractVersion() {
+  // Only the deadline became optional. The floor and contract version are what keep
+  // the clock auditable, so clearing either must still be blocked.
+  const live: FeedCatalog = {
+    ...baseFeed,
+    publisher_time_clock: 'content_time_v1',
+    publisher_time_transition_expires_at: '2026-09-01T18:00:00Z',
+    content_time_cutover_min_valid_share: 0.8,
+    content_time_contract_version: 'newsflows-content-time/v2',
+  }
+  for (const patch of [
+    { rkey: 'newsflow-nl-1', content_time_cutover_min_valid_share: null },
+    { rkey: 'newsflow-nl-1', content_time_contract_version: null },
+  ]) {
+    const dryRun = buildFeedCatalogDryRun(live, validUpdate(patch), { studyExists: true })
+    assert(
+      dryRun.blockers.some((b: { code: string }) => b.code === 'invalid-publisher-age'),
+      `clearing ${Object.keys(patch)[1]} on a content-time feed must be blocked`,
+    )
+  }
+}
+
+function testMalformedExpiryStillRejected() {
+  // Absent is permanent, but corrupt is still corrupt. (Note: the patch validator is
+  // shallow by design; the age rules run on the merged row, so assert them there.)
+  const live: FeedCatalog = {
+    ...baseFeed,
+    publisher_time_clock: 'content_time_v1',
+    publisher_time_transition_expires_at: '2026-09-01T18:00:00Z',
+    content_time_cutover_min_valid_share: 0.8,
+    content_time_contract_version: 'newsflows-content-time/v2',
+  }
+  const dryRun = buildFeedCatalogDryRun(
+    live,
+    validUpdate({ rkey: 'newsflow-nl-1', publisher_time_transition_expires_at: 'not-a-timestamp' }),
+    { studyExists: true },
+  )
+  assert(
+    dryRun.blockers.some((b: { code: string }) => b.code === 'invalid-publisher-age'),
+    'a malformed expiry must still be blocked',
+  )
+}
+
 function testRankerPriorityRequiresRankerPolicy() {
   const result = validateUpdate({
     rkey: 'newsflow-nl-1',
@@ -809,6 +875,9 @@ const tests = [
   testInvalidUpdateOp,
   testValidIfCurrent,
   testValidPolicyFieldUpdate,
+  testContentTimeWithoutExpiryIsPermanent,
+  testContentTimeStillRequiresFloorAndContractVersion,
+  testMalformedExpiryStillRejected,
   testRankerPriorityRequiresRankerPolicy,
   testNonRankerPolicyRequiresNullRankerPolicy,
   testRankerScoreSourceUpdate,

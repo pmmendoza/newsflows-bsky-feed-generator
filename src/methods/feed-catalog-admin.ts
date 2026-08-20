@@ -375,7 +375,9 @@ function publisherAgeErrors(row: Pick<FeedCatalog, 'enabled' | 'publisher_post_m
   if (row.publisher_time_clock === 'content_time_v1') {
     if (row.content_time_cutover_min_valid_share == null) errors.push('content_time_v1 requires content_time_cutover_min_valid_share')
     if (!row.content_time_contract_version) errors.push('content_time_v1 requires content_time_contract_version')
-    if (!row.publisher_time_transition_expires_at) errors.push('content_time_v1 requires publisher_time_transition_expires_at')
+    // No expiry means the transition is permanent (FT-FU-6), which is the target
+    // state; a malformed value is still rejected above. The floor and contract
+    // version remain required -- they are what keep the clock auditable.
   }
   return errors
 }

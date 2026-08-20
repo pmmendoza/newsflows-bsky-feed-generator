@@ -1134,6 +1134,44 @@ migrations['011_publisher_post_max_age'] = {
   },
 }
 
+migrations['012_content_time_expiry_optional'] = {
+  // FT-FU-6 (owner decision 2026-08-19): article-publication time is the target
+  // state, not a time-boxed transition, so a feed may run content_time_v1 with NO
+  // transition expiry -- absent means permanent. The 011 constraint required an
+  // expiry for any non-receipt clock, which made "permanent" unrepresentable.
+  //
+  // The floor and contract version stay required: those are what make the clock
+  // auditable. Only the deadline becomes optional. Expand-only; down() restores
+  // the stricter form and will fail loudly if a row has meanwhile dropped its
+  // expiry -- that is intended, since reverting must not silently drop the
+  // invariant it is restoring.
+  async up(db: Kysely<unknown>) {
+    await sql`
+      ALTER TABLE feedgen_ops.feed_catalog
+        DROP CONSTRAINT feed_catalog_content_time_activation_requirements,
+        ADD CONSTRAINT feed_catalog_content_time_activation_requirements
+          CHECK (
+            publisher_time_clock = 'receipt_time'
+            OR (content_time_cutover_min_valid_share IS NOT NULL
+                AND content_time_contract_version IS NOT NULL)
+          )
+    `.execute(db)
+  },
+  async down(db: Kysely<unknown>) {
+    await sql`
+      ALTER TABLE feedgen_ops.feed_catalog
+        DROP CONSTRAINT feed_catalog_content_time_activation_requirements,
+        ADD CONSTRAINT feed_catalog_content_time_activation_requirements
+          CHECK (
+            publisher_time_clock = 'receipt_time'
+            OR (publisher_time_transition_expires_at IS NOT NULL
+                AND content_time_cutover_min_valid_share IS NOT NULL
+                AND content_time_contract_version IS NOT NULL)
+          )
+    `.execute(db)
+  },
+}
+
 export async function validateContentTimeConstraints(db: Kysely<unknown>) {
   // Validation scans existing rows without holding the stronger ADD-CONSTRAINT
   // lock. Keep bounded timeouts so a busy production table fails safely and can
