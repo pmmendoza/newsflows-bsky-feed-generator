@@ -28,6 +28,9 @@ HEALTH_PY="${HEALTH_PY:-/opt/newsflows/tools/uv/newsflows-bskyhealth/bin/python}
 log() { echo "[r4] $*" >&2; }; die() { echo "[r4] STOP (gate FAIL / hard stop): $*" >&2; exit 2; }; die_precondition() { echo "[r4] PRECONDITION (not a gate FAIL, not a rollback trigger): $*" >&2; if [[ -d "${E:-}" ]]; then local f="$E/PRECONDITION-$(date -u +%Y%m%dT%H%M%SZ).txt"; { echo "precondition_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"; echo "reason=$*"; echo "subcommand=${SUBCMD_FOR_RECEIPT:-${1:-}}"; } > "$f" 2>/dev/null && chgrp newsflows "$f" 2>/dev/null && chmod 640 "$f" 2>/dev/null || true; fi; exit 4; }; ts() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 [[ "${die_early:-0}" == "1" ]] && die "CATALOG_SOURCE_SHA / PREDECESSOR_SOURCE_SHA must be full 40-hex commit ids (symbolic refs such as origin/main are refused)"
 emit() { local n=$1; [[ -e "$E/$n" ]] && die "refusing to overwrite $E/$n"; install -o root -g newsflows -m 640 /dev/stdin "$E/$n"; log "wrote $n"; }
+if [[ "${1:-}" == "apply" ]] && compgen -G "$E/rollback-rowstate-gate-*.txt" >/dev/null; then
+  die_precondition "verified restore evidence already exists in $E; use a fresh evidence root and re-preview before any new apply"
+fi
 [[ $(id -u) -eq 0 ]] || die "run as root (sudo -n)"
 [[ -d "$E" ]] || install -d -o root -g newsflows -m 750 "$E"
 HDR=""; trap '[[ -n "$HDR" ]] && rm -f "$HDR"' EXIT INT TERM HUP
