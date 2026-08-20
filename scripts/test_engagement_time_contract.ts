@@ -75,6 +75,20 @@ check(!assessEngagementScienceEligibility({
   minimumValidShare: 0.8, numerator: 100, denominator: 100,
 }).scienceEligible, 'expired transitions must fail closed')
 
+// FT-FU-6: once the transition is adopted permanently the catalog carries NO expiry.
+// That must stay science-eligible -- otherwise the ranker's compliance-export validator
+// fails closed and the ranking cycle dies (observed in production 2026-08-20T14:12Z).
+check(assessEngagementScienceEligibility({
+  ...activeContract, transitionExpiresAt: null,
+  contentTime: true, explicitBounds: true, contractVersion: 'newsflows-content-time/v2',
+  minimumValidShare: 0.8, numerator: 100, denominator: 100,
+}).scienceEligible, 'an absent transition expiry means permanent and must stay science-eligible')
+check(!assessEngagementScienceEligibility({
+  ...activeContract, transitionExpiresAt: 'not-a-timestamp',
+  contentTime: true, explicitBounds: true, contractVersion: 'newsflows-content-time/v2',
+  minimumValidShare: 0.8, numerator: 100, denominator: 100,
+}).scienceEligible, 'a corrupt expiry must still fail closed, not read as permanent')
+
 const monitorSource = fs.readFileSync(path.resolve(__dirname, '../src/methods/monitor.ts'), 'utf8')
 check(monitorSource.includes(".where('feed_id', '=', feedId)"), 'science export must select its clock from the feed catalog')
 check(monitorSource.includes('? [feedClock.publisher_did]'), 'feed-scoped export must use the selected publisher population')

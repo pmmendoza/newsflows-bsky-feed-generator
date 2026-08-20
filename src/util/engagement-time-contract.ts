@@ -24,9 +24,12 @@ export function assessEngagementScienceEligibility(input: {
       input.contentTime
       && input.explicitBounds
       && input.contractVersion === input.expectedContractVersion
-      && input.transitionExpiresAt !== null
-      && Number.isFinite(Date.parse(input.transitionExpiresAt))
-      && Date.parse(input.transitionExpiresAt) > input.referenceMs
+      // FT-FU-6: an ABSENT expiry means the content-time arrangement is permanent, so
+      // the export stays science-eligible. A PRESENT expiry must still be well-formed
+      // and unexpired -- a stale or corrupt deadline disqualifies exactly as before.
+      && (input.transitionExpiresAt === null
+          || (Number.isFinite(Date.parse(input.transitionExpiresAt))
+              && Date.parse(input.transitionExpiresAt) > input.referenceMs))
       && Number.isFinite(input.minimumValidShare)
       && input.minimumValidShare > 0
       && validPopulation,
