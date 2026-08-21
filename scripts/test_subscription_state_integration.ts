@@ -25,6 +25,7 @@ async function main() {
   if (!dsn || process.env.FEEDGEN_SUBSCRIPTION_TEST_CONFIRM !== 'disposable') {
     throw new Error('integration gate requires FEEDGEN_TEST_DSN and FEEDGEN_SUBSCRIPTION_TEST_CONFIRM=disposable')
   }
+  process.env.FEEDGEN_ADMIN_API_KEY = 'disposable-admin-capability-key'
   const db = createDb(dsn)
   const ctx = { db } as AppContext
   // feed_catalog is feedgen runtime state (not in the app migrations), but it
@@ -169,6 +170,13 @@ async function main() {
   await clean()
   const provisioned = await setSubscription(ctx, { ...ident, state: { scope: 'omni' } }, true, false)
   assert(typeof provisioned.creation_cas === 'string', '9: fresh provisioning returns a creation capability')
+  const originalAdminKey = process.env.FEEDGEN_ADMIN_API_KEY
+  process.env.FEEDGEN_ADMIN_API_KEY = 'rotated-admin-capability-key'
+  await expectErr(
+    () => setSubscription(ctx, { ...ident, state: { scope: 'none', feeds: [], subscribed: false }, expected: { scope: 'omni', feeds: [], subscribed: true }, rollback_capability: provisioned.creation_cas }, true, false, undefined, true),
+    'presence_rollback_capability_mismatch',
+  )
+  process.env.FEEDGEN_ADMIN_API_KEY = originalAdminKey
   await db.insertInto('follows').values({ subject: did, follows: 'did:plc:follow-fixture' }).execute()
   const plannedAbsent = await setSubscription(
     ctx,
@@ -229,6 +237,27 @@ async function main() {
     true,
   )
   await expectErr(repeatAbsent, 'stale_state')
+
+  // 9g. A first provisioning directly into assigned owns its assignment row
+  // and may be rolled back; later assignment history must not be erased.
+  await clean()
+  const assignedProvisioned = await setSubscription(ctx, { ...ident, state: { scope: 'assigned', feeds: [FEED_A] } }, true, false)
+  assert(typeof assignedProvisioned.creation_cas === 'string' && assignedProvisioned.creation_cas.length >= 40, '9g: assigned provisioning returns a nonce capability')
+  const assignedRemoved = await setSubscription(
+    ctx,
+    { ...ident, state: { scope: 'none', feeds: [], subscribed: false }, expected: { scope: 'assigned', feeds: [FEED_A], subscribed: true }, rollback_capability: assignedProvisioned.creation_cas },
+    true,
+    false,
+    undefined,
+    true,
+  )
+  assert(assignedRemoved.subscribed === false, '9g: assigned provisioning rollback succeeds')
+  const establishedCas = await setSubscription(ctx, { ...ident, state: { scope: 'omni' } }, true, false)
+  await setSubscription(ctx, { ...ident, state: { scope: 'assigned', feeds: [FEED_A] } }, true, false)
+  await expectErr(
+    () => setSubscription(ctx, { ...ident, state: { scope: 'none', feeds: [], subscribed: false }, expected: { scope: 'assigned', feeds: [FEED_A], subscribed: true }, rollback_capability: establishedCas.creation_cas }, true, false, undefined, true),
+    'presence_rollback_not_fresh',
+  )
 
   // 10. A scheduled refresh cannot reinsert follows after a concurrent
   // presence rollback: its subscriber FOR SHARE guard linearizes the write.
