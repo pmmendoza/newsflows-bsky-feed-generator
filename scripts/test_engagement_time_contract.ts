@@ -89,6 +89,34 @@ check(!assessEngagementScienceEligibility({
   minimumValidShare: 0.8, numerator: 100, denominator: 100,
 }).scienceEligible, 'a corrupt expiry must still fail closed, not read as permanent')
 
+// v3 contract eligibility
+const activeContractV3 = {
+  expectedContractVersion: 'newsflows-content-time/v3',
+  transitionExpiresAt: null,
+  referenceMs: reference,
+  allowEmptyPopulation: false,
+}
+const eligibleV3 = assessEngagementScienceEligibility({
+  ...activeContractV3,
+  contentTime: true,
+  explicitBounds: true,
+  contractVersion: 'newsflows-content-time/v3',
+  minimumValidShare: 0.8,
+  numerator: 80,
+  denominator: 100,
+})
+check(eligibleV3.scienceEligible && eligibleV3.observedValidShare === 0.8, 'v3 active contract with matching v3 version is science eligible')
+
+check(!assessEngagementScienceEligibility({
+  ...activeContractV3,
+  contentTime: true,
+  explicitBounds: true,
+  contractVersion: 'newsflows-content-time/v2',
+  minimumValidShare: 0.8,
+  numerator: 100,
+  denominator: 100,
+}).scienceEligible, 'v2 version when active catalog is v3 must fail closed')
+
 const monitorSource = fs.readFileSync(path.resolve(__dirname, '../src/methods/monitor.ts'), 'utf8')
 check(monitorSource.includes(".where('feed_id', '=', feedId)"), 'science export must select its clock from the feed catalog')
 check(monitorSource.includes('? [feedClock.publisher_did]'), 'feed-scoped export must use the selected publisher population')

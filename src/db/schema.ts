@@ -273,7 +273,7 @@ export interface FeedCatalogHistory {
 }
 
 export type ContentTimeStatus = 'source_valid' | 'source_invalid' | 'legacy_unknown'
-export type ContentTimeClampReason = 'missing' | 'unparseable' | 'future_skew' | 'past_bound'
+export type ContentTimeClampReason = 'missing' | 'unparseable' | 'future_skew' | 'past_bound' | 'future_skew_clamped'
 export type PublisherTimeClock = 'receipt_time' | 'content_time_v1'
 export type PublisherPostMaxAgeSource = 'study_default' | 'feed_override'
 

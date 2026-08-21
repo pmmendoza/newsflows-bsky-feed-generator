@@ -1172,6 +1172,98 @@ migrations['012_content_time_expiry_optional'] = {
   },
 }
 
+migrations['013_future_skew_clamped'] = {
+  // FT-FU-1 v3: add support for future_skew_clamped in content_time_clamp_reason.
+  // future_skew_clamped is valid only for a provenance-complete v3 source_valid row
+  // whose canonical time equals receipt (content_time_utc = "indexedAt").
+  // Down migration refuses while v3 / future_skew_clamped rows remain to preserve provenance.
+  async up(db: Kysely<unknown>) {
+    for (const table of ['post', 'engagement']) {
+      await sql.raw(`
+        SET LOCAL lock_timeout = '5s';
+        SET LOCAL statement_timeout = '30s';
+        ALTER TABLE ${table}
+          DROP CONSTRAINT ${table}_content_time_pair,
+          DROP CONSTRAINT ${table}_content_time_reason_values;
+        ALTER TABLE ${table}
+          ADD CONSTRAINT ${table}_content_time_reason_values
+            CHECK (content_time_clamp_reason IS NULL OR content_time_clamp_reason IN ('missing', 'unparseable', 'future_skew', 'past_bound', 'future_skew_clamped')) NOT VALID;
+        ALTER TABLE ${table}
+          ADD CONSTRAINT ${table}_content_time_pair
+            CHECK (
+              (content_time_status = 'source_valid'
+                AND content_time_utc IS NOT NULL
+                AND content_time_clamp_reason IS NULL
+                AND created_at_source_raw IS NOT NULL
+                AND content_time_validator_version IS NOT NULL)
+              OR (content_time_status = 'source_valid'
+                AND content_time_utc IS NOT NULL
+                AND content_time_utc::timestamptz = "indexedAt"::timestamptz
+                AND content_time_clamp_reason = 'future_skew_clamped'
+                AND created_at_source_raw IS NOT NULL
+                AND content_time_validator_version = 'newsflows-content-time/v3')
+              OR (content_time_status = 'source_invalid'
+                AND content_time_utc IS NULL
+                AND content_time_clamp_reason IN ('missing', 'unparseable', 'future_skew', 'past_bound')
+                AND created_at_source_raw IS NOT NULL
+                AND content_time_validator_version IS NOT NULL)
+              OR (content_time_status = 'legacy_unknown'
+                AND content_time_utc IS NULL
+                AND content_time_clamp_reason IS NULL
+                AND created_at_source_raw IS NULL
+                AND content_time_validator_version IS NULL)
+            ) NOT VALID;
+      `).execute(db)
+    }
+  },
+  async down(db: Kysely<unknown>) {
+    for (const table of ['post', 'engagement']) {
+      const v3Rows = await sql.raw<{ count: string }>(`
+        SELECT COUNT(*)::text AS count
+        FROM ${table}
+        WHERE content_time_validator_version = 'newsflows-content-time/v3'
+           OR content_time_clamp_reason = 'future_skew_clamped'
+      `).execute(db)
+      const count = Number(v3Rows.rows[0]?.count ?? 0)
+      if (count > 0) {
+        throw new Error(`cannot migrate down while ${count} v3 / future_skew_clamped rows remain in ${table}`)
+      }
+    }
+
+    for (const table of ['post', 'engagement']) {
+      await sql.raw(`
+        SET LOCAL lock_timeout = '5s';
+        SET LOCAL statement_timeout = '30s';
+        ALTER TABLE ${table}
+          DROP CONSTRAINT ${table}_content_time_pair,
+          DROP CONSTRAINT ${table}_content_time_reason_values;
+        ALTER TABLE ${table}
+          ADD CONSTRAINT ${table}_content_time_reason_values
+            CHECK (content_time_clamp_reason IS NULL OR content_time_clamp_reason IN ('missing', 'unparseable', 'future_skew', 'past_bound')) NOT VALID;
+        ALTER TABLE ${table}
+          ADD CONSTRAINT ${table}_content_time_pair
+            CHECK (
+              (content_time_status = 'source_valid'
+                AND content_time_utc IS NOT NULL
+                AND content_time_clamp_reason IS NULL
+                AND created_at_source_raw IS NOT NULL
+                AND content_time_validator_version IS NOT NULL)
+              OR (content_time_status = 'source_invalid'
+                AND content_time_utc IS NULL
+                AND content_time_clamp_reason IS NOT NULL
+                AND created_at_source_raw IS NOT NULL
+                AND content_time_validator_version IS NOT NULL)
+              OR (content_time_status = 'legacy_unknown'
+                AND content_time_utc IS NULL
+                AND content_time_clamp_reason IS NULL
+                AND created_at_source_raw IS NULL
+                AND content_time_validator_version IS NULL)
+            ) NOT VALID;
+      `).execute(db)
+    }
+  },
+}
+
 export async function validateContentTimeConstraints(db: Kysely<unknown>) {
   // Validation scans existing rows without holding the stronger ADD-CONSTRAINT
   // lock. Keep bounded timeouts so a busy production table fails safely and can

@@ -247,6 +247,61 @@ function testMalformedExpiryStillRejected() {
   )
 }
 
+function testContentTimeAcceptsV2AndV3Only() {
+  // Update to v2 is valid
+  const v2Update = validateUpdate({
+    rkey: 'newsflow-nl-1',
+    content_time_contract_version: 'newsflows-content-time/v2',
+  })
+  assert(v2Update.ok, 'v2 contract version update must be accepted')
+
+  // Update to v3 is valid
+  const v3Update = validateUpdate({
+    rkey: 'newsflow-nl-1',
+    content_time_contract_version: 'newsflows-content-time/v3',
+  })
+  assert(v3Update.ok, 'v3 contract version update must be accepted')
+
+  // Update to null is valid (when disabling or switching clock)
+  const nullUpdate = validateUpdate({
+    rkey: 'newsflow-nl-1',
+    content_time_contract_version: null,
+  })
+  assert(nullUpdate.ok, 'null contract version update must be accepted by validateUpdate')
+
+  // Rejects invalid version strings
+  for (const bad of ['newsflows-content-time/v1', 'newsflows-content-time/v4', 'invalid-version']) {
+    const badUpdate = validateUpdate({
+      rkey: 'newsflow-nl-1',
+      content_time_contract_version: bad,
+    })
+    assert(!badUpdate.ok, `validateUpdate must reject ${bad}`)
+    assertEqual(
+      badUpdate.error,
+      'content_time_contract_version must be newsflows-content-time/v2 or newsflows-content-time/v3, or null',
+      'invalid version error message',
+    )
+  }
+
+  // Dry-run checking for v3 enabled content-time feed
+  const liveV2: FeedCatalog = {
+    ...baseFeed,
+    publisher_time_clock: 'content_time_v1',
+    content_time_cutover_min_valid_share: 0.8,
+    content_time_contract_version: 'newsflows-content-time/v2',
+  }
+  const dryRunV3 = buildFeedCatalogDryRun(
+    liveV2,
+    validUpdate({ rkey: 'newsflow-nl-1', content_time_contract_version: 'newsflows-content-time/v3' }),
+    { studyExists: true },
+  )
+  assertJsonEqual(
+    dryRunV3.blockers.filter((b: { code: string }) => b.code === 'invalid-publisher-age'),
+    [],
+    'v3 update must have no invalid-publisher-age blockers',
+  )
+}
+
 function testRankerPriorityRequiresRankerPolicy() {
   const result = validateUpdate({
     rkey: 'newsflow-nl-1',
@@ -643,6 +698,11 @@ function fakeHistoryDb(
     selectFrom,
     insertInto,
     updateTable,
+    getExecutor: () => ({
+      transformQuery: (node: any) => node,
+      compileQuery: (node: any) => ({ sql: '', parameters: [] }),
+      executeQuery: async () => ({ rows: [] }),
+    }),
     transaction: () => ({
       execute: async (callback: (trx: any) => Promise<unknown>) => callback(db),
     }),
@@ -861,8 +921,177 @@ async function testBulkRequiresCasAndUniqueRows() {
   })
 }
 
+async function testRejectedCoherenceRollsBackRowAndHistory() {
+  const initialV2Feed1: FeedCatalog = {
+    ...baseFeed,
+    rkey: 'newsflow-nl-1',
+    study_id: null,
+    access_policy_id: 'subscriber-default',
+    publisher_time_clock: 'content_time_v1',
+    content_time_contract_version: 'newsflows-content-time/v2',
+    content_time_cutover_min_valid_share: 0.8,
+  }
+  const initialV2Feed2: FeedCatalog = {
+    ...baseFeed,
+    feed_id: 'feed-nl-2',
+    rkey: 'newsflow-nl-2',
+    study_id: null,
+    access_policy_id: 'subscriber-default',
+    publisher_time_clock: 'content_time_v1',
+    content_time_contract_version: 'newsflows-content-time/v2',
+    content_time_cutover_min_valid_share: 0.8,
+  }
+
+  let feeds: Record<string, FeedCatalog> = {
+    'newsflow-nl-1': { ...initialV2Feed1 },
+    'newsflow-nl-2': { ...initialV2Feed2 },
+  }
+  const history: FeedCatalogHistory[] = []
+
+  let inTransaction = false
+  let snapshotFeeds: Record<string, FeedCatalog> | null = null
+  let snapshotHistory: FeedCatalogHistory[] | null = null
+
+  const mockDb: any = {
+    selectFrom: (table: string) => {
+      let whereCol = ''
+      let whereVal: any
+      const q: any = {
+        select: () => q,
+        selectAll: () => q,
+        where: (col: string, op: string, val: any) => {
+          whereCol = col
+          whereVal = val
+          return q
+        },
+        orderBy: () => q,
+        limit: () => q,
+        forUpdate: () => q,
+        executeTakeFirst: async () => {
+          if (table === 'feedgen_ops.feed_catalog') {
+            if (whereCol === 'rkey' && typeof whereVal === 'string') {
+              return feeds[whereVal]
+            }
+            return Object.values(feeds)[0]
+          }
+          return undefined
+        },
+        execute: async () => {
+          if (table === 'feedgen_ops.feed_catalog') {
+            return Object.values(feeds)
+          }
+          return history
+        },
+      }
+      return q
+    },
+    updateTable: (table: string) => {
+      let patch: any = {}
+      let targetRkey = ''
+      const q: any = {
+        set: (p: any) => { patch = p; return q },
+        where: (col: string, op: string, val: string) => { targetRkey = val; return q },
+        executeTakeFirst: async () => {
+          if (feeds[targetRkey]) {
+            feeds[targetRkey] = { ...feeds[targetRkey], ...patch }
+            return { numUpdatedRows: 1 }
+          }
+          return { numUpdatedRows: 0 }
+        },
+      }
+      return q
+    },
+    insertInto: (table: string) => {
+      let values: any
+      const q: any = {
+        values: (v: any) => { values = v; return q },
+        execute: async () => {
+          if (table === 'feedgen_ops.feed_catalog_history') {
+            history.push(values)
+          }
+          return []
+        },
+      }
+      return q
+    },
+    getExecutor: () => ({
+      transformQuery: (node: any) => node,
+      compileQuery: (node: any) => ({ sql: '', parameters: [] }),
+      executeQuery: async () => ({ rows: [] }),
+    }),
+    transaction: () => ({
+      execute: async (callback: (trx: any) => Promise<unknown>) => {
+        inTransaction = true
+        snapshotFeeds = JSON.parse(JSON.stringify(feeds))
+        snapshotHistory = JSON.parse(JSON.stringify(history))
+        try {
+          const res = await callback(mockDb)
+          inTransaction = false
+          return res
+        } catch (err) {
+          // Transaction abort / rollback!
+          feeds = snapshotFeeds!
+          history.length = 0
+          history.push(...snapshotHistory!)
+          inTransaction = false
+          throw err
+        }
+      },
+    }),
+  }
+
+  process.env.FEEDGEN_ADMIN_API_KEY = 'coherence-test-key'
+  await withFeedCatalogServer(mockDb, async (server) => {
+    // 1. Incoherent single update (newsflow-nl-1 to v3 while newsflow-nl-2 remains v2)
+    const singleUpdateRes = await requestJson(
+      server,
+      '/api/admin/feed_catalog',
+      'POST',
+      { 'api-key': 'coherence-test-key' },
+      {
+        op: 'update',
+        rkey: 'newsflow-nl-1',
+        content_time_contract_version: 'newsflows-content-time/v3',
+        if_current: { content_time_contract_version: 'newsflows-content-time/v2' },
+      },
+    )
+    assertEqual(singleUpdateRes.status, 409, 'incoherent single update must be 409')
+    assertEqual(feeds['newsflow-nl-1'].content_time_contract_version, 'newsflows-content-time/v2', 'row must be rolled back on coherence failure')
+    assertEqual(history.length, 0, 'no history must be committed on coherence rollback')
+
+    // 2. Coherent bulk update (updating both feeds to v3 atomically)
+    const bulkRes = await requestJson(
+      server,
+      '/api/admin/feed_catalog/bulk',
+      'POST',
+      { 'api-key': 'coherence-test-key' },
+      {
+        updates: [
+          {
+            op: 'update',
+            rkey: 'newsflow-nl-1',
+            content_time_contract_version: 'newsflows-content-time/v3',
+            if_current: { content_time_contract_version: 'newsflows-content-time/v2' },
+          },
+          {
+            op: 'update',
+            rkey: 'newsflow-nl-2',
+            content_time_contract_version: 'newsflows-content-time/v3',
+            if_current: { content_time_contract_version: 'newsflows-content-time/v2' },
+          },
+        ],
+      },
+    )
+    assertEqual(bulkRes.status, 200, 'coherent bulk update must succeed')
+    assertEqual(feeds['newsflow-nl-1'].content_time_contract_version, 'newsflows-content-time/v3', 'feed1 updated to v3')
+    assertEqual(feeds['newsflow-nl-2'].content_time_contract_version, 'newsflows-content-time/v3', 'feed2 updated to v3')
+    assertEqual(history.length, 2, '2 history rows committed on successful bulk update')
+  })
+}
+
 const tests = [
   testBulkRequiresCasAndUniqueRows,
+  testRejectedCoherenceRollsBackRowAndHistory,
   testAdminUpdateWritesOneHistoryRowPerRevision,
   testHistoryReadEndpointAuthPaginationAndNewestFirst,
   testUpdatePathLocksRowGetPathDoesNot,
@@ -878,6 +1107,7 @@ const tests = [
   testContentTimeWithoutExpiryIsPermanent,
   testContentTimeStillRequiresFloorAndContractVersion,
   testMalformedExpiryStillRejected,
+  testContentTimeAcceptsV2AndV3Only,
   testRankerPriorityRequiresRankerPolicy,
   testNonRankerPolicyRequiresNullRankerPolicy,
   testRankerScoreSourceUpdate,

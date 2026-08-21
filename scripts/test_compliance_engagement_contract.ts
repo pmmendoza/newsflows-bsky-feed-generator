@@ -34,6 +34,7 @@ async function main() {
           content_time_cutover_min_valid_share: 0.8,
           content_time_contract_version: scenario.contract,
           publisher_time_transition_expires_at: scenario.expires,
+          enabled: true,
         }] }
       }
       if (text.includes('FROM candidates')) {
@@ -73,11 +74,22 @@ async function main() {
     check(payload.time_clock === 'content_time_v1', 'response must use canonical clock enum')
     check(payload.validity.numerator === 80 && payload.validity.denominator === 100, 'validity counts must be explicit')
 
+    const { invalidateActiveContentTimeContractCache } = await import('../src/util/content-time')
+    invalidateActiveContentTimeContractCache()
+    scenario.contract = 'newsflows-content-time/v3'
+    response = await fetch(base + query, { headers })
+    payload = await response.json()
+    check(response.ok && payload.science_eligible === true, 'v3 active contract must be science eligible')
+    check(payload.content_time_contract_version === 'newsflows-content-time/v3', 'v3 contract version reflected in response')
+
+    invalidateActiveContentTimeContractCache()
     scenario.contract = 'unsupported/v2'
     response = await fetch(base + query, { headers })
     payload = await response.json()
     check(payload.science_eligible === false, 'unsupported contract must fail closed')
+    check(payload.science_ineligible_reason === 'unresolved_contract_version', 'unresolved contract version raw-free reason reflected')
 
+    invalidateActiveContentTimeContractCache()
     scenario.contract = 'newsflows-content-time/v2'
     scenario.expires = '2000-01-01T00:00:00Z'
     response = await fetch(base + query, { headers })

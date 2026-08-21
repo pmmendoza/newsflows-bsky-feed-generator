@@ -23,7 +23,11 @@ import { resolveEngagementTimeHours } from '../algos/feed-builder'
 import { isConfigActivationDegraded } from '../util/config-activation'
 import { getRankerPriorityServingStatus } from '../algos/ranker-priority-helper'
 import { assessEngagementScienceEligibility } from '../util/engagement-time-contract'
-import { CONTENT_TIME_VALIDATOR_VERSION } from '../util/content-time'
+import {
+  CONTENT_TIME_VALIDATOR_VERSION,
+  isSupportedContentTimeVersion,
+  resolveActiveContentTimeContract,
+} from '../util/content-time'
 
 type EngagementExportType = 'like' | 'repost' | 'comment' | 'quote'
 type ActivityEventType = EngagementExportType | 'original_post'
@@ -1593,11 +1597,18 @@ export default function registerMonitorEndpoints(server: Server, ctx: AppContext
       const minimumValidShare = typeof feedClock?.content_time_cutover_min_valid_share === 'number'
         ? feedClock.content_time_cutover_min_valid_share
         : NaN
+      let activeCatalogVersion: string | null = null
+      let resolverFailureReason: string | null = null
+      try {
+        activeCatalogVersion = await resolveActiveContentTimeContract(db)
+      } catch {
+        resolverFailureReason = 'unresolved_contract_version'
+      }
       const { emptyPopulation, observedValidShare, scienceEligible } = assessEngagementScienceEligibility({
         contentTime,
         explicitBounds,
         contractVersion,
-        expectedContractVersion: CONTENT_TIME_VALIDATOR_VERSION,
+        expectedContractVersion: activeCatalogVersion ?? '',
         transitionExpiresAt: feedClock?.publisher_time_transition_expires_at ?? null,
         referenceMs,
         minimumValidShare,
@@ -1605,6 +1616,8 @@ export default function registerMonitorEndpoints(server: Server, ctx: AppContext
         denominator: validity.denominator,
         allowEmptyPopulation: scope === 'subscriber_on_publisher',
       })
+
+      const finalScienceEligible = resolverFailureReason === null && scienceEligible
 
       const response: any = {
         since,
@@ -1615,7 +1628,7 @@ export default function registerMonitorEndpoints(server: Server, ctx: AppContext
         count: events.length,
         events,
         feed_id: feedClock?.feed_id ?? null,
-        science_eligible: scienceEligible,
+        science_eligible: finalScienceEligible,
         time_clock: contentTime ? 'content_time_v1' : 'receipt_time',
         content_time_contract_version: contractVersion,
         publisher_time_transition_expires_at: feedClock?.publisher_time_transition_expires_at ?? null,
@@ -1627,6 +1640,9 @@ export default function registerMonitorEndpoints(server: Server, ctx: AppContext
           denominator_clock: 'receipt_time',
           denominator_bounds: '[since,until)',
         },
+      }
+      if (resolverFailureReason) {
+        response.science_ineligible_reason = resolverFailureReason
       }
       if (nextCursor) {
         response.next_cursor = nextCursor

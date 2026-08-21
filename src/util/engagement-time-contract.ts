@@ -1,3 +1,5 @@
+import { isSupportedContentTimeVersion } from './content-time'
+
 export function assessEngagementScienceEligibility(input: {
   contentTime: boolean
   explicitBounds: boolean
@@ -17,12 +19,14 @@ export function assessEngagementScienceEligibility(input: {
     && observedValidShare !== null
     && observedValidShare >= input.minimumValidShare
   )
+  const isSupported = isSupportedContentTimeVersion(input.contractVersion) && isSupportedContentTimeVersion(input.expectedContractVersion)
   return {
     emptyPopulation,
     observedValidShare,
     scienceEligible: Boolean(
       input.contentTime
       && input.explicitBounds
+      && isSupported
       && input.contractVersion === input.expectedContractVersion
       // FT-FU-6: an ABSENT expiry means the content-time arrangement is permanent, so
       // the export stays science-eligible. A PRESENT expiry must still be well-formed

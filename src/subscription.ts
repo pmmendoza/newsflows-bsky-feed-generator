@@ -11,7 +11,11 @@ import {
   restrictPublisherEngagementToSubscribersEnabled,
 } from './util/ingestion-scope'
 import { dualWriteLinkFields } from './util/link-fields'
-import { validateContentTime } from './util/content-time'
+import {
+  resolveActiveContentTimeContract,
+  SupportedContentTimeVersion,
+  validateContentTime,
+} from './util/content-time'
 
 // for saving embedded preview cards
 function isExternalEmbed(embed: any): embed is { external: { uri: string, title: string, description: string } } {
@@ -54,6 +58,18 @@ function sanitizeForPostgres(text: string | null | undefined): string {
 export class FirehoseSubscription extends FirehoseSubscriptionBase {
   async handleEvent(evt: RepoEvent) {
     if (!isCommit(evt)) return
+
+    let activeContractVersion: SupportedContentTimeVersion
+    try {
+      activeContractVersion = await resolveActiveContentTimeContract(this.db)
+    } catch (err) {
+      console.error(
+        `[${new Date().toISOString()}] - subscription: failed to resolve active content-time contract; skipping batch writes. error=${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      )
+      return
+    }
 
     const ops = await getOpsByType(evt)
 
@@ -143,7 +159,11 @@ export class FirehoseSubscription extends FirehoseSubscriptionBase {
       .filter(shouldStorePost)
       .map((create) => {
         const postIndexedAt = new Date().toISOString()
-        const contentTime = validateContentTime(create.record.createdAt, postIndexedAt)
+        const contentTime = validateContentTime(
+          create.record.createdAt,
+          postIndexedAt,
+          activeContractVersion,
+        )
         const external = create.record.embed && isExternalEmbed(create.record.embed)
           ? create.record.embed.external
           : null
@@ -181,7 +201,11 @@ export class FirehoseSubscription extends FirehoseSubscriptionBase {
       .filter(shouldStoreEngagement)
       .map((create) => {
         const engIndexedAt = new Date().toISOString()
-        const contentTime = validateContentTime(create.record.createdAt, engIndexedAt)
+        const contentTime = validateContentTime(
+          create.record.createdAt,
+          engIndexedAt,
+          activeContractVersion,
+        )
         return {
           uri: create.uri,
           cid: create.cid,
@@ -202,7 +226,11 @@ export class FirehoseSubscription extends FirehoseSubscriptionBase {
           .filter(shouldStoreEngagement)
           .map((create) => {
             const engIndexedAt = new Date().toISOString()
-            const contentTime = validateContentTime(create.record.createdAt, engIndexedAt)
+            const contentTime = validateContentTime(
+              create.record.createdAt,
+              engIndexedAt,
+              activeContractVersion,
+            )
             return {
               uri: create.uri,
               cid: create.cid,
@@ -226,7 +254,11 @@ export class FirehoseSubscription extends FirehoseSubscriptionBase {
             if (!quoted) return []
             if (!shouldStoreQuoteEngagement(create.author, quoted.uri)) return []
             const engIndexedAt = new Date().toISOString()
-            const contentTime = validateContentTime(create.record.createdAt, engIndexedAt)
+            const contentTime = validateContentTime(
+              create.record.createdAt,
+              engIndexedAt,
+              activeContractVersion,
+            )
             return [{
               uri: create.uri,
               cid: create.cid,

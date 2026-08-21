@@ -45,6 +45,7 @@ import {
   PUBLISHER_POST_MAX_AGE_DAYS_MAX,
   resolvePublisherServingWindow,
 } from '../algos/publisher-serving-window'
+import { invalidateActiveContentTimeContractCache } from '../util/content-time'
 
 const adminWriteAuth: ApiKeyAuthConfig = {
   primaryEnv: ['FEEDGEN_ADMIN_API_KEY'],
@@ -374,7 +375,14 @@ function publisherAgeErrors(row: Pick<FeedCatalog, 'enabled' | 'publisher_post_m
   }
   if (row.publisher_time_clock === 'content_time_v1') {
     if (row.content_time_cutover_min_valid_share == null) errors.push('content_time_v1 requires content_time_cutover_min_valid_share')
-    if (!row.content_time_contract_version) errors.push('content_time_v1 requires content_time_contract_version')
+    if (!row.content_time_contract_version) {
+      errors.push('content_time_v1 requires content_time_contract_version')
+    } else if (
+      row.content_time_contract_version !== 'newsflows-content-time/v2' &&
+      row.content_time_contract_version !== 'newsflows-content-time/v3'
+    ) {
+      errors.push('content_time_contract_version must be newsflows-content-time/v2 or newsflows-content-time/v3')
+    }
     // No expiry means the transition is permanent (FT-FU-6), which is the target
     // state; a malformed value is still rejected above. The floor and contract
     // version remain required -- they are what keep the clock auditable.
@@ -634,8 +642,8 @@ export function validateUpdate(body: any): { ok: true; row: ValidatedCatalogUpda
   if (body.content_time_cutover_min_valid_share !== undefined && body.content_time_cutover_min_valid_share !== null && (typeof body.content_time_cutover_min_valid_share !== 'number' || !Number.isFinite(body.content_time_cutover_min_valid_share) || body.content_time_cutover_min_valid_share <= 0 || body.content_time_cutover_min_valid_share > 1)) {
     return { ok: false, error: 'content_time_cutover_min_valid_share must be > 0 and <= 1, or null' }
   }
-  if (body.content_time_contract_version !== undefined && !nullableString(body.content_time_contract_version)) {
-    return { ok: false, error: 'content_time_contract_version must be string or null' }
+  if (body.content_time_contract_version !== undefined && body.content_time_contract_version !== null && body.content_time_contract_version !== 'newsflows-content-time/v2' && body.content_time_contract_version !== 'newsflows-content-time/v3') {
+    return { ok: false, error: 'content_time_contract_version must be newsflows-content-time/v2 or newsflows-content-time/v3, or null' }
   }
   const updates = {
     display_name: body.display_name,
@@ -980,58 +988,112 @@ async function studyExists(ctx: AppContext, studyId: string | null | undefined):
   return studyExistsFromDb(ctx.db, studyId)
 }
 
+async function checkCatalogContractCoherence(
+  trx: Transaction<DatabaseSchema>,
+): Promise<{ ok: true } | { ok: false; error: string }> {
+  const rows = await trx
+    .selectFrom('feedgen_ops.feed_catalog')
+    .select(['rkey', 'enabled', 'publisher_time_clock', 'content_time_contract_version'])
+    .where('enabled', '=', true)
+    .where('publisher_time_clock', '=', 'content_time_v1')
+    .execute()
+
+  if (rows.length === 0) return { ok: true }
+
+  const versions = new Set<string>()
+  for (const row of rows) {
+    const version = String(row.content_time_contract_version ?? '').trim()
+    if (!version) {
+      return {
+        ok: false,
+        error: `enabled content_time_v1 feed ${row.rkey} is missing content_time_contract_version`,
+      }
+    }
+    versions.add(version)
+  }
+
+  if (versions.size > 1) {
+    return {
+      ok: false,
+      error: `mutation would leave enabled content_time_v1 feeds with mixed contract versions: ${[...versions].join(', ')}`,
+    }
+  }
+
+  const [version] = versions
+  if (version !== 'newsflows-content-time/v2' && version !== 'newsflows-content-time/v3') {
+    return {
+      ok: false,
+      error: `unsupported content-time contract version in catalog: ${version}`,
+    }
+  }
+
+  return { ok: true }
+}
+
+export class CatalogApplyAbort extends Error {
+  constructor(readonly httpStatus: number, readonly payload: unknown) {
+    super('catalog apply aborted')
+  }
+}
+
 async function applyCatalogUpdate(
   trx: Transaction<DatabaseSchema>,
   update: ValidatedCatalogUpdate,
   identity: FeedCatalogHistoryIdentity,
+  opts: { skipCoherenceCheck?: boolean } = {},
 ) {
   const current = await readCatalogRowFromDb(trx, update.rkey, true)
-  if (!current) return { httpStatus: 404, payload: feedCatalogNotFoundPayload(update.rkey), applied: false }
+  if (!current) throw new CatalogApplyAbort(404, feedCatalogNotFoundPayload(update.rkey))
   const proposedStudyId = update.patch.study_id !== undefined
     ? update.patch.study_id
     : current.study_id
   const dryRun = buildFeedCatalogDryRun(current, update, {
     studyExists: await studyExistsFromDb(trx, proposedStudyId),
   })
-  if (dryRun.blockers.length > 0) return {
-    httpStatus: 409,
-    payload: buildFeedCatalogApplyBlocked(dryRun, {
-      code: 'dry-run-blocked',
-      message: 'apply refused because feedgen dry-run has blockers',
-    }),
-    applied: false,
+  if (dryRun.blockers.length > 0) {
+    throw new CatalogApplyAbort(
+      409,
+      buildFeedCatalogApplyBlocked(dryRun, {
+        code: 'dry-run-blocked',
+        message: 'apply refused because feedgen dry-run has blockers',
+      }),
+    )
   }
   const mismatches = currentValueMismatches(current, update.ifCurrent)
-  if (mismatches.length > 0) return {
-    httpStatus: 409,
-    payload: buildFeedCatalogApplyConflict(dryRun, mismatches),
-    applied: false,
+  if (mismatches.length > 0) {
+    throw new CatalogApplyAbort(409, buildFeedCatalogApplyConflict(dryRun, mismatches))
   }
-  if (dryRun.change_count === 0) return {
-    httpStatus: 200,
-    payload: buildFeedCatalogApplyResult(current, current, dryRun, false),
-    applied: false,
+  if (dryRun.change_count === 0) {
+    return {
+      httpStatus: 200,
+      payload: buildFeedCatalogApplyResult(current, current, dryRun, false),
+      applied: false,
+    }
   }
   const result = await trx
     .updateTable('feedgen_ops.feed_catalog')
     .set({ ...update.patch, catalog_revision: Number(current.catalog_revision ?? 0) + 1 } as any)
     .where('rkey', '=', update.rkey)
     .executeTakeFirst()
-  if (Number(result.numUpdatedRows ?? 0) === 0) return {
-    httpStatus: 404,
-    payload: feedCatalogNotFoundPayload(update.rkey),
-    applied: false,
+  if (Number(result.numUpdatedRows ?? 0) === 0) {
+    throw new CatalogApplyAbort(404, feedCatalogNotFoundPayload(update.rkey))
   }
   const after = await readCatalogRowFromDb(trx, update.rkey)
-  if (!after) return { httpStatus: 500, payload: { error: 'updated row could not be read back' }, applied: false }
+  if (!after) throw new CatalogApplyAbort(500, { error: 'updated row could not be read back' })
+  if (!opts.skipCoherenceCheck) {
+    const coherence = await checkCatalogContractCoherence(trx)
+    if (!coherence.ok) {
+      throw new CatalogApplyAbort(
+        409,
+        buildFeedCatalogApplyBlocked(dryRun, {
+          code: 'incoherent-catalog-contract-version',
+          message: coherence.error,
+        }),
+      )
+    }
+  }
   await appendFeedCatalogHistory(trx, current, after, dryRun.changes, identity)
   return { httpStatus: 200, payload: buildFeedCatalogApplyResult(current, after, dryRun, true), applied: true }
-}
-
-class BulkApplyAbort extends Error {
-  constructor(readonly httpStatus: number, readonly payload: unknown) {
-    super('bulk feed catalog apply aborted')
-  }
 }
 
 export default function registerFeedCatalogAdminEndpoint(
@@ -1184,15 +1246,23 @@ export default function registerFeedCatalogAdminEndpoint(
     const identity = historyIdentity(req.headers)
     try {
       const results = await ctx.db.transaction().execute(async (trx) => {
+        await sql`SELECT pg_advisory_xact_lock(hashtext('feedgen_ops.feed_catalog'))`.execute(trx)
         const rows: unknown[] = []
         // Stable lock order prevents two overlapping bulk applies deadlocking.
         for (const update of [...validated].sort((a, b) => a.rkey.localeCompare(b.rkey))) {
-          const result = await applyCatalogUpdate(trx, update, identity)
-          if (result.httpStatus !== 200) throw new BulkApplyAbort(result.httpStatus, result.payload)
+          const result = await applyCatalogUpdate(trx, update, identity, { skipCoherenceCheck: true })
           rows.push(result.payload)
+        }
+        const coherence = await checkCatalogContractCoherence(trx)
+        if (!coherence.ok) {
+          throw new CatalogApplyAbort(409, {
+            code: 'incoherent-catalog-contract-version',
+            message: coherence.error,
+          })
         }
         return rows
       })
+      invalidateActiveContentTimeContractCache()
       return res.json({
         schema_version: 1,
         operation: 'feed.bulk-update',
@@ -1203,7 +1273,7 @@ export default function registerFeedCatalogAdminEndpoint(
         raw_values_in_output: false,
       })
     } catch (err) {
-      if (err instanceof BulkApplyAbort) {
+      if (err instanceof CatalogApplyAbort) {
         return res.status(err.httpStatus).json({
           schema_version: 1,
           operation: 'feed.bulk-update',
@@ -1237,6 +1307,7 @@ export default function registerFeedCatalogAdminEndpoint(
         const v = validateInsert(body)
         if (!v.ok) return res.status(400).json({ error: v.error })
         await ctx.db.transaction().execute(async (trx) => {
+          await sql`SELECT pg_advisory_xact_lock(hashtext('feedgen_ops.feed_catalog'))`.execute(trx)
           await trx
             .insertInto('feedgen_ops.feed_catalog')
             .values({
@@ -1264,7 +1335,14 @@ export default function registerFeedCatalogAdminEndpoint(
             } as any)
             .execute()
           const after = await readCatalogRowFromDb(trx, v.row.rkey)
-          if (!after) throw new Error('inserted row could not be read back')
+          if (!after) throw new CatalogApplyAbort(500, { error: 'inserted row could not be read back' })
+          const coherence = await checkCatalogContractCoherence(trx)
+          if (!coherence.ok) {
+            throw new CatalogApplyAbort(409, {
+              code: 'incoherent-catalog-contract-version',
+              message: coherence.error,
+            })
+          }
           const emptyValues = Object.fromEntries(
             UPDATE_FIELDS.map((field) => [field, null]),
           ) as Record<UpdateField, null>
@@ -1276,6 +1354,7 @@ export default function registerFeedCatalogAdminEndpoint(
             identity,
           )
         })
+        invalidateActiveContentTimeContractCache()
         console.log(
           `[${new Date().toISOString()}] - feed_catalog-admin: INSERT rkey=${v.row.rkey} feed_id=${v.row.feed_id} algo=${v.row.algo_policy_id} access=${v.row.access_policy_id}`,
         )
@@ -1284,9 +1363,12 @@ export default function registerFeedCatalogAdminEndpoint(
       if (body.op === 'update') {
         const v = validateUpdate(body)
         if (!v.ok) return res.status(400).json({ error: v.error })
-        const apply = await ctx.db.transaction().execute((trx) =>
-          applyCatalogUpdate(trx, v.row, identity))
+        const apply = await ctx.db.transaction().execute(async (trx) => {
+          await sql`SELECT pg_advisory_xact_lock(hashtext('feedgen_ops.feed_catalog'))`.execute(trx)
+          return await applyCatalogUpdate(trx, v.row, identity)
+        })
         if (apply.applied) {
+          invalidateActiveContentTimeContractCache()
           console.log(
             `[${new Date().toISOString()}] - feed_catalog-admin: UPDATE rkey=${v.row.rkey} ${JSON.stringify(v.row.patch)}`,
           )
@@ -1295,6 +1377,9 @@ export default function registerFeedCatalogAdminEndpoint(
       }
       return res.status(400).json({ error: "op must be 'insert' or 'update'" })
     } catch (err) {
+      if (err instanceof CatalogApplyAbort) {
+        return res.status(err.httpStatus).json(err.payload)
+      }
       console.error(
         `[${new Date().toISOString()}] - feed_catalog-admin: error. ${err instanceof Error ? err.message : String(err)}`,
       )

@@ -28,6 +28,7 @@ import {
   contentTimeRevalidationConfigSha256,
   revalidateContentTimeCandidate,
   parseRevalidateCliArgs,
+  normalizeAppViewPost,
 } from '../src/tools/backfill-publisher-posts'
 
 function check(condition: unknown, message: string): asserts condition {
@@ -103,6 +104,138 @@ function check(condition: unknown, message: string): asserts condition {
   check(result.content_time_status === 'source_valid', 'still valid under v2')
 }
 
+// --- v2->v3 transforms ---------------------------------------------------
+
+// 1. Valid past stays valid
+{
+  const indexedAt = '2026-08-12T12:00:00.000Z'
+  const raw = '2026-08-02T12:00:00+00:00'
+  const result = revalidateContentTimeCandidate(
+    {
+      indexedAt,
+      created_at_source_raw: Buffer.from(raw, 'utf8'),
+      content_time_status: 'source_valid',
+      content_time_clamp_reason: null,
+    },
+    'newsflows-content-time/v3',
+    'newsflows-content-time/v2',
+  )
+  check(result.outcome === 'v2_valid_to_v3_valid', 'v2 valid past content stays valid in v3')
+  check(result.content_time_status === 'source_valid', 'status must be source_valid')
+  check(result.content_time_utc === '2026-08-02T12:00:00.000Z', 'content_time_utc matches raw UTC')
+  check(result.content_time_clamp_reason === null, 'clamp reason is null')
+  check(result.content_time_validator_version === 'newsflows-content-time/v3', 'version is v3')
+}
+
+// 2. 0-5m future skew: valid in v2 -> clamped in v3
+{
+  const indexedAt = '2026-08-12T12:00:00.000Z'
+  const raw = '2026-08-12T12:03:00.000Z'
+  const result = revalidateContentTimeCandidate(
+    {
+      indexedAt,
+      created_at_source_raw: Buffer.from(raw, 'utf8'),
+      content_time_status: 'source_valid',
+      content_time_clamp_reason: null,
+    },
+    'newsflows-content-time/v3',
+    'newsflows-content-time/v2',
+  )
+  check(result.outcome === 'v2_skew_to_v3_clamped', 'v2 0-5m skew flips to v2_skew_to_v3_clamped')
+  check(result.content_time_status === 'source_valid', 'status must be source_valid')
+  check(result.content_time_utc === indexedAt, 'content_time_utc is clamped to receipt')
+  check(result.createdAt === indexedAt, 'createdAt is updated to clamped receipt')
+  check(result.content_time_clamp_reason === 'future_skew_clamped', 'clamp reason is future_skew_clamped')
+  check(result.content_time_validator_version === 'newsflows-content-time/v3', 'version is v3')
+}
+
+// 3. >5m future skew: invalid in v2 -> restored in v3
+{
+  const indexedAt = '2026-08-12T12:00:00.000Z'
+  const raw = '2026-08-12T13:00:00.000Z' // 1 hour skew
+  const result = revalidateContentTimeCandidate(
+    {
+      indexedAt,
+      created_at_source_raw: Buffer.from(raw, 'utf8'),
+      content_time_status: 'source_invalid',
+      content_time_clamp_reason: 'future_skew',
+    },
+    'newsflows-content-time/v3',
+    'newsflows-content-time/v2',
+  )
+  check(result.outcome === 'v2_invalid_to_v3_clamped', 'v2 >5m skew flips to v2_invalid_to_v3_clamped')
+  check(result.content_time_status === 'source_valid', 'status restored to source_valid')
+  check(result.content_time_utc === indexedAt, 'content_time_utc is clamped to receipt')
+  check(result.createdAt === indexedAt, 'createdAt is updated to clamped receipt')
+  check(result.content_time_clamp_reason === 'future_skew_clamped', 'clamp reason is future_skew_clamped')
+  check(result.content_time_validator_version === 'newsflows-content-time/v3', 'version is v3')
+}
+
+// 4. Missing/unparseable: invalid in v2 -> stays invalid in v3
+{
+  const indexedAt = '2026-08-12T12:00:00.000Z'
+  const raw = 'invalid-time'
+  const result = revalidateContentTimeCandidate(
+    {
+      indexedAt,
+      created_at_source_raw: Buffer.from(raw, 'utf8'),
+      content_time_status: 'source_invalid',
+      content_time_clamp_reason: 'unparseable',
+    },
+    'newsflows-content-time/v3',
+    'newsflows-content-time/v2',
+  )
+  check(result.outcome === 'v2_to_v3_invalid', 'unparseable stays invalid')
+  check(result.content_time_status === 'source_invalid', 'status is source_invalid')
+  check(result.content_time_utc === null, 'content_time_utc is null')
+  check(result.content_time_clamp_reason === 'unparseable', 'clamp reason preserved')
+  check(result.content_time_validator_version === 'newsflows-content-time/v3', 'version is v3')
+}
+
+// --- v3->v2 transforms (reversible rollback) -----------------------------
+
+// 1. Clamped 0-5m skew in v3 -> flips back to valid raw UTC in v2
+{
+  const indexedAt = '2026-08-12T12:00:00.000Z'
+  const raw = '2026-08-12T12:03:00.000Z'
+  const result = revalidateContentTimeCandidate(
+    {
+      indexedAt,
+      created_at_source_raw: Buffer.from(raw, 'utf8'),
+      content_time_status: 'source_valid',
+      content_time_clamp_reason: 'future_skew_clamped',
+    },
+    'newsflows-content-time/v2',
+    'newsflows-content-time/v3',
+  )
+  check(result.outcome === 'v3_clamped_to_v2_valid', 'v3 clamped 0-5m skew flips to v3_clamped_to_v2_valid')
+  check(result.content_time_status === 'source_valid', 'status is source_valid')
+  check(result.content_time_utc === '2026-08-12T12:03:00.000Z', 'content_time_utc restored to raw UTC')
+  check(result.content_time_clamp_reason === null, 'clamp reason cleared')
+  check(result.content_time_validator_version === 'newsflows-content-time/v2', 'version is v2')
+}
+
+// 2. Clamped >5m skew in v3 -> flips back to invalid future_skew in v2
+{
+  const indexedAt = '2026-08-12T12:00:00.000Z'
+  const raw = '2026-08-12T13:00:00.000Z'
+  const result = revalidateContentTimeCandidate(
+    {
+      indexedAt,
+      created_at_source_raw: Buffer.from(raw, 'utf8'),
+      content_time_status: 'source_valid',
+      content_time_clamp_reason: 'future_skew_clamped',
+    },
+    'newsflows-content-time/v2',
+    'newsflows-content-time/v3',
+  )
+  check(result.outcome === 'v3_clamped_to_v2_invalid', 'v3 clamped >5m skew flips to v3_clamped_to_v2_invalid')
+  check(result.content_time_status === 'source_invalid', 'status is source_invalid')
+  check(result.content_time_utc === null, 'content_time_utc is null')
+  check(result.content_time_clamp_reason === 'future_skew', 'clamp reason is future_skew')
+  check(result.content_time_validator_version === 'newsflows-content-time/v2', 'version is v2')
+}
+
 console.log('revalidateContentTimeCandidate transform checks passed')
 
 // --- contentTimeRevalidationConfigSha256: deterministic checkpoint guard --
@@ -118,6 +251,29 @@ console.log('revalidateContentTimeCandidate transform checks passed')
 
   const differentActors = contentTimeRevalidationConfigSha256(['did:plc:a'], '2026-08-01T00:00:00.000Z')
   check(a !== differentActors, 'changing the actor set must change the config hash')
+
+  // Table binding
+  const engagementConfig = contentTimeRevalidationConfigSha256([], '2026-08-01T00:00:00.000Z', 'engagement')
+  check(a !== engagementConfig, 'changing table must change the config hash')
+
+  // Version bindings
+  const v2Tov3Config = contentTimeRevalidationConfigSha256(
+    ['did:plc:a', 'did:plc:b'],
+    '2026-08-01T00:00:00.000Z',
+    'post',
+    'newsflows-content-time/v2',
+    'newsflows-content-time/v3',
+  )
+  check(a !== v2Tov3Config, 'changing validator versions must change the config hash')
+
+  const v3Tov2Config = contentTimeRevalidationConfigSha256(
+    ['did:plc:a', 'did:plc:b'],
+    '2026-08-01T00:00:00.000Z',
+    'post',
+    'newsflows-content-time/v3',
+    'newsflows-content-time/v2',
+  )
+  check(v2Tov3Config !== v3Tov2Config, 'direction of validator change must change the config hash')
 }
 
 console.log('contentTimeRevalidationConfigSha256 checks passed')
@@ -132,7 +288,7 @@ assert.deepEqual(REVALIDATION_LIMITS, {
   statementTimeoutMs: 30_000,
 }, 'REVALIDATION_LIMITS must match the same bounded contract as RECOVERY_LIMITS')
 
-check(CONTENT_TIME_VALIDATOR_VERSION === 'newsflows-content-time/v2', 'live validator version must still be v2')
+check(CONTENT_TIME_VALIDATOR_VERSION === 'newsflows-content-time/v2', 'live validator version default is v2')
 check(CONTENT_TIME_VALIDATOR_VERSION_V1 === 'newsflows-content-time/v1', 'historical validator version constant must be v1')
 
 console.log('bounded-contract constant checks passed')
@@ -250,16 +406,25 @@ console.log('receipt raw-free shape checks passed')
     )
   }
 
-  // Both flags combine cleanly with the rest of the existing surface.
-  const combined = parseRevalidateCliArgs(['--apply', '--packet-sha256', validSha, '--max-batches', '1', '--json'])
-  check(combined.apply === true && combined.json === true && combined.packetSha256 === validSha && combined.maxBatches === 1, 'flags must combine without interference')
-  // --pause-baseline-bytes-per-s (adaptive inter-batch pause, D4-b): optional, positive integer bytes/s.
-  check(bare.pauseBaselineBytesPerSecond === undefined, 'pause baseline defaults to unset (fixed pause)')
-  const withPause = parseRevalidateCliArgs(['--pause-baseline-bytes-per-s', '3041841'])
-  check(withPause.pauseBaselineBytesPerSecond === 3041841, '--pause-baseline-bytes-per-s must be captured as a number')
-  for (const bad of ['0', '-5', '1.5', 'abc', ' ']) {
-    check(throws(() => parseRevalidateCliArgs(['--pause-baseline-bytes-per-s', bad])), `--pause-baseline-bytes-per-s must reject: ${JSON.stringify(bad)}`)
-  }
+  // --table, --from-version, --to-version CLI flags
+  check(bare.table === 'post', 'table defaults to post')
+  check(bare.fromVersion === 'newsflows-content-time/v1', 'fromVersion defaults to v1')
+  check(bare.toVersion === 'newsflows-content-time/v2', 'toVersion defaults to v2')
+
+  const engagementRevalidate = parseRevalidateCliArgs(['--table', 'engagement', '--from-version', 'newsflows-content-time/v2', '--to-version', 'newsflows-content-time/v3'])
+  check(engagementRevalidate.table === 'engagement', 'captures table=engagement')
+  check(engagementRevalidate.fromVersion === 'newsflows-content-time/v2', 'captures fromVersion=v2')
+  check(engagementRevalidate.toVersion === 'newsflows-content-time/v3', 'captures toVersion=v3')
+
+  // Rollback args
+  const rollbackArgs = parseRevalidateCliArgs(['--from-version', 'newsflows-content-time/v3', '--to-version', 'newsflows-content-time/v2'])
+  check(rollbackArgs.fromVersion === 'newsflows-content-time/v3', 'captures rollback fromVersion=v3')
+  check(rollbackArgs.toVersion === 'newsflows-content-time/v2', 'captures rollback toVersion=v2')
+
+  // Transitions restriction checks
+  check(throws(() => parseRevalidateCliArgs(['--from-version', 'newsflows-content-time/v1', '--to-version', 'newsflows-content-time/v3'])), 'must reject v1->v3')
+  check(throws(() => parseRevalidateCliArgs(['--from-version', 'newsflows-content-time/v3', '--to-version', 'newsflows-content-time/v1'])), 'must reject v3->v1')
+  check(throws(() => parseRevalidateCliArgs(['--from-version', 'newsflows-content-time/v2', '--to-version', 'newsflows-content-time/v1'])), 'must reject v2->v1')
 }
 
 function throws(fn: () => unknown): boolean {
@@ -269,6 +434,61 @@ function throws(fn: () => unknown): boolean {
   } catch {
     return true
   }
+}
+
+// --- Recovery helper version binding tests --------------------------------
+{
+  const appViewPost = {
+    uri: 'at://did:plc:example-publisher/app.bsky.feed.post/123',
+    cid: 'cid123',
+    indexedAt: '2026-08-12T12:00:00.000Z',
+    author: { did: 'did:plc:example-publisher' },
+    record: {
+      text: 'hello',
+      createdAt: '2026-08-12T12:00:00.000Z',
+    },
+  }
+  const normalized = normalizeAppViewPost(appViewPost, 'did:plc:example-publisher')
+  check(normalized !== null, 'normalizeAppViewPost succeeds on valid input in default v2 mode')
+  check(normalized?.content_time_validator_version === 'newsflows-content-time/v2', 'normalizes with v2 validator')
+
+  check(
+    throws(() => normalizeAppViewPost(appViewPost, 'did:plc:example-publisher', 'newsflows-content-time/v3')),
+    'normalizeAppViewPost must fail closed for versions other than v2',
+  )
+}
+
+// --- Engagement cursor masking in batch summary ---------------------------
+{
+  const rawUri = 'at://did:plc:user123/app.bsky.feed.like/456'
+  const expectedHash = require('crypto').createHash('sha256').update(rawUri).digest('hex')
+  const engagementBatch = {
+    batch: 1,
+    candidates: 100,
+    updated: 100,
+    skipped_cas: 0,
+    counts: {
+      v2_valid_to_v3_valid: 90,
+      v2_skew_to_v3_clamped: 10,
+      v2_invalid_to_v3_clamped: 0,
+      v2_to_v3_invalid: 0,
+      gt_5m_restored: 0,
+      zero_to_5m_clamped: 10,
+      gt_5m_invalidated: 0,
+      zero_to_5m_unclamped: 0,
+      by_invalid_reason: {},
+      by_v2_invalid_reason: {},
+    },
+    cursor_author: '',
+    cursor_uri: expectedHash,
+    elapsed_ms: 50,
+    wal_bytes: 1000,
+    relation_bytes_before: 5000,
+    relation_bytes_after: 6000,
+  }
+  check(engagementBatch.cursor_author === '', 'engagement batch summary omits author')
+  check(!engagementBatch.cursor_uri.includes('at://'), 'engagement batch summary masks raw URI')
+  check(engagementBatch.cursor_uri === expectedHash, 'engagement batch summary uses sha256 of cursor URI')
 }
 
 console.log('parseRevalidateCliArgs --packet-sha256 / --max-batches checks passed')

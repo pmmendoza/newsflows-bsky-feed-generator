@@ -20,6 +20,7 @@
 import { Client } from 'pg'
 import { invalidatePolicyCache } from './access-policy'
 import { invalidateDispatchCache } from '../algos/catalog-dispatch'
+import { invalidateActiveContentTimeContractCache } from './content-time'
 
 const RECONNECT_DELAY_MS = 5000
 const CHANNEL = 'feed_catalog_changed'
@@ -71,6 +72,7 @@ async function connectAndListen(connectionString: string): Promise<void> {
     client.on('notification', (msg) => {
       try {
         const payload = msg.payload ? JSON.parse(msg.payload) : null
+        invalidateActiveContentTimeContractCache()
         if (payload?.rkey) {
           invalidatePolicyCache(String(payload.rkey))
           // Sprint 14 / T2 Phase 1 — dispatch cache invalidates on
@@ -87,6 +89,7 @@ async function connectAndListen(connectionString: string): Promise<void> {
           )
         }
       } catch (err) {
+        invalidateActiveContentTimeContractCache()
         invalidatePolicyCache()
         invalidateDispatchCache()
         console.warn(
@@ -101,6 +104,7 @@ async function connectAndListen(connectionString: string): Promise<void> {
       console.error(
         `[${new Date().toISOString()}] - catalog-listener: client error; will reconnect. error=${err.message}`,
       )
+      invalidateActiveContentTimeContractCache()
       invalidatePolicyCache()
       invalidateDispatchCache()
       cleanup()
