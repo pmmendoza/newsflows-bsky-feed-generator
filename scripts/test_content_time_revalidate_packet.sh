@@ -89,9 +89,10 @@ psql_copy() { [[ $1 == *public.post* ]] && printf '%s\n' "$row_v3" || printf '%s
 psql_ro() { echo 0; }
 PREREG_POST='v2_valid_to_v3_valid=1,v2_skew_to_v3_clamped=0,v2_invalid_to_v3_clamped=0,v2_to_v3_invalid=0,gt_5m_restored=0,zero_to_5m_clamped=0'
 PREREG_ENGAGEMENT=$PREREG_POST
+cp "$empty" "$E/migrate-post-preview-after-1.json" # failed prior attempt must not make retry collide
 cmd_migrate_readback
-grep -q '^post rows=1$' "$E/migrate-readback-1.txt"
-grep -q '^engagement rows=1$' "$E/migrate-readback-1.txt"
+grep -q '^post rows=1$' "$E/migrate-readback-2.txt"
+grep -q '^engagement rows=1$' "$E/migrate-readback-2.txt"
 
 assert_active_catalog_version() { :; }
 migration_apply_one() { :; }

@@ -641,7 +641,7 @@ cmd_migrate_apply() {
 }
 cmd_migrate_readback() {
   local target table since f rows updated before_out after_out before_total after_total attempt=1 key expected actual
-  while [[ -e "$E/migrate-post-readback-$attempt.tsv" ]]; do attempt=$((attempt+1)); done
+  while [[ -e "$E/migrate-post-readback-$attempt.tsv" || -e "$E/migrate-post-preview-after-$attempt.json" || -e "$E/migrate-post-preview-after-$attempt.err" ]]; do attempt=$((attempt+1)); done
   for target in $(migration_targets); do
     table=$(migration_target_table "$target"); since=$(migration_target_since "$target")
     f=$(migration_preview_one "migrate-$target-preview-after-$attempt" "$target" "$FROM_VERSION" "$TO_VERSION")
