@@ -441,6 +441,10 @@ async function main() {
       const address = app.server?.address()
       assert(address && typeof address === 'object', 'test server must expose a port')
       const base = `http://127.0.0.1:${address.port}`
+      const adminHeaders = {
+        'content-type': 'application/json',
+        'api-key': 'subscription-admin-test-key',
+      }
       const body = { handle: HANDLE, feed: 'test-be-1', mode: 'replace' }
       const mint = await fetch(`${base}/api/subscription-token`, {
         method: 'POST',
