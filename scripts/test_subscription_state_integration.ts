@@ -25,6 +25,7 @@ async function main() {
   if (!dsn || process.env.FEEDGEN_SUBSCRIPTION_TEST_CONFIRM !== 'disposable') {
     throw new Error('integration gate requires FEEDGEN_TEST_DSN and FEEDGEN_SUBSCRIPTION_TEST_CONFIRM=disposable')
   }
+  process.env.FEEDGEN_ADMIN_API_KEY = 'disposable-admin-capability-key'
   const db = createDb(dsn)
   const ctx = { db } as AppContext
   // feed_catalog is feedgen runtime state (not in the app migrations), but it
@@ -169,6 +170,13 @@ async function main() {
   await clean()
   const provisioned = await setSubscription(ctx, { ...ident, state: { scope: 'omni' } }, true, false)
   assert(typeof provisioned.creation_cas === 'string', '9: fresh provisioning returns a creation capability')
+  const originalAdminKey = process.env.FEEDGEN_ADMIN_API_KEY
+  process.env.FEEDGEN_ADMIN_API_KEY = 'rotated-admin-capability-key'
+  await expectErr(
+    () => setSubscription(ctx, { ...ident, state: { scope: 'none', feeds: [], subscribed: false }, expected: { scope: 'omni', feeds: [], subscribed: true }, rollback_capability: provisioned.creation_cas }, true, false, undefined, true),
+    'presence_rollback_capability_mismatch',
+  )
+  process.env.FEEDGEN_ADMIN_API_KEY = originalAdminKey
   await db.insertInto('follows').values({ subject: did, follows: 'did:plc:follow-fixture' }).execute()
   const plannedAbsent = await setSubscription(
     ctx,

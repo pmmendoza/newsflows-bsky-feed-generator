@@ -1,7 +1,7 @@
 import { Transaction } from 'kysely'
 import { AppContext } from '../config'
 import { Database } from '../db'
-import { randomBytes, timingSafeEqual } from 'crypto'
+import { createHmac, timingSafeEqual } from 'crypto'
 import { DatabaseSchema, FeedCatalog } from '../db/schema'
 import { getProfile } from './queries'
 import { triggerFollowsUpdateForSubscriber } from './scheduled-updater'
@@ -52,6 +52,15 @@ export type SubscriptionResult = {
 }
 
 type Db = Database | Transaction<DatabaseSchema>
+
+function presenceRollbackCapability(did: string, firstSubscribedAt: string | Date): string {
+  const adminKey = process.env.FEEDGEN_ADMIN_API_KEY
+  if (!adminKey) throw new SubscriptionError(503, 'presence_rollback_unavailable', 'presence rollback capability is unavailable because the administrator key is not configured')
+  const timestamp = firstSubscribedAt instanceof Date ? firstSubscribedAt.toISOString() : new Date(String(firstSubscribedAt)).toISOString()
+  return createHmac('sha256', adminKey)
+    .update(`feedgen:subscriber-presence-rollback:v1\0${did}\0${timestamp}`)
+    .digest('base64url')
+}
 
 export class SubscriptionError extends Error {
   constructor(
@@ -663,18 +672,17 @@ export async function setSubscription(
   // linearization point) so the response never reflects a concurrent writer.
   const result = await ctx.db.transaction().execute(async (trx) => {
     const now = new Date()
-    const creationNonce = desired.subscribed ? randomBytes(32).toString('base64url') : undefined
     const inserted = desired.subscribed
       ? await trx
         .insertInto('subscriber')
-        .values({ handle: identity.handle, did: identity.did, access_scope: 'omni', first_subscribed_at: now, creation_nonce: creationNonce })
+        .values({ handle: identity.handle, did: identity.did, access_scope: 'omni', first_subscribed_at: now })
         .onConflict((oc) => oc.column('did').doNothing())
         .returning('did')
         .executeTakeFirst()
       : undefined
     const locked = await trx
       .selectFrom('subscriber')
-      .select(['did', 'kind', 'handle', 'first_subscribed_at', 'creation_nonce'])
+      .select(['did', 'kind', 'handle', 'first_subscribed_at', 'scope_changed_at'])
       .where('did', '=', identity.did)
       .forUpdate()
       .executeTakeFirst()
@@ -709,7 +717,9 @@ export async function setSubscription(
     if (!desired.subscribed) {
       if (!locked) return { changed: false, followsRelevant: false, scope: 'none' as AccessScope, assignments: [], creationCas: undefined }
       const creationCas = input.rollback_capability as string
-      const storedNonce = locked.creation_nonce
+      const storedNonce = locked.first_subscribed_at
+        ? presenceRollbackCapability(identity.did, locked.first_subscribed_at)
+        : ''
       const providedBytes = Buffer.from(creationCas)
       const storedBytes = Buffer.from(storedNonce ?? '')
       if (!storedNonce || providedBytes.length !== storedBytes.length || !timingSafeEqual(providedBytes, storedBytes)) {
@@ -728,13 +738,22 @@ export async function setSubscription(
       const firstSubscribedAt = locked.first_subscribed_at instanceof Date
         ? locked.first_subscribed_at.getTime()
         : locked.first_subscribed_at ? Date.parse(String(locked.first_subscribed_at)) : NaN
+      const scopeChangedAt = locked.scope_changed_at instanceof Date
+        ? locked.scope_changed_at.getTime()
+        : locked.scope_changed_at ? Date.parse(String(locked.scope_changed_at)) : NaN
       const creationOwnedAssignments = assignments.every((assignment) => {
         const activeFrom = assignment.active_from instanceof Date
           ? assignment.active_from.getTime()
           : Date.parse(String(assignment.active_from))
-        return Number.isFinite(firstSubscribedAt) && activeFrom === firstSubscribedAt
+        return assignment.active_until == null && Number.isFinite(firstSubscribedAt) && activeFrom === firstSubscribedAt
       })
-      if (history || (assignments.length > 0 && !creationOwnedAssignments)) {
+      if (
+        history ||
+        !Number.isFinite(firstSubscribedAt) ||
+        !Number.isFinite(scopeChangedAt) ||
+        scopeChangedAt !== firstSubscribedAt ||
+        (assignments.length > 0 && !creationOwnedAssignments)
+      ) {
         throw new SubscriptionError(409, 'presence_rollback_not_fresh', 'presence rollback cannot erase established subscriber history')
       }
       await trx.deleteFrom('follows').where('subject', '=', identity.did).execute()
@@ -760,7 +779,7 @@ export async function setSubscription(
       followsRelevant: logicalChanged,
       scope: next.scope,
       assignments: next.assignments,
-      creationCas: inserted ? creationNonce : undefined,
+      creationCas: inserted ? presenceRollbackCapability(identity.did, now) : undefined,
     }
   })
 
