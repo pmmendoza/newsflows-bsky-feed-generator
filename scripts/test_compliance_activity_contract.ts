@@ -53,6 +53,12 @@ async function main() {
     assert.strictEqual(response.status, 400, 'original_post must require one subscriber DID')
 
     response = await fetch(
+      `${base}?scope=publisher_posts&subscriber_did=did:plc:subscriber&types=original_post&include_retrievals=false&days=1`,
+      { headers: { 'api-key': 'contract-test-key' } },
+    )
+    assert.strictEqual(response.status, 400, 'original_post must require scope=all_tracked')
+
+    response = await fetch(
       `${base}?scope=all_tracked&subscriber_did=did:plc:subscriber&types=original_post&include_retrievals=false&limit=1&days=1`,
       { headers: { 'api-key': 'contract-test-key' } },
     )

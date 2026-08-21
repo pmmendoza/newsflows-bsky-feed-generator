@@ -406,6 +406,9 @@ function parseActivityFilters(req: any): { filters: ActivityFilters; cursor: Eng
   if (types.includes('original_post') && !subscriberDid) {
     throw new Error('types=original_post requires subscriber_did')
   }
+  if (types.includes('original_post') && scope !== 'all_tracked') {
+    throw new Error('types=original_post requires scope=all_tracked')
+  }
 
   const limitRaw = req.query?.limit
   const limit = limitRaw === undefined ? 100 : parseNonNegInt(limitRaw)
