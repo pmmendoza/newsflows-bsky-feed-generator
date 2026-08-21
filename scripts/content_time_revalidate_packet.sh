@@ -36,9 +36,10 @@
 #   finalize <start> <end>
 #                        SHA256SUMS over every file (recursive), RESULT.txt last
 #   migrate-prereg | migrate-preflight | migrate-preview | migrate-apply <label>
-#   migrate-readback | migrate-rollback <dry-run|apply>
+#   migrate-readback | migrate-rollback <dry-run|apply> | migrate-secret-scan
+#   migrate-finalize <start> <end>
 #                        FT-FU-1 global storage migration. FROM_VERSION, TO_VERSION,
-#                        exact main/BE/engagement bounds and preregistration cells bind scope.
+#                        widest post/engagement bound plus exact IR evidence cells bind scope.
 #
 # Required env (the runner refuses to start without them):
 #   E TREE EXPECTED_SHA EXPECTED_DIST_SHA256 EXPECTED_CT_SHA256 EXPECTED_IMAGE_CT_SHA256 PACKET_SHA
@@ -58,33 +59,37 @@
 set -euo pipefail
 
 : "${E:?E (evidence root) is required}"
-: "${TREE:?TREE (built feedgen tree) is required}"
-: "${EXPECTED_SHA:?EXPECTED_SHA (full source SHA) is required}"
-: "${EXPECTED_DIST_SHA256:?EXPECTED_DIST_SHA256 is required}"
-: "${EXPECTED_CT_SHA256:?EXPECTED_CT_SHA256 is required}"
-: "${EXPECTED_IMAGE_CT_SHA256:?EXPECTED_IMAGE_CT_SHA256 (validator module hash inside the live image) is required}"
-: "${PACKET_SHA:?PACKET_SHA (approved packet SHA-256) is required}"
-: "${EXPECTED_TOOL_REFS:?EXPECTED_TOOL_REFS (bsky-ops=<sha>,blueskyranker=<sha>,newsflows-bskyhealth=<sha>) is required}"
 COMMAND=${1:-}
-if [[ "$COMMAND" == migrate-* ]]; then
+MIGRATION_SEAL=0; [[ "$COMMAND" == migrate-secret-scan || "$COMMAND" == migrate-finalize ]] && MIGRATION_SEAL=1
+if (( ! MIGRATION_SEAL )); then
+  : "${TREE:?TREE (built feedgen tree) is required}"
+  : "${EXPECTED_SHA:?EXPECTED_SHA (full source SHA) is required}"
+  : "${EXPECTED_DIST_SHA256:?EXPECTED_DIST_SHA256 is required}"
+  : "${EXPECTED_CT_SHA256:?EXPECTED_CT_SHA256 is required}"
+  : "${EXPECTED_IMAGE_CT_SHA256:?EXPECTED_IMAGE_CT_SHA256 (validator module hash inside the live image) is required}"
+  : "${PACKET_SHA:?PACKET_SHA (approved packet SHA-256) is required}"
+  : "${EXPECTED_TOOL_REFS:?EXPECTED_TOOL_REFS (bsky-ops=<sha>,blueskyranker=<sha>,newsflows-bskyhealth=<sha>) is required}"
+  [[ "$PACKET_SHA" =~ ^[0-9a-f]{64}$ ]] || { echo "PACKET_SHA must be 64 lowercase hex" >&2; exit 2; }
+fi
+if [[ "$COMMAND" == migrate-* && $MIGRATION_SEAL == 0 ]]; then
   : "${FROM_VERSION:?FROM_VERSION is required for migrate-* commands}"
   : "${TO_VERSION:?TO_VERSION is required for migrate-* commands}"
   : "${SINCE_MAIN:?SINCE_MAIN is required}"
   : "${SINCE_BE:?SINCE_BE is required}"
   SINCE_ENGAGEMENT="${SINCE_ENGAGEMENT:-$SINCE_BE}"
   if [[ "$COMMAND" != "migrate-prereg" ]]; then
-    : "${PREREG_POST_MAIN:?PREREG_POST_MAIN is required}"
-    : "${PREREG_POST_BE:?PREREG_POST_BE is required}"
+    : "${PREREG_POST:?PREREG_POST is required}"
     : "${PREREG_ENGAGEMENT:?PREREG_ENGAGEMENT is required}"
     : "${PREREG_IR:?PREREG_IR is required}"
   fi
-else
+elif [[ "$COMMAND" != migrate-* ]]; then
   : "${PREREG_MAIN:?PREREG_MAIN (pre-registered cells) is required}"
   : "${PREREG_BE:?PREREG_BE (pre-registered cells) is required}"
   : "${SINCE_MAIN:?SINCE_MAIN (absolute receipt-time lower bound, ISO Z, from the ledger approval) is required}"
   : "${SINCE_BE:?SINCE_BE (absolute receipt-time lower bound, ISO Z, from the ledger approval) is required}"
 fi
-[[ "$PACKET_SHA" =~ ^[0-9a-f]{64}$ ]] || { echo "PACKET_SHA must be 64 lowercase hex" >&2; exit 2; }
+# Keep legacy SQL constants parseable for seal-only invocations; they are not used.
+SINCE_MAIN="${SINCE_MAIN:-1970-01-01T00:00:00.000Z}"; SINCE_BE="${SINCE_BE:-$SINCE_MAIN}"; SINCE_ENGAGEMENT="${SINCE_ENGAGEMENT:-$SINCE_BE}"
 IMG="${IMG:-pmmendoza/bsky-feedgen@sha256:928c15aac77a8a842f60053eff8953e70cc9e4117c2fbe86f548e345c1a34711}"
 NETWORK="${NETWORK:-newsflows-bsky-feed-generator-v2_default}"
 ENV_FILE="${ENV_FILE:-/etc/newsflows/secrets/feedgen.env}"
@@ -130,6 +135,7 @@ emit() {  # emit <name>  (stdin -> $E/<name>, root:newsflows 0640, never overwri
   sudo -n install -o root -g newsflows -m 640 "$tmp" "$E/$name"; rm -f "$tmp"
   log "wrote $name"
 }
+seal_evidence() { ( cd "$E" && sudo -n sh -c 'find . -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS && chown root:newsflows SHA256SUMS && chmod 640 SHA256SUMS' ); }
 psql_ro() {
   "${DOCKER[@]}" exec -i "$DB_CONTAINER" psql -U "$PSQL_USER" -d "$PSQL_DB" -X -q -A -F '|' -v ON_ERROR_STOP=1 \
     -c "SET default_transaction_read_only = on; SET statement_timeout = '120s';" "$@"
@@ -470,7 +476,7 @@ cmd_finalize() {
   local rtmp; rtmp=$(mktemp)
   { echo "status=complete"; echo "generated_at=$(ts)"; cat "$E/source-set.txt"; echo "window_start_utc=$wstart"; echo "window_end_utc=$wend"; for f in "$E"/ceiling-*.txt; do if [[ -f "$f" ]]; then echo "--- $(basename "$f")"; cat "$f"; fi; done; echo "--- diffs"; cat "$E"/step1-*-diff-*.txt "$E"/readback-*.txt 2>/dev/null || true; echo "--- populations after"; cat "$E/poststate-populations.tsv" 2>/dev/null || true; } >"$rtmp"
   emit RESULT.txt <"$rtmp"; rm -f "$rtmp"
-  ( cd "$E" && sudo -n sh -c 'find . -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS && chown root:newsflows SHA256SUMS && chmod 640 SHA256SUMS' )
+  seal_evidence
   log "finalized: $E"
 }
 
@@ -487,8 +493,8 @@ cmd_prereg() {  # read-only helper for the ledger approval: cells at the given S
   psql_ro -c "$SCOPE_SQL"; rm -f "$tmp"
 }
 
-# FT-FU-1: the storage contract is global, so v2<->v3 migrates every in-horizon
-# row in both shared tables. The proven v1->v2 packet above remains unchanged.
+# FT-FU-1: one contract governs every post and engagement row in the widest
+# active horizon. The proven v1->v2 packet above remains unchanged.
 migration_outcomes() {
   case "$1->$2" in
     "$V2->$V3") echo 'v2_valid_to_v3_valid v2_skew_to_v3_clamped v2_invalid_to_v3_clamped v2_to_v3_invalid gt_5m_restored zero_to_5m_clamped';;
@@ -497,21 +503,25 @@ migration_outcomes() {
   esac
 }
 assert_migration_transition() { migration_outcomes "$FROM_VERSION" "$TO_VERSION" >/dev/null; }
-migration_targets() { echo 'post-main post-be engagement'; }
-migration_target_table() { case "$1" in post-main|post-be) echo post;; engagement) echo engagement;; *) die "unknown migration target $1";; esac; }
-migration_target_since() { case "$1" in post-main) echo "$SINCE_MAIN";; post-be) echo "$SINCE_BE";; engagement) echo "$SINCE_ENGAGEMENT";; *) die "unknown migration target $1";; esac; }
-migration_target_actors() { case "$1" in post-main) echo "$MAIN_DIDS";; post-be) echo "$BE_DID";; engagement) echo '';; *) die "unknown migration target $1";; esac; }
+migration_targets() { echo 'post engagement'; }
+migration_target_table() { case "$1" in post|engagement) echo "$1";; *) die "unknown migration target $1";; esac; }
+migration_target_since() { case "$1" in post|engagement) echo "$SINCE_ENGAGEMENT";; *) die "unknown migration target $1";; esac; }
+migration_target_actors() {
+  case "$1" in
+    post) psql_ro -t -c "SELECT string_agg(author,',' ORDER BY author) FROM (SELECT DISTINCT author FROM public.post WHERE content_time_validator_version IN ('$FROM_VERSION','$TO_VERSION') AND \"indexedAt\">='$SINCE_ENGAGEMENT') x;" | tr -d '\n';;
+    engagement) echo '';;
+    *) die "unknown migration target $1";;
+  esac
+}
 migration_snapshot_sql() { # <target> <version>
-  local target=$1 version=$2 table since actors scope=""
-  table=$(migration_target_table "$target"); since=$(migration_target_since "$target"); actors=$(migration_target_actors "$target")
-  [[ -n "$actors" ]] && scope="AND author=ANY($(sql_array "$actors")::text[])"
-  echo "SELECT uri, author, \"indexedAt\", \"createdAt\", content_time_utc, content_time_status, content_time_clamp_reason, content_time_validator_version, encode(created_at_source_raw,'hex') AS raw_hex FROM public.$table WHERE content_time_validator_version='$version' AND created_at_source_raw IS NOT NULL AND \"indexedAt\">='$since' $scope ORDER BY author, uri"
+  local target=$1 version=$2 table since
+  table=$(migration_target_table "$target"); since=$(migration_target_since "$target")
+  echo "SELECT uri, author, \"indexedAt\", \"createdAt\", content_time_utc, content_time_status, content_time_clamp_reason, content_time_validator_version, encode(created_at_source_raw,'hex') AS raw_hex FROM public.$table WHERE content_time_validator_version='$version' AND created_at_source_raw IS NOT NULL AND \"indexedAt\">='$since' ORDER BY author, uri"
 }
 migration_scope_sql() { # <target>
-  local target=$1 table since actors scope=""
-  table=$(migration_target_table "$target"); since=$(migration_target_since "$target"); actors=$(migration_target_actors "$target")
-  [[ -n "$actors" ]] && scope="AND author=ANY($(sql_array "$actors")::text[])"
-  echo "SELECT 'from_in_horizon',count(*) FROM public.$table WHERE content_time_validator_version='$FROM_VERSION' AND \"indexedAt\">='$since' $scope UNION ALL SELECT 'from_outside_horizon',count(*) FROM public.$table WHERE content_time_validator_version='$FROM_VERSION' AND \"indexedAt\"<'$since' $scope UNION ALL SELECT 'from_total',count(*) FROM public.$table WHERE content_time_validator_version='$FROM_VERSION' $scope UNION ALL SELECT 'to_in_horizon',count(*) FROM public.$table WHERE content_time_validator_version='$TO_VERSION' AND \"indexedAt\">='$since' $scope ORDER BY 1"
+  local target=$1 table since
+  table=$(migration_target_table "$target"); since=$(migration_target_since "$target")
+  echo "SELECT 'from_in_horizon',count(*) FROM public.$table WHERE content_time_validator_version='$FROM_VERSION' AND \"indexedAt\">='$since' UNION ALL SELECT 'from_outside_horizon',count(*) FROM public.$table WHERE content_time_validator_version='$FROM_VERSION' AND \"indexedAt\"<'$since' UNION ALL SELECT 'from_total',count(*) FROM public.$table WHERE content_time_validator_version='$FROM_VERSION' UNION ALL SELECT 'to_in_horizon',count(*) FROM public.$table WHERE content_time_validator_version='$TO_VERSION' AND \"indexedAt\">='$since' ORDER BY 1"
 }
 pgstat_table_read() { # wal_bytes|relation_bytes|dead|live|epoch
   psql_ro -t -c "SELECT (SELECT wal_bytes FROM pg_stat_wal), pg_total_relation_size('public.$1'), n_dead_tup, n_live_tup, extract(epoch FROM now())::bigint FROM pg_stat_user_tables WHERE relname='$1';"
@@ -524,6 +534,8 @@ assert_active_catalog_version() {
 migration_run_tool() { # <artifact> <target> <from> <to> [extra args...]
   local out=$1 target=$2 from=$3 to=$4 table since actors; shift 4
   table=$(migration_target_table "$target"); since=$(migration_target_since "$target"); actors=$(migration_target_actors "$target")
+  [[ "$table" != post || -n "$actors" ]] || die 'global post target resolved no in-horizon authors'
+  (( ${#actors} < 500000 )) || die 'global post author list exceeds safe argv bound; add native all-author support before applying'
   local -a scope=(); [[ -n "$actors" ]] && scope=(--actors "$actors")
   run_tool "$out" --mode revalidate --table "$table" --since "$since" "${scope[@]}" --from-version "$from" --to-version "$to" --packet-sha256 "$PACKET_SHA" --json "$@"
 }
@@ -532,7 +544,7 @@ prereg_spec_value() { # <spec> <key>
   [[ "$v" =~ ^[0-9]+$ ]] || die "pre-registered cell $2 missing or non-numeric"
   echo "$v"
 }
-migration_prereg_spec() { case "$1" in post-main) echo "$PREREG_POST_MAIN";; post-be) echo "$PREREG_POST_BE";; engagement) echo "$PREREG_ENGAGEMENT";; *) die "unknown migration target $1";; esac; }
+migration_prereg_spec() { case "$1" in post) echo "$PREREG_POST";; engagement) echo "$PREREG_ENGAGEMENT";; *) die "unknown migration target $1";; esac; }
 gate_migration_preview() { # <file> <spec> <label>
   local file=$1 spec=$2 label=$3 outcomes key expected actual sum=0 scanned
   outcomes=$(migration_outcomes "$FROM_VERSION" "$TO_VERSION")
@@ -551,10 +563,10 @@ gate_migration_preview() { # <file> <spec> <label>
   esac
   [[ "$scanned" == "$sum" ]] || die "$label denominator mismatch: scanned=$scanned primary_outcomes=$sum"
 }
-migration_preview_one() { # <artifact> <target> <from> <to> [actor override]
-  local out=$1 target=$2 from=$3 to=$4 actors=${5:-} rc
+migration_preview_one() { # <artifact> <target> <from> <to> [actor override] [since override]
+  local out=$1 target=$2 from=$3 to=$4 actors=${5:-} since_override=${6:-} rc
   if [[ -n "$actors" ]]; then
-    local table since; table=$(migration_target_table "$target"); since=$(migration_target_since "$target")
+    local table since; table=$(migration_target_table "$target"); since=${since_override:-$(migration_target_since "$target")}
     rc=$(run_tool "$out" --mode revalidate --table "$table" --since "$since" --actors "$actors" --from-version "$from" --to-version "$to" --packet-sha256 "$PACKET_SHA" --json)
   else rc=$(migration_run_tool "$out" "$target" "$from" "$to"); fi
   [[ "$rc" == 0 ]] || die "$out preview failed (exit=$rc)"
@@ -570,8 +582,8 @@ cmd_migrate_prereg() {
   [[ -d "$E" ]] || sudo -n install -d -o root -g newsflows -m 750 "$E"
   local target f
   echo "SINCE_MAIN=$SINCE_MAIN SINCE_BE=$SINCE_BE SINCE_ENGAGEMENT=$SINCE_ENGAGEMENT"
-  for target in $(migration_targets); do f=$(migration_preview_one "migrate-prereg-$target" "$target" "$FROM_VERSION" "$TO_VERSION"); echo "PREREG_${target^^}=$(migration_cells "$f")" | tr '-' '_'; done
-  f=$(migration_preview_one migrate-prereg-ir post-main "$FROM_VERSION" "$TO_VERSION" "$IR_DID")
+  for target in $(migration_targets); do f=$(migration_preview_one "migrate-prereg-$target" "$target" "$FROM_VERSION" "$TO_VERSION"); echo "PREREG_${target^^}=$(migration_cells "$f")"; done
+  f=$(migration_preview_one migrate-prereg-ir post "$FROM_VERSION" "$TO_VERSION" "$IR_DID" "$SINCE_MAIN")
   echo "PREREG_IR=$(migration_cells "$f")"
 }
 cmd_migrate_preflight() {
@@ -579,20 +591,20 @@ cmd_migrate_preflight() {
   local bound; for bound in "$SINCE_MAIN" "$SINCE_BE" "$SINCE_ENGAGEMENT"; do [[ "$bound" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{3}Z$ ]] || die "migration bound must be ISO-8601 with milliseconds and Z: $bound"; done
   [[ -d "$E" ]] || sudo -n install -d -o root -g newsflows -m 750 "$E"
   assert_tree; assert_active_catalog_version "$FROM_VERSION"
-  local target table since actors scope f rows nullraw
+  local target table since f rows nullraw
   { echo "generated_at=$(ts)"; echo "migration_transition=$FROM_VERSION->$TO_VERSION"; echo "since_main=$SINCE_MAIN"; echo "since_be=$SINCE_BE"; echo "since_engagement=$SINCE_ENGAGEMENT"; echo "source_sha=$EXPECTED_SHA"; echo "packet_sha256=$PACKET_SHA"; echo "expected_tool_refs=$EXPECTED_TOOL_REFS"; echo "ir_did_sha256=$(printf %s "$IR_DID" | sha256sum | cut -d' ' -f1)"; } | emit migrate-source-set.txt
   for target in $(migration_targets); do
-    table=$(migration_target_table "$target"); since=$(migration_target_since "$target"); actors=$(migration_target_actors "$target"); scope=""; [[ -n "$actors" ]] && scope="AND author=ANY($(sql_array "$actors")::text[])"
+    table=$(migration_target_table "$target"); since=$(migration_target_since "$target")
     psql_ro -c "$(migration_scope_sql "$target")" | emit "migrate-$target-prestate-scope.tsv"
     psql_copy "$(migration_snapshot_sql "$target" "$FROM_VERSION")" | emit "migrate-$target-prestate.tsv"
-    rows=$(wc -l <"$E/migrate-$target-prestate.tsv")
-    nullraw=$(psql_ro -t -c "SELECT count(*) FROM public.$table WHERE content_time_validator_version='$FROM_VERSION' AND \"indexedAt\">='$since' AND created_at_source_raw IS NULL $scope;")
+    rows=$(awk 'END{print NR}' "$E/migrate-$target-prestate.tsv")
+    nullraw=$(psql_ro -t -c "SELECT count(*) FROM public.$table WHERE content_time_validator_version='$FROM_VERSION' AND \"indexedAt\">='$since' AND created_at_source_raw IS NULL;")
     [[ "$nullraw" == 0 ]] || die "$target has $nullraw in-horizon $FROM_VERSION rows with NULL raw"
     f=$(migration_preview_one "migrate-$target-preview-preflight" "$target" "$FROM_VERSION" "$TO_VERSION")
     gate_migration_preview "$f" "$(migration_prereg_spec "$target")" "$target"
     [[ "$(jsonq "$f" preview.scanned)" == "$rows" ]] || die "$target preview does not cover its full in-horizon snapshot"
   done
-  f=$(migration_preview_one migrate-ir-preview-preflight post-main "$FROM_VERSION" "$TO_VERSION" "$IR_DID")
+  f=$(migration_preview_one migrate-ir-preview-preflight post "$FROM_VERSION" "$TO_VERSION" "$IR_DID" "$SINCE_MAIN")
   gate_migration_preview "$f" "$PREREG_IR" ir
   take_control pg-control-1.txt
   log 'migration preflight complete for post and engagement'
@@ -628,14 +640,14 @@ cmd_migrate_apply() {
   for target in $(migration_targets); do migration_apply_one "$target" "$label" "$FROM_VERSION" "$TO_VERSION" migrate "$maxb"; done
 }
 cmd_migrate_readback() {
-  local target table since actors scope f rows updated before_out after_out before_total after_total attempt=1 key expected actual
-  while [[ -e "$E/migrate-post-main-readback-$attempt.tsv" ]]; do attempt=$((attempt+1)); done
+  local target table since f rows updated before_out after_out before_total after_total attempt=1 key expected actual
+  while [[ -e "$E/migrate-post-readback-$attempt.tsv" ]]; do attempt=$((attempt+1)); done
   for target in $(migration_targets); do
-    table=$(migration_target_table "$target"); since=$(migration_target_since "$target"); actors=$(migration_target_actors "$target"); scope=""; [[ -n "$actors" ]] && scope="AND author=ANY($(sql_array "$actors")::text[])"
+    table=$(migration_target_table "$target"); since=$(migration_target_since "$target")
     f=$(migration_preview_one "migrate-$target-preview-after-$attempt" "$target" "$FROM_VERSION" "$TO_VERSION")
     [[ "$(jsonq "$f" preview.scanned)" == 0 ]] || die "$target still has in-horizon $FROM_VERSION rows"
     psql_copy "$(migration_snapshot_sql "$target" "$TO_VERSION")" | emit "migrate-$target-readback-$attempt.tsv"
-    rows=$(wc -l <"$E/migrate-$target-prestate.tsv")
+    rows=$(awk 'END{print NR}' "$E/migrate-$target-prestate.tsv")
     node -e 'const fs=require("fs");const [a,b]=process.argv.slice(1).map(p=>fs.readFileSync(p,"utf8").trim().split("\n").filter(Boolean).map(x=>x.split("\t")));const m=new Map(b.map(r=>[r[0],r]));let missing=0,raw=0;for(const r of a){const q=m.get(r[0]);if(!q)missing++;else if(q[8]!==r[8])raw++}console.log(`prestate_rows=${a.length} poststate_rows=${b.length} missing=${missing} raw_mismatch=${raw}`);if(missing||raw)process.exit(2)' "$E/migrate-$target-prestate.tsv" "$E/migrate-$target-readback-$attempt.tsv" | emit "migrate-$target-diff-$attempt.txt" || die "$target readback identity/raw gate failed"
     updated=$(for f in "$E"/migrate-$target-apply-*.json; do jsonq "$f" revalidation.updated; done | awk '{s+=$1}END{print s+0}')
     [[ "$updated" == "$rows" ]] || die "$target apply updated=$updated but prestate denominator=$rows"
@@ -645,10 +657,10 @@ cmd_migrate_readback() {
       [[ "$actual" == "$expected" ]] || die "$target realized $key=$actual but preregistered=$expected"
     done
     before_out=$(awk -F'|' '$1=="from_outside_horizon"{print $2}' "$E/migrate-$target-prestate-scope.tsv"); before_total=$(awk -F'|' '$1=="from_total"{print $2}' "$E/migrate-$target-prestate-scope.tsv")
-    after_out=$(psql_ro -t -c "SELECT count(*) FROM public.$table WHERE content_time_validator_version='$FROM_VERSION' AND \"indexedAt\"<'$since' $scope;"); after_total=$(psql_ro -t -c "SELECT count(*) FROM public.$table WHERE content_time_validator_version='$FROM_VERSION' $scope;")
+    after_out=$(psql_ro -t -c "SELECT count(*) FROM public.$table WHERE content_time_validator_version='$FROM_VERSION' AND \"indexedAt\"<'$since';"); after_total=$(psql_ro -t -c "SELECT count(*) FROM public.$table WHERE content_time_validator_version='$FROM_VERSION';")
     [[ "$before_out" == "$after_out" && $((before_total-after_total)) == "$rows" ]] || die "$target migration escaped the in-horizon snapshot"
   done
-  { echo "transition=$FROM_VERSION->$TO_VERSION"; for target in $(migration_targets); do echo "$target rows=$(wc -l <"$E/migrate-$target-prestate.tsv")"; done; echo "ir_gt_5m_restored=$(jsonq "$E/migrate-ir-preview-preflight.json" preview.counts.gt_5m_restored)"; echo "ir_zero_to_5m_clamped=$(jsonq "$E/migrate-ir-preview-preflight.json" preview.counts.zero_to_5m_clamped)"; } | emit "migrate-readback-$attempt.txt"
+  { echo "transition=$FROM_VERSION->$TO_VERSION"; for target in $(migration_targets); do echo "$target rows=$(awk 'END{print NR}' "$E/migrate-$target-prestate.tsv")"; done; echo "ir_gt_5m_restored=$(jsonq "$E/migrate-ir-preview-preflight.json" preview.counts.gt_5m_restored)"; echo "ir_zero_to_5m_clamped=$(jsonq "$E/migrate-ir-preview-preflight.json" preview.counts.zero_to_5m_clamped)"; } | emit "migrate-readback-$attempt.txt"
 }
 cmd_migrate_rollback() { # dry-run | apply <label> [max-batches]
   local mode=${1:?dry-run|apply} label=${2:-rollback} maxb=${3:-} target f attempt=1
@@ -658,7 +670,7 @@ cmd_migrate_rollback() { # dry-run | apply <label> [max-batches]
     apply)
       assert_tree; assert_active_catalog_version "$FROM_VERSION"
       for target in $(migration_targets); do migration_apply_one "$target" "$label" "$TO_VERSION" "$FROM_VERSION" rollback "$maxb"; done
-      while [[ -e "$E/rollback-post-main-readback-$attempt.tsv" ]]; do attempt=$((attempt+1)); done
+      while [[ -e "$E/rollback-post-readback-$attempt.tsv" ]]; do attempt=$((attempt+1)); done
       for target in $(migration_targets); do
         f=$(migration_preview_one "rollback-$target-preview-after-$attempt" "$target" "$TO_VERSION" "$FROM_VERSION"); [[ "$(jsonq "$f" preview.scanned)" == 0 ]] || die "$target reverse migration incomplete"
         psql_copy "$(migration_snapshot_sql "$target" "$FROM_VERSION")" | emit "rollback-$target-readback-$attempt.tsv"
@@ -667,6 +679,16 @@ cmd_migrate_rollback() { # dry-run | apply <label> [max-batches]
     *) die 'migrate-rollback mode must be dry-run or apply';;
   esac
 }
+cmd_migrate_finalize() {
+  local wstart=${1:-unset} wend=${2:-unset} tmp
+  [[ -f "$E/secret-scan.txt" ]] && grep -q '^hits=0$' "$E/secret-scan.txt" || die 'migrate-finalize requires migrate-secret-scan first'
+  tmp=$(mktemp)
+  { echo 'status=complete'; echo "generated_at=$(ts)"; cat "$E/migrate-source-set.txt"; echo "window_start_utc=$wstart"; echo "window_end_utc=$wend"; echo '--- readback'; cat "$E"/migrate-readback-*.txt; echo '--- ceilings'; cat "$E"/migrate-*-ceiling-*.txt; } >"$tmp"
+  emit RESULT.txt <"$tmp"; rm -f "$tmp"
+  seal_evidence
+}
+
+if [[ "${CONTENT_TIME_PACKET_SOURCE_ONLY:-0}" == 1 ]]; then return 0; fi
 
 case "${1:-}" in
   prereg) cmd_prereg;;
@@ -684,5 +706,7 @@ case "${1:-}" in
   migrate-apply) cmd_migrate_apply "${2:?label}" "${3:-}";;
   migrate-readback) cmd_migrate_readback;;
   migrate-rollback) cmd_migrate_rollback "${2:?dry-run|apply}" "${3:-}" "${4:-}";;
-  *) echo "usage: $0 prereg|preflight|control|preview <group>|apply <group> <label> [max_batches]|readback|restore <group>|secret-scan|finalize <start> <end>|migrate-prereg|migrate-preflight|migrate-preview|migrate-apply <label> [max_batches]|migrate-readback|migrate-rollback <dry-run|apply> [label] [max_batches]" >&2; exit 2;;
+  migrate-secret-scan) cmd_secret_scan;;
+  migrate-finalize) cmd_migrate_finalize "${2:-}" "${3:-}";;
+  *) echo "usage: $0 prereg|preflight|control|preview <group>|apply <group> <label> [max_batches]|readback|restore <group>|secret-scan|finalize <start> <end>|migrate-prereg|migrate-preflight|migrate-preview|migrate-apply <label> [max_batches]|migrate-readback|migrate-rollback <dry-run|apply> [label] [max_batches]|migrate-secret-scan|migrate-finalize <start> <end>" >&2; exit 2;;
 esac
