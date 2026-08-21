@@ -1,6 +1,7 @@
 import { Transaction } from 'kysely'
 import { AppContext } from '../config'
 import { Database } from '../db'
+import { randomBytes, timingSafeEqual } from 'crypto'
 import { DatabaseSchema, FeedCatalog } from '../db/schema'
 import { getProfile } from './queries'
 import { triggerFollowsUpdateForSubscriber } from './scheduled-updater'
@@ -662,17 +663,18 @@ export async function setSubscription(
   // linearization point) so the response never reflects a concurrent writer.
   const result = await ctx.db.transaction().execute(async (trx) => {
     const now = new Date()
+    const creationNonce = desired.subscribed ? randomBytes(32).toString('base64url') : undefined
     const inserted = desired.subscribed
       ? await trx
         .insertInto('subscriber')
-        .values({ handle: identity.handle, did: identity.did, access_scope: 'omni', first_subscribed_at: now })
+        .values({ handle: identity.handle, did: identity.did, access_scope: 'omni', first_subscribed_at: now, creation_nonce: creationNonce })
         .onConflict((oc) => oc.column('did').doNothing())
         .returning('did')
         .executeTakeFirst()
       : undefined
     const locked = await trx
       .selectFrom('subscriber')
-      .select(['did', 'kind', 'handle', 'first_subscribed_at'])
+      .select(['did', 'kind', 'handle', 'first_subscribed_at', 'creation_nonce'])
       .where('did', '=', identity.did)
       .forUpdate()
       .executeTakeFirst()
@@ -707,10 +709,10 @@ export async function setSubscription(
     if (!desired.subscribed) {
       if (!locked) return { changed: false, followsRelevant: false, scope: 'none' as AccessScope, assignments: [], creationCas: undefined }
       const creationCas = input.rollback_capability as string
-      const firstSubscribedAt = locked.first_subscribed_at instanceof Date
-        ? locked.first_subscribed_at.toISOString()
-        : locked.first_subscribed_at
-      if (!firstSubscribedAt || firstSubscribedAt !== creationCas) {
+      const storedNonce = locked.creation_nonce
+      const providedBytes = Buffer.from(creationCas)
+      const storedBytes = Buffer.from(storedNonce ?? '')
+      if (!storedNonce || providedBytes.length !== storedBytes.length || !timingSafeEqual(providedBytes, storedBytes)) {
         throw new SubscriptionError(409, 'presence_rollback_capability_mismatch', 'presence rollback capability does not match subscriber creation')
       }
       const history = await trx
@@ -718,12 +720,21 @@ export async function setSubscription(
         .select('id')
         .where('did', '=', identity.did)
         .executeTakeFirst()
-      const assignmentHistory = await trx
+      const assignments = await trx
         .selectFrom('feedgen_ops.subscriber_feed_assignment')
-        .select('assignment_id')
+        .select(['active_from', 'active_until'])
         .where('did', '=', identity.did)
-        .executeTakeFirst()
-      if (history || assignmentHistory) {
+        .execute()
+      const firstSubscribedAt = locked.first_subscribed_at instanceof Date
+        ? locked.first_subscribed_at.getTime()
+        : locked.first_subscribed_at ? Date.parse(String(locked.first_subscribed_at)) : NaN
+      const creationOwnedAssignments = assignments.every((assignment) => {
+        const activeFrom = assignment.active_from instanceof Date
+          ? assignment.active_from.getTime()
+          : Date.parse(String(assignment.active_from))
+        return Number.isFinite(firstSubscribedAt) && activeFrom === firstSubscribedAt
+      })
+      if (history || (assignments.length > 0 && !creationOwnedAssignments)) {
         throw new SubscriptionError(409, 'presence_rollback_not_fresh', 'presence rollback cannot erase established subscriber history')
       }
       await trx.deleteFrom('follows').where('subject', '=', identity.did).execute()
@@ -749,7 +760,7 @@ export async function setSubscription(
       followsRelevant: logicalChanged,
       scope: next.scope,
       assignments: next.assignments,
-      creationCas: inserted ? (now.toISOString()) : undefined,
+      creationCas: inserted ? creationNonce : undefined,
     }
   })
 

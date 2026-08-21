@@ -1172,6 +1172,24 @@ migrations['012_content_time_expiry_optional'] = {
   },
 }
 
+migrations['013_subscriber_creation_nonce'] = {
+  async up(db: Kysely<unknown>) {
+    await sql`
+      ALTER TABLE subscriber
+      ADD COLUMN IF NOT EXISTS creation_nonce text
+    `.execute(db)
+    await sql`
+      COMMENT ON COLUMN subscriber.creation_nonce IS 'feedgen:migration:013_subscriber_creation_nonce; provisioning rollback capability only'
+    `.execute(db)
+  },
+  async down(db: Kysely<unknown>) {
+    await sql`
+      ALTER TABLE subscriber
+      DROP COLUMN IF EXISTS creation_nonce
+    `.execute(db)
+  },
+}
+
 export async function validateContentTimeConstraints(db: Kysely<unknown>) {
   // Validation scans existing rows without holding the stronger ADD-CONSTRAINT
   // lock. Keep bounded timeouts so a busy production table fails safely and can

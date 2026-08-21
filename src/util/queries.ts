@@ -38,7 +38,7 @@ export async function getFollowsApi(
     db,
     updateAll: boolean = false,
     excludeDids: string[] = [],
-    requireSubscriber: boolean = false,
+    requireSubscriber: boolean = true,
 ): Promise<string[]> {
     const baseUrl = 'https://public.api.bsky.app/xrpc/app.bsky.graph.getFollows';
     let allFollows: SimplifiedFollow[] = [];

@@ -86,6 +86,7 @@ export type Subscriber = {
   // Additive INFRA-WEB-024/030 columns (migration 007). No column DEFAULT on
   // the two timestamps (RT-2) — stamped explicitly by exact-subscription.ts.
   first_subscribed_at?: string | Date | null
+  creation_nonce?: string | null
   scope_changed_at?: string | Date | null
   kind?: SubscriberKind
 }
