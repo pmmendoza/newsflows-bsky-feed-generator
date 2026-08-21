@@ -37,6 +37,8 @@
     "test:content-time-revalidate": "ts-node scripts/test_content_time_revalidate_execute.ts",
     "test:engagement-time-contract": "ts-node scripts/test_engagement_time_contract.ts",
     "test:ft-fu-1-db": "ts-node scripts/test_ft_fu_1_db_execute.ts",
+    "test:content-time-reconstruction": "ts-node scripts/test_content_time_reconstruction.ts",
+    "verify:content-time-reconstruction": "ts-node src/tools/verify-content-time-reconstruction.ts",
     "test:content-time-contract-upgrade-packet": "bash scripts/test_content_time_contract_upgrade_packet.sh",
     "test:engagement-refresh-execute": "ts-node scripts/test_engagement_refresh_execute.ts",
     "test:compliance-engagement-contract": "ts-node scripts/test_compliance_engagement_contract.ts",
