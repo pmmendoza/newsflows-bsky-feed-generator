@@ -14,6 +14,7 @@ import {
   setSubscription,
   SubscriptionError,
 } from '../src/util/exact-subscription'
+import { getFollowsApi } from '../src/util/queries'
 
 const HANDLE = process.env.FEEDGEN_SUBSCRIPTION_TEST_HANDLE || 'luciemartel.bsky.social'
 const FEED_A = 'itfeed-a'
@@ -26,9 +27,9 @@ async function main() {
   }
   const db = createDb(dsn)
   const ctx = { db } as AppContext
-  await migrateToLatest(db)
-  // feed_catalog is feedgen runtime state (not in the app migrations); create
-  // it the same way the existing subscription integration harness does.
+  // feed_catalog is feedgen runtime state (not in the app migrations), but it
+  // must exist before migrateToLatest because later migrations add owner
+  // columns and constraints to it.
   await sql`
     CREATE SCHEMA IF NOT EXISTS feedgen_ops;
     CREATE TABLE IF NOT EXISTS feedgen_ops.feed_catalog (
@@ -46,6 +47,7 @@ async function main() {
       retired_at timestamptz
     )
   `.execute(db)
+  await migrateToLatest(db)
   for (const rkey of [FEED_A, FEED_B]) {
     await db
       .insertInto('feedgen_ops.feed_catalog')
@@ -160,6 +162,100 @@ async function main() {
   // 8d. Now a member + expected.subscribed:true + correct state -> mutates.
   r = await setSubscription(ctx, { ...ident, state: { scope: 'omni' }, expected: { scope: 'assigned', feeds: [FEED_A], subscribed: true } }, true)
   assert((await state()).scope === 'omni', '8d: mutate-existing succeeds')
+
+  // 9. Administrator-only presence rollback removes the subscriber, its
+  // follow allowlist, and assignment rows atomically; rollback is
+  // capability- and CAS-protected and cannot be repeated after deletion.
+  await clean()
+  const provisioned = await setSubscription(ctx, { ...ident, state: { scope: 'omni' } }, true, false)
+  assert(typeof provisioned.creation_cas === 'string', '9: fresh provisioning returns a creation capability')
+  await db.insertInto('follows').values({ subject: did, follows: 'did:plc:follow-fixture' }).execute()
+  const plannedAbsent = await setSubscription(
+    ctx,
+    { ...ident, state: { scope: 'none', feeds: [], subscribed: false }, expected: { scope: 'omni', feeds: [], subscribed: true }, rollback_capability: provisioned.creation_cas },
+    false,
+    false,
+    undefined,
+    true,
+  )
+  assert(plannedAbsent.subscribed === false && plannedAbsent.changed, '9a: absent plan reports pending deletion')
+  const missingCas = async () => setSubscription(
+    ctx,
+    { ...ident, state: { scope: 'none', feeds: [], subscribed: false } },
+    true,
+    false,
+    undefined,
+    true,
+  )
+  await expectErr(missingCas, 'presence_rollback_cas_required')
+  const falseCas = async () => setSubscription(
+    ctx,
+    { ...ident, state: { scope: 'none', feeds: [], subscribed: false }, expected: { scope: 'omni', feeds: [], subscribed: false }, rollback_capability: provisioned.creation_cas },
+    true,
+    false,
+    undefined,
+    true,
+  )
+  await expectErr(falseCas, 'presence_rollback_cas_required')
+  const staleAbsent = async () => setSubscription(
+    ctx,
+    { ...ident, state: { scope: 'none', feeds: [], subscribed: false }, expected: { scope: 'none', feeds: [], subscribed: true }, rollback_capability: provisioned.creation_cas },
+    true,
+    false,
+    undefined,
+    true,
+  )
+  await expectErr(staleAbsent, 'stale_state')
+  const removed = await setSubscription(
+    ctx,
+    { ...ident, state: { scope: 'none', feeds: [], subscribed: false }, expected: { scope: 'omni', feeds: [], subscribed: true }, rollback_capability: provisioned.creation_cas },
+    true,
+    false,
+    undefined,
+    true,
+  )
+  assert(removed.subscribed === false && removed.access_scope === 'none', '9b: absent apply reports subscribed=false')
+  const absent = await inspectSubscription(db, await resolveSubscriptionIdentity({ did }))
+  assert(absent.subscribed === false && absent.access_scope === 'none' && absent.assignments.length === 0, '9c: absent readback')
+  assert(!(await db.selectFrom('subscriber').select('did').where('did', '=', did).executeTakeFirst()), '9d: subscriber row removed')
+  assert(!(await db.selectFrom('follows').select('subject').where('subject', '=', did).executeTakeFirst()), '9e: follows removed')
+  assert(!(await db.selectFrom('feedgen_ops.subscriber_feed_assignment').select('did').where('did', '=', did).executeTakeFirst()), '9f: assignments removed')
+  const repeatAbsent = async () => setSubscription(
+    ctx,
+    { ...ident, state: { scope: 'none', feeds: [], subscribed: false }, expected: { scope: 'none', feeds: [], subscribed: true }, rollback_capability: provisioned.creation_cas },
+    true,
+    false,
+    undefined,
+    true,
+  )
+  await expectErr(repeatAbsent, 'stale_state')
+
+  // 10. A scheduled refresh cannot reinsert follows after a concurrent
+  // presence rollback: its subscriber FOR SHARE guard linearizes the write.
+  await setSubscription(ctx, { ...ident, state: { scope: 'omni' } }, true, false)
+  const originalFetch = globalThis.fetch
+  globalThis.fetch = (async () => new Response(JSON.stringify({
+    follows: [{ did: 'did:plc:race-follow' }],
+    subject: { did },
+  }), { status: 200, headers: { 'content-type': 'application/json' } })) as typeof fetch
+  let releaseDelete!: () => void
+  const deleteGate = new Promise<void>((resolve) => { releaseDelete = resolve })
+  let deleteLocked!: () => void
+  const locked = new Promise<void>((resolve) => { deleteLocked = resolve })
+  const deletion = db.transaction().execute(async (trx) => {
+    await trx.selectFrom('subscriber').select('did').where('did', '=', did).forUpdate().executeTakeFirstOrThrow()
+    deleteLocked()
+    await deleteGate
+    await trx.deleteFrom('follows').where('subject', '=', did).execute()
+    await trx.deleteFrom('subscriber').where('did', '=', did).execute()
+  })
+  await locked
+  const refresh = getFollowsApi(did, db, false, [], true)
+  releaseDelete()
+  await Promise.all([deletion, refresh])
+  globalThis.fetch = originalFetch
+  assert(!(await db.selectFrom('follows').select('subject').where('subject', '=', did).executeTakeFirst()), '10: guarded refresh must not reinsert follows after rollback')
+  assert(!(await db.selectFrom('subscriber').select('did').where('did', '=', did).executeTakeFirst()), '10: rollback must leave subscriber absent')
 
   await clean()
   await new Promise((r) => setTimeout(r, 400)) // let async follows updates settle

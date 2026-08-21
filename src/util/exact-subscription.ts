@@ -46,6 +46,8 @@ export type SubscriptionResult = {
   current_access_scope?: AccessScope
   current_assignments?: AssignmentView[]
   apply_performed: boolean
+  subscribed: boolean
+  creation_cas?: string
 }
 
 type Db = Database | Transaction<DatabaseSchema>
@@ -417,6 +419,7 @@ export async function executeSubscription(
   const finalState = apply ? await inspectSubscription(ctx.db, identity) : {
     access_scope: next.scope,
     assignments: next.assignments,
+    subscribed: true,
   }
   return {
     ok: true,
@@ -432,6 +435,7 @@ export async function executeSubscription(
     current_access_scope: apply ? undefined : beforeState.access_scope,
     current_assignments: apply ? undefined : beforeState.assignments,
     apply_performed: apply,
+    subscribed: apply ? finalState.subscribed : true,
   }
 }
 
@@ -444,11 +448,12 @@ export async function executeSubscription(
 // proven applyProjectedState writer; the legacy mode API remains as a shim.
 // ---------------------------------------------------------------------------
 
-export type DesiredState = { scope: AccessScope; feeds: string[] }
+export type DesiredState = { scope: AccessScope; feeds: string[]; subscribed: boolean }
 
 export type SetSubscriptionInput = SubscriptionInput & {
-  state?: { scope?: unknown; feeds?: unknown }
+  state?: { scope?: unknown; feeds?: unknown; subscribed?: unknown }
   expected?: { scope?: unknown; feeds?: unknown; subscribed?: unknown } | null
+  rollback_capability?: unknown
 }
 
 // `subscribed` is an optional membership predicate for compare-and-set: it
@@ -486,17 +491,24 @@ export function parseDesiredState(input: SetSubscriptionInput): DesiredState {
     throw new SubscriptionError(400, 'invalid_state', 'state.scope must be omni, none, or assigned')
   }
   const feeds = parseFeedList(raw.feeds, 'state')
+  const subscribed = raw.subscribed === undefined ? true : raw.subscribed
+  if (typeof subscribed !== 'boolean') {
+    throw new SubscriptionError(400, 'invalid_state', 'state.subscribed must be a boolean')
+  }
+  if (!subscribed && (scope !== 'none' || feeds.length > 0)) {
+    throw new SubscriptionError(400, 'invalid_state', 'state.subscribed=false requires scope=none and an empty feeds list')
+  }
   if (scope === 'assigned') {
     const deduped = Array.from(new Set(feeds)).sort()
     if (!deduped.length) {
       throw new SubscriptionError(400, 'invalid_state', 'state.scope=assigned requires a non-empty feeds list')
     }
-    return { scope, feeds: deduped }
+    return { scope, feeds: deduped, subscribed }
   }
   if (feeds.length > 0) {
     throw new SubscriptionError(400, 'invalid_state', `state.scope=${scope} does not accept feeds`)
   }
-  return { scope, feeds: [] }
+  return { scope, feeds: [], subscribed }
 }
 
 function parseExpectedState(raw: { scope?: unknown; feeds?: unknown; subscribed?: unknown }): ExpectedState {
@@ -579,6 +591,7 @@ export async function setSubscription(
   apply: boolean,
   updateFollows = true,
   boundDid?: string,
+  allowPresenceDeletion = false,
 ): Promise<SubscriptionResult> {
   // RT-8: apply resolves via AppView (exactly once, at apply time); preview
   // resolves DB-first so a batch's preview/plan calls spend no AppView budget.
@@ -589,9 +602,20 @@ export async function setSubscription(
     throw new SubscriptionError(403, 'identity_mismatch', 'subscription identity does not match token subject')
   }
   const desired = parseDesiredState(input)
-  const source = input.source?.trim() || 'feedgen-subscription-api'
   const expected =
     input.expected !== undefined && input.expected !== null ? parseExpectedState(input.expected) : null
+  if (!desired.subscribed && !allowPresenceDeletion) {
+    throw new SubscriptionError(403, 'presence_deletion_forbidden', 'only an administrator may remove subscriber presence')
+  }
+  if (!desired.subscribed) {
+    if (!expected || expected.subscribed !== true) {
+      throw new SubscriptionError(409, 'presence_rollback_cas_required', 'presence rollback requires expected.subscribed=true')
+    }
+    if (typeof input.rollback_capability !== 'string' || input.rollback_capability.trim().length === 0) {
+      throw new SubscriptionError(409, 'presence_rollback_capability_required', 'presence rollback requires the creation capability from provisioning')
+    }
+  }
+  const source = input.source?.trim() || 'feedgen-subscription-api'
 
   // RT-1: reject researcher-account mutation in the preview/plan path too,
   // not only inside the apply transaction.
@@ -627,6 +651,7 @@ export async function setSubscription(
       access_scope: desired.scope,
       changed: didChange,
       assignments: nextAssignments,
+      subscribed: desired.subscribed,
       current_access_scope: beforeState.access_scope,
       current_assignments: beforeState.assignments,
       apply_performed: false,
@@ -637,15 +662,17 @@ export async function setSubscription(
   // linearization point) so the response never reflects a concurrent writer.
   const result = await ctx.db.transaction().execute(async (trx) => {
     const now = new Date()
-    const inserted = await trx
-      .insertInto('subscriber')
-      .values({ handle: identity.handle, did: identity.did, access_scope: 'omni', first_subscribed_at: now })
-      .onConflict((oc) => oc.column('did').doNothing())
-      .returning('did')
-      .executeTakeFirst()
+    const inserted = desired.subscribed
+      ? await trx
+        .insertInto('subscriber')
+        .values({ handle: identity.handle, did: identity.did, access_scope: 'omni', first_subscribed_at: now })
+        .onConflict((oc) => oc.column('did').doNothing())
+        .returning('did')
+        .executeTakeFirst()
+      : undefined
     const locked = await trx
       .selectFrom('subscriber')
-      .select(['did', 'kind', 'handle'])
+      .select(['did', 'kind', 'handle', 'first_subscribed_at'])
       .where('did', '=', identity.did)
       .forUpdate()
       .executeTakeFirst()
@@ -653,7 +680,9 @@ export async function setSubscription(
     assertNotResearcher(locked?.kind, identity.did)
     // RT-8: identity.handle was already resolved once (via AppView, above);
     // no second lookup here — just compare to the locked row's stored value.
-    await recordHandleChangeIfNeeded(trx, identity.did, locked?.handle, identity.handle, source)
+    if (desired.subscribed) {
+      await recordHandleChangeIfNeeded(trx, identity.did, locked?.handle, identity.handle, source)
+    }
     // Two views of "before":
     //  - PHYSICAL: what the row actually holds now, incl. the bootstrap omni
     //    row a fresh insert just created. Drives whether we must write, so a
@@ -667,13 +696,39 @@ export async function setSubscription(
     const logicalScope: AccessScope = inserted ? 'none' : observed.access_scope
     const logicalAssignments = inserted ? [] : observed.assignments
     // Logical membership: a row we just bootstrapped was NOT a subscriber before.
-    const logicalSubscribed = !inserted
+    const logicalSubscribed = desired.subscribed ? !inserted : Boolean(locked)
     if (
       expected &&
       (!statesEqual(logicalScope, currentFeeds(logicalAssignments), expected) ||
         (expected.subscribed !== undefined && expected.subscribed !== logicalSubscribed))
     ) {
       throw new SubscriptionError(409, 'stale_state', 'current state does not match expected; re-read and retry')
+    }
+    if (!desired.subscribed) {
+      if (!locked) return { changed: false, followsRelevant: false, scope: 'none' as AccessScope, assignments: [], creationCas: undefined }
+      const creationCas = input.rollback_capability as string
+      const firstSubscribedAt = locked.first_subscribed_at instanceof Date
+        ? locked.first_subscribed_at.toISOString()
+        : locked.first_subscribed_at
+      if (!firstSubscribedAt || firstSubscribedAt !== creationCas) {
+        throw new SubscriptionError(409, 'presence_rollback_capability_mismatch', 'presence rollback capability does not match subscriber creation')
+      }
+      const history = await trx
+        .selectFrom('subscriber_handle_history')
+        .select('id')
+        .where('did', '=', identity.did)
+        .executeTakeFirst()
+      const assignmentHistory = await trx
+        .selectFrom('feedgen_ops.subscriber_feed_assignment')
+        .select('assignment_id')
+        .where('did', '=', identity.did)
+        .executeTakeFirst()
+      if (history || assignmentHistory) {
+        throw new SubscriptionError(409, 'presence_rollback_not_fresh', 'presence rollback cannot erase established subscriber history')
+      }
+      await trx.deleteFrom('follows').where('subject', '=', identity.did).execute()
+      await trx.deleteFrom('subscriber').where('did', '=', identity.did).execute()
+      return { changed: true, followsRelevant: true, scope: 'none' as AccessScope, assignments: [], creationCas: undefined }
     }
     const nextAssignments =
       desired.scope === 'assigned' ? await resolveDesiredAssignments(trx, desired.feeds, true) : []
@@ -689,7 +744,13 @@ export async function setSubscription(
       // first real scope decision (INFRA-WEB-024: stamp scope_changed_at).
       await trx.updateTable('subscriber').set({ scope_changed_at: now }).where('did', '=', identity.did).execute()
     }
-    return { changed: physChanged || logicalChanged, followsRelevant: logicalChanged, scope: next.scope, assignments: next.assignments }
+    return {
+      changed: physChanged || logicalChanged,
+      followsRelevant: logicalChanged,
+      scope: next.scope,
+      assignments: next.assignments,
+      creationCas: inserted ? (now.toISOString()) : undefined,
+    }
   })
 
   if (result.followsRelevant && updateFollows && result.scope !== 'none') {
@@ -706,8 +767,10 @@ export async function setSubscription(
     access_scope: result.scope,
     changed: result.changed,
     assignments: result.assignments,
+    subscribed: desired.subscribed,
     current_access_scope: undefined,
     current_assignments: undefined,
     apply_performed: true,
+    creation_cas: result.creationCas,
   }
 }

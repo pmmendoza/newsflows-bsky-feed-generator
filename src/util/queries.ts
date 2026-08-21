@@ -33,7 +33,13 @@ export async function getFollows(actor: string, db): Promise<string[]> {
     return getFollowsApi(actor, db);
 }
 
-export async function getFollowsApi(actor: string, db, updateAll: boolean = false, excludeDids: string[] = []): Promise<string[]> {
+export async function getFollowsApi(
+    actor: string,
+    db,
+    updateAll: boolean = false,
+    excludeDids: string[] = [],
+    requireSubscriber: boolean = false,
+): Promise<string[]> {
     const baseUrl = 'https://public.api.bsky.app/xrpc/app.bsky.graph.getFollows';
     let allFollows: SimplifiedFollow[] = [];
     let currentCursor: string | undefined = undefined;
@@ -118,28 +124,47 @@ export async function getFollowsApi(actor: string, db, updateAll: boolean = fals
 
     if (allFollows.length > 0) {
         try {
-            if (updateAll) {
+            const store = async (writerDb) => {
+              if (updateAll) {
                 // Full sync mode: replace entire follows list for this subject
                 // Delete existing follows for this subject
-                await db
+                await writerDb
                     .deleteFrom('follows')
                     .where('subject', '=', actor)
                     .execute();
 
                 // Insert the complete new list
-                await db
+                await writerDb
                     .insertInto('follows')
                     .values(allFollows)
                     .execute();
                 console.log(`[${new Date().toISOString()}] - Full sync: replaced follows list with ${allFollows.length} follows for ${actor}`);
-            } else {
+              } else {
                 // Incremental sync mode: only add new follows
-                await db
+                await writerDb
                     .insertInto('follows')
                     .values(allFollows)
                     .onConflict((oc) => oc.columns(['subject', 'follows']).doNothing())
                     .execute();
                 console.log(`[${new Date().toISOString()}] - Incremental sync: added ${allFollows.length} new follows for ${actor}`);
+              }
+            }
+            if (requireSubscriber) {
+              await db.transaction().execute(async (trx) => {
+                // Scheduled refreshes must linearize against presence rollback:
+                // either this shared lock commits before deletion, or the row is
+                // gone and no follow rows are written.
+                const subscriber = await trx
+                    .selectFrom('subscriber')
+                    .select('did')
+                    .where('did', '=', actor)
+                    .forShare()
+                    .executeTakeFirst()
+                if (!subscriber) return
+                await store(trx)
+              })
+            } else {
+              await store(db)
             }
         } catch (dbError) {
             console.error(`[${new Date().toISOString()}] - Database error while storing follows for ${actor}:`, dbError);
