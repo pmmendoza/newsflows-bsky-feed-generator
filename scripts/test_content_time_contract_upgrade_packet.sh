@@ -12,16 +12,42 @@ must 'post_bulk "$E/feedgen-forward.json" 03-feedgen-forward-apply'
 must 'forward_to_completion'
 must '"$REVALIDATE" "$@"'
 must 'EXPECTED_REVALIDATE_RUNNER_SHA'
+must 'PREREG_POST'
 must 'sleep "${DRAIN_INTERVAL_SECONDS:-60}"'
 must 'post_bulk "$E/feedgen-rollback.json" 01-feedgen-rollback-v3-to-v2'
 must 'revalidate_runner migrate-rollback apply reverse'
+must 'revalidate_runner migrate-secret-scan'
+must 'revalidate_runner migrate-finalize'
+! grep -Fq -- 'PREREG_POST_MAIN' "$packet"
+! grep -Fq -- 'PREREG_POST_BE' "$packet"
 [[ $(grep '^RKEYS=' "$packet" | cut -d= -f2 | tr ',' '\n' | sort -u | wc -l | tr -d ' ') == 6 ]]
 line() { grep -nF -- "$1" "$packet" | tail -1 | cut -d: -f1; }
 (( $(line 'catalog_sync_apply "$SOURCE_ROOT"') < $(line 'post_bulk "$E/feedgen-forward.json" 03-feedgen-forward-apply') ))
 (( $(line 'post_bulk "$E/feedgen-forward.json" 03-feedgen-forward-apply') < $(line 'forward_to_completion') ))
 (( $(line 'post_bulk "$E/feedgen-rollback.json" 01-feedgen-rollback-v3-to-v2') < $(line 'revalidate_runner migrate-rollback apply reverse') ))
 
-tmp=$(mktemp -d); mock=$tmp/mock; mkdir "$mock" "$tmp/evidence"
+# Execute the delegated runner's boundary functions: exactly two global
+# migration targets, both at the single widest storage horizon. IR remains a
+# separately scoped preview inside that runner, never a migration target.
+runner=$dir/content_time_revalidate_packet.sh
+tmp=$(mktemp -d)
+(
+  export CONTENT_TIME_PACKET_SOURCE_ONLY=1 E="$tmp/library-evidence" TREE="$tmp/library-tree" EXPECTED_SHA=x \
+    EXPECTED_DIST_SHA256=x EXPECTED_CT_SHA256=x EXPECTED_IMAGE_CT_SHA256=x EXPECTED_TOOL_REFS=x \
+    PACKET_SHA=1111111111111111111111111111111111111111111111111111111111111111 \
+    FROM_VERSION=newsflows-content-time/v2 TO_VERSION=newsflows-content-time/v3 \
+    SINCE_MAIN=2026-08-18T00:00:00.000Z SINCE_BE=2026-08-11T00:00:00.000Z \
+    SINCE_ENGAGEMENT=2026-08-11T00:00:00.000Z PREREG_POST=x PREREG_ENGAGEMENT=x PREREG_IR=x
+  set -- migrate-preflight
+  # shellcheck source=content_time_revalidate_packet.sh
+  . "$runner"
+  [[ $(migration_targets) == 'post engagement' ]]
+  [[ $(migration_target_since post) == "$SINCE_ENGAGEMENT" ]]
+  [[ $(migration_target_since engagement) == "$SINCE_ENGAGEMENT" ]]
+  [[ $(migration_snapshot_sql post "$FROM_VERSION") != *'author=ANY('* ]]
+)
+
+mock=$tmp/mock; mkdir "$mock" "$tmp/evidence"
 cat >"$mock/sudo" <<'SH'
 #!/usr/bin/env bash
 [[ ${1:-} == -n ]] && shift

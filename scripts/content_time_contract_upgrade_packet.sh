@@ -75,7 +75,7 @@ if [[ $COMMAND == test-timer-restore && ${FTFU1_TEST_MODE:-0} == 1 ]]; then
   : "${E:?}"; mkdir -p "$E"; fence_timers; false
 fi
 
-for v in E SOURCE_ROOT SOURCE_SHA SOURCE_CATALOG_SHA ROLLBACK_SOURCE_ROOT ROLLBACK_SOURCE_SHA ROLLBACK_CATALOG_SHA TREE FEEDGEN_SHA EXPECTED_DIST_SHA EXPECTED_CT_SHA EXPECTED_IMAGE_CT_SHA EXPECTED_IMAGE EXPECTED_TOOL_REFS EXPECTED_RUNNER_SHA EXPECTED_REVALIDATE_RUNNER_SHA PACKET_PATH PACKET_SHA SINCE_MAIN SINCE_BE SINCE_ENGAGEMENT PREREG_POST_MAIN PREREG_POST_BE PREREG_ENGAGEMENT PREREG_IR; do
+for v in E SOURCE_ROOT SOURCE_SHA SOURCE_CATALOG_SHA ROLLBACK_SOURCE_ROOT ROLLBACK_SOURCE_SHA ROLLBACK_CATALOG_SHA TREE FEEDGEN_SHA EXPECTED_DIST_SHA EXPECTED_CT_SHA EXPECTED_IMAGE_CT_SHA EXPECTED_IMAGE EXPECTED_TOOL_REFS EXPECTED_RUNNER_SHA EXPECTED_REVALIDATE_RUNNER_SHA PACKET_PATH PACKET_SHA SINCE_MAIN SINCE_BE SINCE_ENGAGEMENT PREREG_POST PREREG_ENGAGEMENT PREREG_IR; do
   [[ -n ${!v:-} ]] || die "$v is required"
 done
 [[ $E == /* ]] || die 'E must be an absolute evidence root'
@@ -151,7 +151,7 @@ revalidate_runner() {
 }
 migration_complete() {
   local label=$1 target
-  for target in post-main post-be engagement; do
+  for target in post engagement; do
     [[ $(node -e 'console.log(JSON.parse(require("fs").readFileSync(process.argv[1])).revalidation.complete)' "$E/migrate-$target-apply-$label.json") == true ]] || return 1
   done
 }
@@ -193,7 +193,7 @@ cmd_apply() {
   post_bulk "$E/feedgen-forward.json" 03-feedgen-forward-apply
   active_version_gate "$V3"
   forward_to_completion
-  { echo '01 catalog-sync forward'; echo '02 feedgen sync packet gate'; echo '03 exact-six bulk v2->v3'; echo '04 post-main'; echo '04 post-be'; echo '04 engagement-global'; } | emit apply-order.txt
+  { echo '01 catalog-sync forward'; echo '02 feedgen sync packet gate'; echo '03 exact-six bulk v2->v3'; echo '04 global post'; echo '04 global engagement'; } | emit apply-order.txt
   restore_timers
 }
 cmd_revalidate() { assert_bindings; active_version_gate "$V3"; fence_timers; forward_to_completion; restore_timers; }
@@ -226,11 +226,16 @@ cmd_rollback() {
   active_version_gate "$V2"
   catalog_sync_apply "$ROLLBACK_SOURCE_ROOT" | emit 02-catalog-sync-rollback-apply.json; gate_catalog_sync "$E/02-catalog-sync-rollback-apply.json"
   revalidate_runner migrate-rollback apply reverse
-  { echo '01 exact-six bulk v3->v2'; echo '02 catalog desired-state rollback'; echo '03 reverse post-main'; echo '03 reverse post-be'; echo '03 reverse engagement-global'; } | emit rollback-order.txt
+  { echo '01 exact-six bulk v3->v2'; echo '02 catalog desired-state rollback'; echo '03 reverse global post'; echo '03 reverse global engagement'; } | emit rollback-order.txt
   restore_timers
+}
+cmd_finalize() {
+  assert_bindings
+  revalidate_runner migrate-secret-scan
+  revalidate_runner migrate-finalize "${2:?window start is required}" "${3:?window end is required}"
 }
 
 case "$COMMAND" in
-  preflight) cmd_preflight;; preview) cmd_preview;; apply) cmd_apply;; revalidate) cmd_revalidate;; readback) cmd_readback;; rollback-dryrun) cmd_rollback_dryrun;; rollback) cmd_rollback;;
-  *) echo 'usage: content_time_contract_upgrade_packet.sh preflight|preview|apply|revalidate|readback|rollback-dryrun|rollback' >&2; exit 2;;
+  preflight) cmd_preflight;; preview) cmd_preview;; apply) cmd_apply;; revalidate) cmd_revalidate;; readback) cmd_readback;; rollback-dryrun) cmd_rollback_dryrun;; rollback) cmd_rollback;; finalize) cmd_finalize "$@";;
+  *) echo 'usage: content_time_contract_upgrade_packet.sh preflight|preview|apply|revalidate|readback|rollback-dryrun|rollback|finalize <start> <end>' >&2; exit 2;;
 esac
