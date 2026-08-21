@@ -29,7 +29,7 @@
  */
 import { createHash } from 'crypto'
 import { Config } from '../config'
-import { resolveEngagementTimeHours, archiveOutboxEnabled, servingTimeHourOverrides } from '../algos/feed-builder'
+import { resolveEngagementTimeHours, archiveOutboxEnabled } from '../algos/feed-builder'
 import { freshnessHours } from '../algos/ranker-priority-helper'
 import { killSwitchDisabled as politicianFilterKillSwitchDisabled } from '../algos/politician-filter'
 import { scoreSourceRefreshMs } from './score-source-cache'
@@ -92,12 +92,7 @@ export function buildConfigManifest(cfg: Config) {
     },
     engagement: {
       time_hours: resolveEngagementTimeHours(),
-      // per-feed publisher serving-window overrides ({ <RKEY_ENV_SUFFIX>: hours });
-      // empty {} when none set. Only the publisher (ranked) window is overridden;
-      // the follows window + engagement-recount window stay on time_hours.
-      serving_time_hours_overrides: servingTimeHourOverrides(),
-      publisher_serving_window_authority: 'feed_catalog_with_transitional_env_fallback',
-      compatibility_fallback_retirement_gate: 'materialized_catalog_production_proof',
+      publisher_serving_window_authority: 'feed_catalog',
     },
     politician_filter: {
       kill_switch_disabled: politicianFilterKillSwitchDisabled(),
@@ -213,12 +208,8 @@ export const CONFIG_MANIFEST_ENV_KEYS: readonly string[] = [
 
 // Dynamic-key patterns matched by shape rather than enumerated individually:
 //   - NEWSBOT_*_DID: one env var per country bot (e.g. NEWSBOT_NL_DID).
-//   - FEEDGEN_SERVING_TIME_HOURS_*: optional per-feed publisher serving-window
-//     override (e.g. FEEDGEN_SERVING_TIME_HOURS_NEWSFLOW_BE_K); the resolved
-//     values are recorded under engagement.serving_time_hours_overrides.
 export const CONFIG_MANIFEST_DYNAMIC_ENV_KEY_PATTERNS: readonly RegExp[] = [
   /^NEWSBOT_[A-Z0-9_]*_DID$/,
-  /^FEEDGEN_SERVING_TIME_HOURS_[A-Z0-9_]+$/,
 ]
 
 export const CONFIG_MANIFEST_EXCLUDED_ENV_KEYS: Readonly<Record<string, string>> = {

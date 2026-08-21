@@ -438,7 +438,6 @@ export function operatorStatus(row: Pick<FeedCatalog, 'enabled' | 'access_policy
 
 export function feedCatalogItemPayload(row: FeedCatalog) {
   const servingWindow = resolvePublisherServingWindow(
-    row.rkey,
     row.publisher_post_max_age_days,
     row.publisher_post_max_age_source,
   )

@@ -79,14 +79,16 @@ check(rollbackParsed.ok, 'rollback update must parse through the same CAS path')
 const rollbackDryRun = buildFeedCatalogDryRun(after, rollbackParsed.row, { studyExists: true })
 check(rollbackDryRun.status === 'dry-run' && rollbackDryRun.proposed.publisher_post_max_age_days === 7, 'rollback dry-run must restore prior value')
 
-process.env.FEEDGEN_SERVING_TIME_HOURS_NEWSFLOW_BE_K = '168'
-const compatibility = feedCatalogShowPayload({
-  ...current,
-  publisher_post_max_age_days: null,
-  publisher_post_max_age_source: null,
-})
-check(compatibility.publisher_serving_window.compatibility_fallback_active, 'readback must expose compatibility fallback')
-check(compatibility.publisher_serving_window.effective_hours === 168, 'readback must expose fallback effect')
-delete process.env.FEEDGEN_SERVING_TIME_HOURS_NEWSFLOW_BE_K
+let missingWindowFailedClosed = false
+try {
+  feedCatalogShowPayload({
+    ...current,
+    publisher_post_max_age_days: null,
+    publisher_post_max_age_source: null,
+  })
+} catch {
+  missingWindowFailedClosed = true
+}
+check(missingWindowFailedClosed, 'readback must fail closed without a catalog publisher window')
 
 console.log('publisher catalog control tests passed')

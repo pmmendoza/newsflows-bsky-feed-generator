@@ -34,12 +34,10 @@ withEnv({
   ENGAGEMENT_TIME_HOURS: '72',
   FEEDGEN_SERVING_TIME_HOURS_NEWSFLOW_BE_K: '168',
 }, () => {
-  const catalog = resolvePublisherServingWindow('newsflow-be-k', 10, 'study_default')
+  const catalog = resolvePublisherServingWindow(10, 'study_default')
   check(catalog.effectiveHours === 240, 'materialized ten-day value must win')
-  check(!catalog.compatibilityFallbackActive, 'valid catalog value disables compatibility fallback')
-  const fallback = resolvePublisherServingWindow('newsflow-be-k', null, null)
-  check(fallback.effectiveHours === 168, 'legacy Belgium fallback remains available')
-  check(fallback.compatibilityFallbackActive, 'fallback must be explicit')
+  check(!catalog.compatibilityFallbackActive, 'catalog authority has no compatibility fallback')
+  check(catalog.compatibilityEnvKey === null, 'catalog authority must not name an environment fallback')
 })
 
 const cutoff = cutoffFromHours(Date.parse('2026-08-12T00:00:00Z'), 240)

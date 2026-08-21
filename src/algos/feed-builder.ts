@@ -31,34 +31,6 @@ export function resolveEngagementTimeHours(): number {
   return parseStrictPositiveHours(process.env.ENGAGEMENT_TIME_HOURS) ?? 72
 }
 
-/**
- * Transitional compatibility resolver retained for callers/tests that do not
- * yet provide a catalog row. A valid materialized catalog value always wins in
- * resolvePublisherServingWindow; readback labels this fallback when active.
- */
-export function resolveServingTimeHours(shortname: string): number {
-  return resolvePublisherServingWindow(shortname, null, null).effectiveHours
-}
-
-/**
- * All active per-feed serving-window overrides as { <RKEY_ENV_SUFFIX>: hours },
- * for the config-activation manifest (util/config-manifest.ts). Uses the same
- * parse rule as resolveServingTimeHours so the manifest records exactly what
- * serving uses (the manifest's load-bearing "no separate re-parse" rule).
- */
-export function servingTimeHourOverrides(): Record<string, number> {
-  const out: Record<string, number> = {}
-  for (const key of Object.keys(process.env)) {
-    const match = /^FEEDGEN_SERVING_TIME_HOURS_([A-Z0-9_]+)$/.exec(key)
-    if (!match) continue
-    const value = process.env[key]
-    if (!value) continue
-    const parsed = parseStrictPositiveHours(value)
-    if (parsed !== null) out[match[1]] = parsed
-  }
-  return out
-}
-
 export function archiveOutboxEnabled(): boolean {
   return process.env.FEEDGEN_ARCHIVE_OUTBOX_ENABLED === 'true'
 }
@@ -126,7 +98,6 @@ export async function buildFeed({
   // legacy receipt-time horizon. Both derive from one request reference time.
   const engagementTimeHours = resolveEngagementTimeHours();
   const servingWindow = resolvePublisherServingWindow(
-    shortname,
     publisherPostMaxAgeDays,
     publisherPostMaxAgeSource,
   )

@@ -1,5 +1,4 @@
 import { PublisherPostMaxAgeSource } from '../db/schema'
-import { rkeyToEnvSuffix } from './ranker-priority-helper'
 
 export const PUBLISHER_POST_MAX_AGE_DAYS_MIN = 1
 export const PUBLISHER_POST_MAX_AGE_DAYS_MAX = 365
@@ -8,7 +7,7 @@ const MAX_COMPATIBILITY_HOURS = PUBLISHER_POST_MAX_AGE_DAYS_MAX * 24
 export type PublisherServingWindow = {
   effectiveHours: number
   effectiveDays: number
-  source: PublisherPostMaxAgeSource | 'compatibility_feed_env' | 'compatibility_global_env' | 'compatibility_default'
+  source: PublisherPostMaxAgeSource
   compatibilityFallbackActive: boolean
   compatibilityEnvKey: string | null
 }
@@ -28,40 +27,20 @@ export function parseStrictPositiveHours(raw: string | undefined): number | null
 }
 
 export function resolvePublisherServingWindow(
-  rkey: string,
   catalogDays: number | null | undefined,
   catalogSource: PublisherPostMaxAgeSource | null | undefined,
 ): PublisherServingWindow {
-  if (isPublisherPostMaxAgeDays(catalogDays) && catalogSource) {
-    return {
-      effectiveHours: catalogDays * 24,
-      effectiveDays: catalogDays,
-      source: catalogSource,
-      compatibilityFallbackActive: false,
-      compatibilityEnvKey: null,
-    }
+  if (!isPublisherPostMaxAgeDays(catalogDays)
+    || (catalogSource !== 'study_default' && catalogSource !== 'feed_override')) {
+    throw new Error('publisher serving window requires valid catalog days and provenance')
   }
 
-  const feedEnvKey = `FEEDGEN_SERVING_TIME_HOURS_${rkeyToEnvSuffix(rkey)}`
-  const feedHours = parseStrictPositiveHours(process.env[feedEnvKey])
-  if (feedHours !== null) {
-    return {
-      effectiveHours: feedHours,
-      effectiveDays: feedHours / 24,
-      source: 'compatibility_feed_env',
-      compatibilityFallbackActive: true,
-      compatibilityEnvKey: feedEnvKey,
-    }
-  }
-
-  const globalHours = parseStrictPositiveHours(process.env.ENGAGEMENT_TIME_HOURS)
-  const effectiveHours = globalHours ?? 72
   return {
-    effectiveHours,
-    effectiveDays: effectiveHours / 24,
-    source: globalHours === null ? 'compatibility_default' : 'compatibility_global_env',
-    compatibilityFallbackActive: true,
-    compatibilityEnvKey: globalHours === null ? null : 'ENGAGEMENT_TIME_HOURS',
+    effectiveHours: catalogDays * 24,
+    effectiveDays: catalogDays,
+    source: catalogSource,
+    compatibilityFallbackActive: false,
+    compatibilityEnvKey: null,
   }
 }
 
