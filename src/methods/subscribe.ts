@@ -116,7 +116,7 @@ export default function registerSubscribeEndpoint(server: Server, ctx: AppContex
         : { ...input, source: 'subscription-token' }
       // Canonical atomic desired-state path (FEEDGEN-SUBSCRIBE-ATOMIC).
       if (input.state !== undefined) {
-        return res.json(await setSubscription(ctx, trustedInput, true, true, boundDid))
+        return res.json(await setSubscription(ctx, trustedInput, true, true, boundDid, admin))
       }
       // Legacy mode-based shim (deprecated): add/remove/replace/omni.
       parseSubscriptionMode(input.mode)

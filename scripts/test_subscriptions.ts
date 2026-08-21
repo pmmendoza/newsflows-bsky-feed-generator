@@ -478,6 +478,13 @@ async function main() {
         body: JSON.stringify({ handle: HANDLE, mode: 'omni' }),
       })
       assert(tokenOmni.status === 200, 'per-user token must currently support omni mode')
+      const tokenPresenceDelete = await fetch(`${base}/api/subscribe`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', authorization: `Bearer ${tokenPayload.token}` },
+        body: JSON.stringify({ handle: HANDLE, state: { scope: 'none', feeds: [], subscribed: false } }),
+      })
+      assert(tokenPresenceDelete.status === 403, 'per-user token must not delete subscriber presence')
+      assert((await inspectSubscription(db, identity)).subscribed, 'forbidden presence deletion must not remove the subscriber')
       const tokenOmniWithFeed = await fetch(`${base}/api/subscribe`, {
         method: 'POST',
         headers: { 'content-type': 'application/json', authorization: `Bearer ${tokenPayload.token}` },
@@ -725,6 +732,13 @@ async function main() {
         body: JSON.stringify({ handle: HANDLE, mode: 'omni' }),
       })
       assert(plan.status === 200, 'admin subscriber plan must remain available')
+      const absencePlan = await fetch(`${base}/api/admin/subscribers/plan`, {
+        method: 'POST',
+        headers: adminHeaders,
+        body: JSON.stringify({ handle: HANDLE, state: { scope: 'none', feeds: [], subscribed: false } }),
+      })
+      const absencePlanPayload = await absencePlan.json() as any
+      assert(absencePlan.status === 409 && absencePlanPayload.error === 'presence_rollback_cas_required', 'admin plan must require a rollback CAS')
       const beforeRetiredApply = await inspectSubscription(db, identity)
       const unauthorizedRetiredApply = await fetch(`${base}/api/admin/subscribers/apply`, {
         method: 'POST',
@@ -751,6 +765,17 @@ async function main() {
         JSON.stringify(afterRetiredApply) === JSON.stringify(beforeRetiredApply),
         'retired admin subscriber apply must not mutate subscription state',
       )
+      const adminPresenceDelete = await fetch(`${base}/api/subscribe`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'api-key': 'subscription-admin-test-key' },
+        body: JSON.stringify({ handle: HANDLE, state: { scope: 'none', feeds: [], subscribed: false } }),
+      })
+      const adminPresenceDeletePayload = await adminPresenceDelete.json() as any
+      assert(adminPresenceDelete.status === 409 && adminPresenceDeletePayload.error === 'presence_rollback_cas_required', 'administrator must not delete without a rollback CAS')
+      const deletedInspect = await fetch(`${base}/api/admin/subscribers/inspect?did=${encodeURIComponent(did)}`, {
+        headers: { 'api-key': 'subscription-admin-test-key' },
+      }).then((response) => response.json() as Promise<any>)
+      assert(deletedInspect.subscribed === true, 'blocked presence deletion must preserve the subscriber')
       await fetch(`${base}/api/subscribe`, {
         method: 'POST',
         headers: { 'content-type': 'application/json', 'api-key': 'subscription-admin-test-key' },

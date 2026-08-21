@@ -209,6 +209,19 @@ async function main() {
       .where('did', '=', jgruber.did)
       .execute()
     assert(historyAfterSecondApply.length === 1, '2c: no new history row when the handle has not changed')
+    await setSubscription(ctx, { did: jgruber.did, state: { scope: 'omni' } }, true, false)
+    await db.updateTable('subscriber').set({ first_subscribed_at: new Date() }).where('did', '=', jgruber.did).execute()
+    const establishedRow = await db.selectFrom('subscriber').select('first_subscribed_at').where('did', '=', jgruber.did).executeTakeFirstOrThrow()
+    const establishedCas = establishedRow.first_subscribed_at instanceof Date
+      ? establishedRow.first_subscribed_at.toISOString()
+      : establishedRow.first_subscribed_at
+    let establishedBlocked = false
+    try {
+      await setSubscription(ctx, { did: jgruber.did, state: { scope: 'none', subscribed: false }, expected: { scope: 'omni', feeds: [], subscribed: true }, rollback_capability: establishedCas }, true, false, undefined, true)
+    } catch (error) {
+      establishedBlocked = error instanceof SubscriptionError && error.code === 'presence_rollback_not_fresh'
+    }
+    assert(establishedBlocked, '2d: established subscriber history must block presence rollback')
 
     // -----------------------------------------------------------------
     // 3. Researcher guard (RT-1) — both mutation paths + preview + no-demote
@@ -235,6 +248,10 @@ async function main() {
     await expectResearcherLocked(
       () => setSubscription(ctx, { did: researcher.did, state: { scope: 'none' } }, true, false),
       '3b: setSubscription apply',
+    )
+    await expectResearcherLocked(
+      () => setSubscription(ctx, { did: researcher.did, state: { scope: 'none', subscribed: false }, expected: { scope: 'omni', feeds: [], subscribed: true }, rollback_capability: 'not-the-researcher-capability' }, true, false, undefined, true),
+      '3b-presence: researcher deletion must remain blocked',
     )
     // executeSubscription (legacy verbs) preview + apply.
     await expectResearcherLocked(

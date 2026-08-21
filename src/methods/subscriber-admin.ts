@@ -590,7 +590,7 @@ export default function registerSubscriberAdminEndpoints(server: Server, ctx: Ap
       const body = req.body as SetSubscriptionInput
       // Atomic desired-state preview (apply=false) when a state is supplied.
       if (body.state !== undefined) {
-        return res.json(await setSubscription(ctx, body, false))
+        return res.json(await setSubscription(ctx, body, false, true, undefined, true))
       }
       return res.json(await executeSubscription(ctx, normalize(req.body as LegacyAdminInput), false))
     } catch (error) {

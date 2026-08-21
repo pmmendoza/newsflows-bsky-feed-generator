@@ -14,6 +14,8 @@ const omni = parseDesiredState({ state: { scope: 'omni' } })
 if (omni.scope !== 'omni' || omni.feeds.length !== 0) throw new Error('omni')
 const none = parseDesiredState({ state: { scope: 'none' } })
 if (none.scope !== 'none' || none.feeds.length !== 0) throw new Error('none')
+const absent = parseDesiredState({ state: { scope: 'none', feeds: [], subscribed: false } })
+if (absent.scope !== 'none' || absent.feeds.length !== 0 || absent.subscribed !== false) throw new Error('absent')
 const asg = parseDesiredState({ state: { scope: 'assigned', feeds: ['b', 'a', 'a'] } })
 if (asg.scope !== 'assigned' || asg.feeds.join(',') !== 'a,b') throw new Error('dedupe')
 
@@ -22,6 +24,8 @@ fails({ state: { scope: 'bogus' } }, 'invalid_state')
 fails({ state: { scope: 'assigned', feeds: [] } }, 'invalid_state')
 fails({ state: { scope: 'omni', feeds: ['x'] } }, 'invalid_state')
 fails({ state: { scope: 'none', feeds: ['x'] } }, 'invalid_state')
+fails({ state: { scope: 'omni', subscribed: false } }, 'invalid_state')
+fails({ state: { scope: 'none', subscribed: 'false' } }, 'invalid_state')
 // Strict validation (red-team MED 5): non-array feeds, blank/non-string
 // entries, and conflicting legacy verbs must all be rejected, not coerced.
 fails({ state: { scope: 'omni', feeds: 'newsflow-nl-1' } }, 'invalid_state')

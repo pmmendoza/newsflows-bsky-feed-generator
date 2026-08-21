@@ -51,7 +51,7 @@ export async function updateAllSubscriberFollows(db: Database, updateAll: boolea
 
     for (const subscriber of subscribers) {
       try {
-        await getFollowsApi(subscriber.did, db, updateAll, newsbotDids);
+        await getFollowsApi(subscriber.did, db, updateAll, newsbotDids, true);
       } catch (error) {
         console.error(`Error updating follows for ${subscriber.did}:`, error);
       }
@@ -94,7 +94,7 @@ export function triggerFollowsUpdateForSubscriber(db: Database, did: string): vo
     try {
       console.log(`[${new Date().toISOString()}] - Background update: fetching follows for new subscriber ${did}`);
       const newsbotDids = await resolvePublisherDids(db);
-      await getFollowsApi(did, db, false, newsbotDids);
+      await getFollowsApi(did, db, false, newsbotDids, true);
     } catch (error) {
       console.error(`Error updating follows for ${did}:`, error);
     }
