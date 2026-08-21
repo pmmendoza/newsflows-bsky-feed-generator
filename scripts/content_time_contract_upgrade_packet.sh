@@ -22,6 +22,7 @@ NETWORK=${NETWORK:-newsflows-bsky-feed-generator-v2_default}
 IMG=${IMG:-}
 HDR=
 TIMERS_FENCED=0
+MIGRATION_DRAIN_SECONDS=${MIGRATION_DRAIN_SECONDS:-60}
 
 log() { echo "[ft-fu-1] $*" >&2; }
 die() { echo "[ft-fu-1] STOP: $*" >&2; exit 2; }
@@ -36,6 +37,14 @@ emit() {
   rm -f "$tmp"
 }
 split_csv() { tr ',' '\n' <<<"$1"; }
+assert_packet_tree() {
+  local got; got=$(git -C "$TREE" rev-parse HEAD)
+  [[ "$got" == "$PACKET_SOURCE_SHA" && -z $(git -C "$TREE" status --porcelain) ]] || die "packet execution tree is not the bound clean commit $PACKET_SOURCE_SHA"
+}
+assert_runtime_provenance() {
+  local got; got=$(sudo -n docker image inspect "$EXPECTED_IMAGE" --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}')
+  [[ "$FEEDGEN_SHA" =~ ^[0-9a-f]{40}$ && "$got" == "$FEEDGEN_SHA" ]] || die "runtime image revision is '$got', expected FEEDGEN_SHA=$FEEDGEN_SHA"
+}
 
 restore_timers() {
   local unit failed=0 state_file=${E:-}/timer-prestate-${COMMAND:-unknown}.tsv
@@ -74,16 +83,22 @@ fence_timers() {
 if [[ $COMMAND == test-timer-restore && ${FTFU1_TEST_MODE:-0} == 1 ]]; then
   : "${E:?}"; mkdir -p "$E"; fence_timers; false
 fi
+if [[ $COMMAND == test-packet-tree-binding && ${FTFU1_TEST_MODE:-0} == 1 ]]; then
+  : "${E:?}" "${TREE:?}" "${PACKET_SOURCE_SHA:?}"; assert_packet_tree; exit 0
+fi
+if [[ $COMMAND == test-runtime-provenance && ${FTFU1_TEST_MODE:-0} == 1 ]]; then
+  : "${E:?}" "${EXPECTED_IMAGE:?}" "${FEEDGEN_SHA:?}"; assert_runtime_provenance; exit 0
+fi
 
-for v in E SOURCE_ROOT SOURCE_SHA SOURCE_CATALOG_SHA ROLLBACK_SOURCE_ROOT ROLLBACK_SOURCE_SHA ROLLBACK_CATALOG_SHA TREE FEEDGEN_SHA EXPECTED_DIST_SHA EXPECTED_CT_SHA EXPECTED_IMAGE_CT_SHA EXPECTED_IMAGE EXPECTED_TOOL_REFS EXPECTED_RUNNER_SHA EXPECTED_REVALIDATE_RUNNER_SHA PACKET_PATH PACKET_SHA SINCE_MAIN SINCE_BE SINCE_ENGAGEMENT PREREG_POST PREREG_ENGAGEMENT PREREG_IR; do
+for v in E SOURCE_ROOT SOURCE_SHA SOURCE_CATALOG_SHA ROLLBACK_SOURCE_ROOT ROLLBACK_SOURCE_SHA ROLLBACK_CATALOG_SHA TREE PACKET_SOURCE_SHA FEEDGEN_SHA EXPECTED_DIST_SHA EXPECTED_CT_SHA EXPECTED_IMAGE_CT_SHA EXPECTED_IMAGE EXPECTED_TOOL_REFS EXPECTED_RUNNER_SHA EXPECTED_REVALIDATE_RUNNER_SHA PACKET_PATH PACKET_SHA SINCE_MAIN SINCE_BE SINCE_ENGAGEMENT; do
   [[ -n ${!v:-} ]] || die "$v is required"
 done
 [[ $E == /* ]] || die 'E must be an absolute evidence root'
 [[ $COMMAND != preflight || ! -e $E ]] || die 'preflight requires a new evidence root'
-[[ $SOURCE_SHA =~ ^[0-9a-f]{40}$ && $ROLLBACK_SOURCE_SHA =~ ^[0-9a-f]{40}$ && $FEEDGEN_SHA =~ ^[0-9a-f]{40}$ ]] || die 'source refs must be full commit SHAs'
+[[ $SOURCE_SHA =~ ^[0-9a-f]{40}$ && $ROLLBACK_SOURCE_SHA =~ ^[0-9a-f]{40}$ && $PACKET_SOURCE_SHA =~ ^[0-9a-f]{40}$ && $FEEDGEN_SHA =~ ^[0-9a-f]{40}$ ]] || die 'source refs must be full commit SHAs'
 for v in SOURCE_CATALOG_SHA ROLLBACK_CATALOG_SHA EXPECTED_DIST_SHA EXPECTED_CT_SHA EXPECTED_IMAGE_CT_SHA EXPECTED_RUNNER_SHA EXPECTED_REVALIDATE_RUNNER_SHA PACKET_SHA; do [[ ${!v} =~ ^[0-9a-f]{64}$ ]] || die "$v must be sha256"; done
 for v in SINCE_MAIN SINCE_BE SINCE_ENGAGEMENT; do [[ ${!v} =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{3}Z$ ]] || die "$v must be fixed ISO UTC with milliseconds"; done
-sudo -n install -d -o root -g newsflows -m 750 "$E"
+if [[ ${FTFU1_TEST_MODE:-0} == 1 ]]; then mkdir -p "$E"; else sudo -n install -d -o root -g newsflows -m 750 "$E"; fi
 IMG=${IMG:-$EXPECTED_IMAGE}
 
 CATALOG_REL=config/newsflows/catalogs/publishers.yml
@@ -104,13 +119,14 @@ tool_ref() {
 assert_bindings() {
   [[ $(git -C "$SOURCE_ROOT" rev-parse HEAD) == "$SOURCE_SHA" && -z $(git -C "$SOURCE_ROOT" status --porcelain) ]] || die 'forward source root is not the bound clean commit'
   [[ $(git -C "$ROLLBACK_SOURCE_ROOT" rev-parse HEAD) == "$ROLLBACK_SOURCE_SHA" && -z $(git -C "$ROLLBACK_SOURCE_ROOT" status --porcelain) ]] || die 'rollback source root is not the bound clean commit'
-  [[ $(git -C "$TREE" rev-parse HEAD) == "$FEEDGEN_SHA" ]] || die 'feedgen source ref differs'
+  assert_packet_tree
   [[ $(sha "$SOURCE_ROOT/$CATALOG_REL") == "$SOURCE_CATALOG_SHA" && $(sha "$ROLLBACK_SOURCE_ROOT/$CATALOG_REL") == "$ROLLBACK_CATALOG_SHA" ]] || die 'catalog hash differs'
   [[ $(sha "$DIST") == "$EXPECTED_DIST_SHA" && $(sha "$CT_DIST") == "$EXPECTED_CT_SHA" ]] || die 'built revalidation artifact hash differs'
   [[ $(sha "${BASH_SOURCE[0]}") == "$EXPECTED_RUNNER_SHA" ]] || die 'packet runner hash differs'
   [[ $(sha "$REVALIDATE") == "$EXPECTED_REVALIDATE_RUNNER_SHA" ]] || die 'revalidation runner hash differs'
   [[ $(sha "$PACKET_PATH") == "$PACKET_SHA" ]] || die 'approved packet hash differs'
   [[ $(sudo -n docker inspect feedgen --format '{{.Image}}') == "$EXPECTED_IMAGE" ]] || die 'running feedgen image differs'
+  assert_runtime_provenance
   local tool expected actual
   for tool in bsky-ops blueskyranker newsflows-bskyhealth; do
     expected=$(split_csv "$EXPECTED_TOOL_REFS" | awk -F= -v k="$tool" '$1==k{print $2}')
@@ -146,18 +162,22 @@ active_version_gate() {
   [[ $got == "$expected" ]] || die "active catalog version is $got, expected $expected"
 }
 revalidate_runner() {
-  EXPECTED_SHA=$FEEDGEN_SHA EXPECTED_DIST_SHA256=$EXPECTED_DIST_SHA EXPECTED_CT_SHA256=$EXPECTED_CT_SHA EXPECTED_IMAGE_CT_SHA256=$EXPECTED_IMAGE_CT_SHA \
-    FROM_VERSION=$V2 TO_VERSION=$V3 IMG=$IMG RUNNER=container "$REVALIDATE" "$@"
+  EXPECTED_SHA=$PACKET_SOURCE_SHA EXPECTED_DIST_SHA256=$EXPECTED_DIST_SHA EXPECTED_CT_SHA256=$EXPECTED_CT_SHA EXPECTED_IMAGE_CT_SHA256=$EXPECTED_IMAGE_CT_SHA \
+    FROM_VERSION=$V2 TO_VERSION=$V3 IMG=$IMG RUNNER=container MIGRATION_DRAIN_SECONDS=$MIGRATION_DRAIN_SECONDS "$REVALIDATE" "$@"
 }
 migration_complete() {
   local label=$1 target
   for target in post engagement; do
+    [[ -f "$E/migrate-$target-apply-$label.json" ]] || return 1
     [[ $(node -e 'console.log(JSON.parse(require("fs").readFileSync(process.argv[1])).revalidation.complete)' "$E/migrate-$target-apply-$label.json") == true ]] || return 1
   done
 }
+forward_label_used() { [[ -n $(find "$E" -maxdepth 1 -type f -name "*forward-$1*" -print -quit) ]]; }
 forward_to_completion() {
   local attempt label
+  for attempt in 1 2 3 4 5; do migration_complete "forward-$attempt" && return 0; done
   for attempt in 1 2 3 4 5; do
+    forward_label_used "$attempt" && continue
     label="forward-$attempt"; revalidate_runner migrate-apply "$label"
     migration_complete "$label" && return 0
   done
@@ -174,13 +194,15 @@ cmd_preflight() {
   catalog_sync_preview "$SOURCE_ROOT" | emit catalog-sync-forward-preview.json; gate_catalog_sync "$E/catalog-sync-forward-preview.json"
   catalog_packet "$SOURCE_ROOT/$CATALOG_REL" | emit feedgen-sync-preview.json
   gate_body "$E/feedgen-sync-preview.json" "$V2" "$V3"; extract_bodies "$E/feedgen-sync-preview.json"
-  revalidate_runner migrate-preflight
-  { echo "generated_at=$(ts)"; echo "source_sha=$SOURCE_SHA"; echo "source_catalog_sha256=$SOURCE_CATALOG_SHA"; echo "rollback_source_sha=$ROLLBACK_SOURCE_SHA"; echo "rollback_catalog_sha256=$ROLLBACK_CATALOG_SHA"; echo "feedgen_sha=$FEEDGEN_SHA"; echo "feedgen_image=$EXPECTED_IMAGE"; echo "packet_sha256=$PACKET_SHA"; echo "runner_sha256=$EXPECTED_RUNNER_SHA"; echo "since_main=$SINCE_MAIN"; echo "since_be=$SINCE_BE"; echo "since_engagement=$SINCE_ENGAGEMENT"; echo "rkeys=$RKEYS"; echo "tool_refs=$EXPECTED_TOOL_REFS"; } | emit bindings.txt
+  # Prepare bounds/control while writes are still v2. The exact population is
+  # deliberately not bound until the catalog switch makes new writes v3.
+  revalidate_runner migrate-prepare
+  { echo "generated_at=$(ts)"; echo "source_sha=$SOURCE_SHA"; echo "source_catalog_sha256=$SOURCE_CATALOG_SHA"; echo "rollback_source_sha=$ROLLBACK_SOURCE_SHA"; echo "rollback_catalog_sha256=$ROLLBACK_CATALOG_SHA"; echo "packet_source_sha=$PACKET_SOURCE_SHA"; echo "feedgen_runtime_sha=$FEEDGEN_SHA"; echo "feedgen_image=$EXPECTED_IMAGE"; echo "packet_sha256=$PACKET_SHA"; echo "runner_sha256=$EXPECTED_RUNNER_SHA"; echo "since_main=$SINCE_MAIN"; echo "since_be=$SINCE_BE"; echo "since_engagement=$SINCE_ENGAGEMENT"; echo "migration_drain_seconds=$MIGRATION_DRAIN_SECONDS"; echo "rkeys=$RKEYS"; echo "tool_refs=$EXPECTED_TOOL_REFS"; } | emit bindings.txt
 }
 cmd_preview() {
   assert_bindings
   [[ -f $E/feedgen-forward.json ]] || die 'preflight receipts missing'
-  revalidate_runner migrate-preview
+  [[ -f $E/migrate-source-set.txt && -n $(ls -1 "$E"/pg-control-*.txt 2>/dev/null | head -1) ]] || die 'migration preparation receipts missing'
   catalog_sync_preview "$ROLLBACK_SOURCE_ROOT" | emit catalog-sync-rollback-preview.json; gate_catalog_sync "$E/catalog-sync-rollback-preview.json"
 }
 cmd_apply() {
@@ -192,18 +214,19 @@ cmd_apply() {
   node -e 'const fs=require("fs"),a=JSON.parse(fs.readFileSync(process.argv[1])),j=JSON.parse(fs.readFileSync(process.argv[2]));if(JSON.stringify(a)!==JSON.stringify(j.atomic_change_set.request_body))throw Error("fresh apply body differs from bound preview body")' "$E/feedgen-forward.json" "$E/02-feedgen-sync-apply-packet.json"
   post_bulk "$E/feedgen-forward.json" 03-feedgen-forward-apply
   active_version_gate "$V3"
+  revalidate_runner migrate-freeze
   forward_to_completion
-  { echo '01 catalog-sync forward'; echo '02 feedgen sync packet gate'; echo '03 exact-six bulk v2->v3'; echo '04 global post'; echo '04 global engagement'; } | emit apply-order.txt
+  { echo '01 catalog-sync forward'; echo '02 feedgen sync packet gate'; echo '03 exact-six bulk v2->v3'; echo '04 drain and bind stable v2 population'; echo '05 global post'; echo '05 global engagement'; } | emit apply-order.txt
   restore_timers
 }
-cmd_revalidate() { assert_bindings; active_version_gate "$V3"; fence_timers; forward_to_completion; restore_timers; }
+cmd_revalidate() { assert_bindings; active_version_gate "$V3"; fence_timers; [[ -f $E/migrate-stable-population.txt ]] || revalidate_runner migrate-freeze; revalidate_runner migrate-stable-check; forward_to_completion; restore_timers; }
 cmd_readback() {
   assert_bindings
   active_version_gate "$V3"
   revalidate_runner migrate-readback
   sleep "${DRAIN_INTERVAL_SECONDS:-60}"
   revalidate_runner migrate-readback
-  local num den; num=$(node -e 'console.log(JSON.parse(require("fs").readFileSync(process.argv[1])).preview.counts.gt_5m_restored||0)' "$E/migrate-ir-preview-preflight.json"); den=$(node -e 'console.log(JSON.parse(require("fs").readFileSync(process.argv[1])).preview.scanned)' "$E/migrate-ir-preview-preflight.json")
+  local num den; num=$(awk -F= '$1=="ir_gt_5m_restored"{print $2}' "$E/migrate-stable-population.txt"); den=$(awk -F= '$1=="ir_denominator"{print $2}' "$E/migrate-stable-population.txt")
   { echo "irish_restored_gt_5m_numerator=$num"; echo "irish_in_horizon_v2_denominator=$den"; echo 'participant_exposure_not_inferred=true'; } | emit irish-restoration.txt
 }
 cmd_rollback_dryrun() {
@@ -236,6 +259,7 @@ cmd_finalize() {
 }
 
 case "$COMMAND" in
+  test-forward-resume) [[ ${FTFU1_TEST_MODE:-0} == 1 ]] || die 'test-only command'; forward_to_completion;;
   preflight) cmd_preflight;; preview) cmd_preview;; apply) cmd_apply;; revalidate) cmd_revalidate;; readback) cmd_readback;; rollback-dryrun) cmd_rollback_dryrun;; rollback) cmd_rollback;; finalize) cmd_finalize "$@";;
   *) echo 'usage: content_time_contract_upgrade_packet.sh preflight|preview|apply|revalidate|readback|rollback-dryrun|rollback|finalize <start> <end>' >&2; exit 2;;
 esac

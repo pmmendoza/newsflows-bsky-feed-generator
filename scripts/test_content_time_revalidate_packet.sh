@@ -63,17 +63,34 @@ migration_run_tool receipt engagement "$TO_VERSION" "$FROM_VERSION" --apply >/de
 grep -Fq -- "--table engagement --since $SINCE_ENGAGEMENT --from-version $TO_VERSION --to-version $FROM_VERSION" "$captured"
 
 assert_tree() { :; }; assert_active_catalog_version() { [[ $1 == "$TO_VERSION" ]]; }
+mkdir -p "$E"
+row_v2=$'at://row\tdid:plc:a\t2026-08-20T00:00:00.000Z\t2026-08-19T00:00:00.000Z\t2026-08-19T00:00:00.000Z\tsource_valid\t\\N\tnewsflows-content-time/v2\t616263'
+row_v3=${row_v2/newsflows-content-time\/v2/newsflows-content-time\/v3}
+printf '%s\n' "$row_v2" >"$E/migrate-freeze-post-final-1.tsv"
+printf '%s\n' "$row_v2" >"$E/migrate-freeze-engagement-final-1.tsv"
+printf 'from_outside_horizon|0\nfrom_total|1\n' >"$E/migrate-freeze-post-scope-1.tsv"
+printf 'from_outside_horizon|0\nfrom_total|1\n' >"$E/migrate-freeze-engagement-scope-1.tsv"
+one="$scratch/one.json"
+printf '{"preview":{"scanned":1,"counts":{"v2_valid_to_v3_valid":1,"v2_skew_to_v3_clamped":0,"v2_invalid_to_v3_clamped":0,"v2_to_v3_invalid":0,"gt_5m_restored":0,"zero_to_5m_clamped":0}}}\n' >"$one"
+cp "$one" "$E/migrate-freeze-post-preview-1.json"
+cp "$one" "$E/migrate-freeze-engagement-preview-1.json"
+cp "$one" "$E/migrate-freeze-ir-preview-1.json"
+post_pre=$(sha256sum "$E/migrate-freeze-post-final-1.tsv" | cut -d' ' -f1)
+eng_pre=$(sha256sum "$E/migrate-freeze-engagement-final-1.tsv" | cut -d' ' -f1)
+spec_hash=$(migration_cells "$one" | sha256sum | cut -d' ' -f1)
+printf 'attempt=1\ndrain_seconds=60\npost_rows=1\npost_prestate_sha256=%s\npost_prereg_sha256=%s\nengagement_rows=1\nengagement_prestate_sha256=%s\nengagement_prereg_sha256=%s\nir_prereg_sha256=%s\nir_gt_5m_restored=0\nir_denominator=1\n' "$post_pre" "$spec_hash" "$eng_pre" "$spec_hash" "$spec_hash" >"$E/migrate-stable-population.txt"
+emit() { mkdir -p "$E"; dd of="$E/$1" status=none; }
+migration_preview_one() { cp "$one" "$E/$1.json"; echo "$E/$1.json"; }
 migration_apply_one() { echo "$1"; }
 [[ $(cmd_migrate_apply test) == $'post\nengagement' ]]
 
 calls="$scratch/preview-calls"
 migration_preview_one() { echo "$2" >>"$calls"; echo "$good"; }
+mv "$E/migrate-stable-population.txt" "$scratch/stable-marker"
 PREREG_POST=$spec PREREG_ENGAGEMENT=$spec cmd_migrate_preview
+mv "$scratch/stable-marker" "$E/migrate-stable-population.txt"
 [[ $(paste -sd, "$calls") == post,engagement ]]
 
-mkdir -p "$E"
-row_v2=$'at://row\tdid:plc:a\t2026-08-20T00:00:00.000Z\t2026-08-19T00:00:00.000Z\t2026-08-19T00:00:00.000Z\tsource_valid\t\\N\tnewsflows-content-time/v2\t616263'
-row_v3=${row_v2/newsflows-content-time\/v2/newsflows-content-time\/v3}
 printf '%s\n' "$row_v2" >"$E/migrate-post-prestate.tsv"
 printf '%s\n' "$row_v2" >"$E/migrate-engagement-prestate.tsv"
 printf 'from_outside_horizon|0\nfrom_total|1\n' >"$E/migrate-post-prestate-scope.tsv"
@@ -83,7 +100,6 @@ printf '{"revalidation":{"updated":1,"counts":%s}}\n' "$counts" >"$E/migrate-pos
 printf '{"revalidation":{"updated":1,"counts":%s}}\n' "$counts" >"$E/migrate-engagement-apply-test.json"
 printf '{"preview":{"scanned":1,"counts":{"gt_5m_restored":0,"zero_to_5m_clamped":0}}}\n' >"$E/migrate-ir-preview-preflight.json"
 empty="$scratch/empty.json"; printf '{"preview":{"scanned":0,"counts":{}}}\n' >"$empty"
-emit() { mkdir -p "$E"; dd of="$E/$1" status=none; }
 migration_preview_one() { cp "$empty" "$E/$1.json"; echo "$E/$1.json"; }
 psql_copy() { [[ $1 == *public.post* ]] && printf '%s\n' "$row_v3" || printf '%s\n' "$row_v3"; }
 psql_ro() { echo 0; }
