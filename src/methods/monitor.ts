@@ -26,6 +26,7 @@ import { assessEngagementScienceEligibility } from '../util/engagement-time-cont
 import { CONTENT_TIME_VALIDATOR_VERSION } from '../util/content-time'
 
 type EngagementExportType = 'like' | 'repost' | 'comment' | 'quote'
+type ActivityEventType = EngagementExportType | 'original_post'
 type EngagementExportScope = 'union' | 'publisher' | 'subscriber' | 'subscriber_on_publisher'
 type ActivityScope = 'publisher_posts' | 'feed_posts' | 'all_tracked'
 type EngagementTargetMode = 'any' | 'publisher' | 'non_publisher'
@@ -78,7 +79,7 @@ type ActivityFilters = {
   until: string
   scope: ActivityScope
   limit: number
-  types: EngagementExportType[]
+  types: ActivityEventType[]
   subscriberDid: string | null
   includeRetrievals: boolean
   includeEngagements: boolean
@@ -93,7 +94,7 @@ type ActivityRetrievalRow = {
 }
 
 type ActivityEngagementRow = {
-  type: EngagementExportType
+  type: ActivityEventType
   event_uri: string
   target_uri: string
   author_did: string
@@ -328,7 +329,7 @@ function getDefaultActivitySinceUntil(): { since: string; until: string } {
   return { since: sinceDate.toISOString(), until: untilDate.toISOString() }
 }
 
-function parseActivityTypes(raw: unknown): EngagementExportType[] {
+function parseActivityTypes(raw: unknown): ActivityEventType[] {
   if (raw === undefined) return ['like', 'repost', 'comment', 'quote']
   if (typeof raw !== 'string') {
     throw new Error('types must be a comma-separated string')
@@ -337,9 +338,15 @@ function parseActivityTypes(raw: unknown): EngagementExportType[] {
     .split(',')
     .map((t) => t.trim().toLowerCase())
     .filter((t) => t.length > 0)
-  const allowed: EngagementExportType[] = []
+  const allowed: ActivityEventType[] = []
   for (const t of parsed) {
-    if (t === 'like' || t === 'repost' || t === 'comment' || t === 'quote') {
+    if (
+      t === 'like' ||
+      t === 'repost' ||
+      t === 'comment' ||
+      t === 'quote' ||
+      t === 'original_post'
+    ) {
       allowed.push(t)
     } else {
       throw new Error(`types contains invalid value: ${t}`)
@@ -395,6 +402,10 @@ function parseActivityFilters(req: any): { filters: ActivityFilters; cursor: Eng
   if (scope === 'feed_posts' && !subscriberDid) {
     throw new Error('scope=feed_posts requires subscriber_did')
   }
+  const types = parseActivityTypes(req.query?.types)
+  if (types.includes('original_post') && !subscriberDid) {
+    throw new Error('types=original_post requires subscriber_did')
+  }
 
   const limitRaw = req.query?.limit
   const limit = limitRaw === undefined ? 100 : parseNonNegInt(limitRaw)
@@ -432,7 +443,7 @@ function parseActivityFilters(req: any): { filters: ActivityFilters; cursor: Eng
     until,
     scope,
     limit,
-    types: parseActivityTypes(req.query?.types),
+    types,
     subscriberDid,
     includeRetrievals,
     includeEngagements,
@@ -511,13 +522,17 @@ async function fetchActivityEngagementRows(
   publisherDids: string[],
 ): Promise<{ rows: ActivityEngagementResponseRow[]; nextCursor?: string }> {
   const engagementTypeCodes = filters.types
-    .filter((type): type is Exclude<EngagementExportType, 'comment'> => type !== 'comment')
+    .filter(
+      (type): type is 'like' | 'repost' | 'quote' =>
+        type === 'like' || type === 'repost' || type === 'quote',
+    )
     .map((type) => {
       if (type === 'repost') return 1
       if (type === 'like') return 2
       return 3
     })
   const includeCommentEvents = filters.types.includes('comment')
+  const includeOriginalPostEvents = filters.types.includes('original_post')
 
   const servedToSubscriberExpr = filters.subscriberDid
     ? sql<boolean>`EXISTS (SELECT 1 FROM served s WHERE s.post_uri = b.target_uri)`
@@ -614,6 +629,35 @@ async function fetchActivityEngagementRows(
           AND p."createdAt" < ${filters.until}
           AND (${postAuthorFilter})
           AND (${postTargetFilter})
+      `)
+    }
+    if (
+      includeOriginalPostEvents &&
+      filters.scope === 'all_tracked' &&
+      targetMode !== 'publisher'
+    ) {
+      baseParts.push(sql`
+        SELECT
+          'original_post' AS type,
+          p.uri AS event_uri,
+          p.uri AS target_uri,
+          p.author AS author_did,
+          p."createdAt" AS created_at,
+          p."indexedAt" AS indexed_at,
+          false AS publisher_target,
+          (${subscriberActorExpr(sql`p.author`)}) AS subscriber_actor
+        FROM post p
+        ${postJoin}
+        WHERE
+          p."rootUri" = ''
+          AND p."createdAt" >= ${filters.since}
+          AND p."createdAt" < ${filters.until}
+          AND (${postAuthorFilter})
+          AND NOT EXISTS (
+            SELECT 1
+            FROM engagement e_quote
+            WHERE e_quote.uri = p.uri AND e_quote.type = 3
+          )
       `)
     }
 
