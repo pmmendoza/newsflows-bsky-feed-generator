@@ -166,10 +166,10 @@ prereg_out=$(bash "$runner" prereg); echo "$prereg_out" | sed 's/^/prereg: /'
 
 step() { echo "status=$1"; shift; "$@"; }
 # NEGATIVE legs of the participant-safety gates (each must stop preflight before writing prestate/plan artifacts):
-psql -c "UPDATE feedgen_ops.feed_catalog SET publisher_time_clock='content_time_v1', publisher_time_transition_expires_at='2030-01-01T00:00:00Z', content_time_cutover_min_valid_share=0.8, content_time_contract_version='newsflows-content-time/v2' WHERE rkey='newsflow-zz-2a';" >/dev/null
+psql -c "UPDATE feedgen_ops.feed_catalog SET publisher_time_clock='content_time_v1', content_time_cutover_min_valid_share=0.8, content_time_contract_version='newsflows-content-time/v2' WHERE rkey='newsflow-zz-2a';" >/dev/null
 set +e; E="$E-neg-clock" bash "$runner" preflight >/dev/null 2>&1; rc=$?; set -e
 [[ $rc -ne 0 && ! -f "$E-neg-clock/step1-be-prestate-rows.tsv" ]] || { echo "content-time clock on the target feed did not stop preflight pre-artifact (rc=$rc)"; exit 1; }
-psql -c "UPDATE feedgen_ops.feed_catalog SET publisher_time_clock='receipt_time', publisher_time_transition_expires_at=NULL, content_time_cutover_min_valid_share=NULL, content_time_contract_version=NULL WHERE rkey='newsflow-zz-2a';" >/dev/null
+psql -c "UPDATE feedgen_ops.feed_catalog SET publisher_time_clock='receipt_time', content_time_cutover_min_valid_share=NULL, content_time_contract_version=NULL WHERE rkey='newsflow-zz-2a';" >/dev/null
 rb_bad=$(mktemp); sed 's/"time_column":"createdAt"/"time_column":"content_time_utc"/' "$rb" > "$rb_bad"; grep -q content_time_utc "$rb_bad" || { echo "could not build the bad readback"; exit 1; }
 set +e; E="$E-neg-timecol" READBACK_JSON="$rb_bad" bash "$runner" preflight >/dev/null 2>&1; rc=$?; set -e
 [[ $rc -ne 0 && ! -f "$E-neg-timecol/step1-be-prestate-rows.tsv" ]] || { echo "BSR time_column=content_time_utc did not stop preflight pre-artifact (rc=$rc)"; exit 1; }

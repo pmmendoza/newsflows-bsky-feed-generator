@@ -29,8 +29,6 @@ check(failedClosed, 'an unresolved catalog consumer must fail closed')
 
 const activeContract = {
   expectedContractVersion: 'newsflows-content-time/v2',
-  transitionExpiresAt: '2026-08-15T00:00:00Z',
-  referenceMs: reference,
   allowEmptyPopulation: false,
 }
 const eligible = assessEngagementScienceEligibility({
@@ -69,31 +67,16 @@ check(!assessEngagementScienceEligibility({
   ...activeContract, contentTime: true, explicitBounds: true, contractVersion: 'unsupported/v2',
   minimumValidShare: 0.8, numerator: 100, denominator: 100,
 }).scienceEligible, 'unsupported contract versions must fail closed')
-check(!assessEngagementScienceEligibility({
-  ...activeContract, transitionExpiresAt: '2026-08-14T12:00:00Z',
-  contentTime: true, explicitBounds: true, contractVersion: 'newsflows-content-time/v2',
-  minimumValidShare: 0.8, numerator: 100, denominator: 100,
-}).scienceEligible, 'expired transitions must fail closed')
-
-// FT-FU-6: once the transition is adopted permanently the catalog carries NO expiry.
-// That must stay science-eligible -- otherwise the ranker's compliance-export validator
-// fails closed and the ranking cycle dies (observed in production 2026-08-20T14:12Z).
+// Legacy database expiry values are inert after permanent content-time adoption.
 check(assessEngagementScienceEligibility({
-  ...activeContract, transitionExpiresAt: null,
+  ...activeContract, publisher_time_transition_expires_at: 'not-a-timestamp',
   contentTime: true, explicitBounds: true, contractVersion: 'newsflows-content-time/v2',
   minimumValidShare: 0.8, numerator: 100, denominator: 100,
-}).scienceEligible, 'an absent transition expiry means permanent and must stay science-eligible')
-check(!assessEngagementScienceEligibility({
-  ...activeContract, transitionExpiresAt: 'not-a-timestamp',
-  contentTime: true, explicitBounds: true, contractVersion: 'newsflows-content-time/v2',
-  minimumValidShare: 0.8, numerator: 100, denominator: 100,
-}).scienceEligible, 'a corrupt expiry must still fail closed, not read as permanent')
+} as any).scienceEligible, 'legacy expiry provenance must not affect science eligibility')
 
 // v3 contract eligibility
 const activeContractV3 = {
   expectedContractVersion: 'newsflows-content-time/v3',
-  transitionExpiresAt: null,
-  referenceMs: reference,
   allowEmptyPopulation: false,
 }
 const eligibleV3 = assessEngagementScienceEligibility({

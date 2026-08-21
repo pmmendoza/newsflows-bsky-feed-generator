@@ -34,7 +34,6 @@ const parsed = validateUpdate({
   publisher_post_max_age_days: 10,
   publisher_post_max_age_source: 'study_default',
   publisher_time_clock: 'content_time_v1',
-  publisher_time_transition_expires_at: '2026-09-30T00:00:00Z',
   content_time_cutover_min_valid_share: 0.99,
   content_time_contract_version: 'newsflows-content-time/v2',
   if_current: {
@@ -45,7 +44,7 @@ const parsed = validateUpdate({
 })
 check(parsed.ok, 'valid resolved update must parse')
 const dryRun = buildFeedCatalogDryRun(current, parsed.row, { studyExists: true })
-check(dryRun.status === 'dry-run' && dryRun.change_count === 6, 'dry-run must expose all materialized changes')
+check(dryRun.status === 'dry-run' && dryRun.change_count === 5, 'dry-run must expose all materialized changes')
 check(dryRun.rollback.fields.publisher_post_max_age_days === 7, 'rollback packet must preserve prior value')
 check(currentValueMismatches(current, parsed.row.ifCurrent).length === 0, 'matching CAS must pass')
 check(currentValueMismatches({ ...current, publisher_post_max_age_days: 8 }, parsed.row.ifCurrent).length === 1, 'stale CAS must fail')
@@ -70,7 +69,6 @@ const rollbackParsed = validateUpdate({
     publisher_post_max_age_days: 10,
     publisher_post_max_age_source: 'study_default',
     publisher_time_clock: 'content_time_v1',
-    publisher_time_transition_expires_at: '2026-09-30T00:00:00Z',
     content_time_cutover_min_valid_share: 0.99,
     content_time_contract_version: 'newsflows-content-time/v2',
   },
@@ -78,6 +76,12 @@ const rollbackParsed = validateUpdate({
 check(rollbackParsed.ok, 'rollback update must parse through the same CAS path')
 const rollbackDryRun = buildFeedCatalogDryRun(after, rollbackParsed.row, { studyExists: true })
 check(rollbackDryRun.status === 'dry-run' && rollbackDryRun.proposed.publisher_post_max_age_days === 7, 'rollback dry-run must restore prior value')
+const retiredExpiry = validateUpdate({
+  rkey: current.rkey,
+  publisher_time_transition_expires_at: 'not-a-timestamp',
+})
+check(!retiredExpiry.ok, 'retired expiry field must not be writable')
+check(!Object.prototype.hasOwnProperty.call(applied.readback, 'publisher_time_transition_expires_at'), 'readback must not advertise retired expiry authority')
 
 let missingWindowFailedClosed = false
 try {

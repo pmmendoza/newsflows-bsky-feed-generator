@@ -243,6 +243,7 @@ export type FeedCatalog = {
   publisher_post_max_age_days?: number | null
   publisher_post_max_age_source?: PublisherPostMaxAgeSource | null
   publisher_time_clock?: PublisherTimeClock
+  /** @deprecated Inert audit provenance retained for migration/rollback history. */
   publisher_time_transition_expires_at?: string | null
   content_time_cutover_min_valid_share?: number | null
   content_time_contract_version?: string | null

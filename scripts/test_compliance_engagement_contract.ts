@@ -6,7 +6,6 @@ bufferModule.SlowBuffer ??= bufferModule.Buffer
 
 type Scenario = {
   contract: string
-  expires: string
   numerator: number
   denominator: number
 }
@@ -18,7 +17,6 @@ function check(condition: unknown, message: string): asserts condition {
 async function main() {
   const scenario: Scenario = {
     contract: 'newsflows-content-time/v2',
-    expires: '2099-01-01T00:00:00Z',
     numerator: 80,
     denominator: 100,
   }
@@ -33,7 +31,6 @@ async function main() {
           publisher_time_clock: 'content_time_v1',
           content_time_cutover_min_valid_share: 0.8,
           content_time_contract_version: scenario.contract,
-          publisher_time_transition_expires_at: scenario.expires,
           enabled: true,
         }] }
       }
@@ -91,12 +88,6 @@ async function main() {
 
     invalidateActiveContentTimeContractCache()
     scenario.contract = 'newsflows-content-time/v2'
-    scenario.expires = '2000-01-01T00:00:00Z'
-    response = await fetch(base + query, { headers })
-    payload = await response.json()
-    check(payload.science_eligible === false, 'expired transition must fail closed')
-
-    scenario.expires = '2099-01-01T00:00:00Z'
     scenario.numerator = 79
     response = await fetch(base + query, { headers })
     payload = await response.json()
@@ -116,6 +107,7 @@ async function main() {
     response = await fetch(base + '?since=2026-08-01T00:00:00Z&until=2026-08-02T00:00:00Z&scope=publisher&types=like,comment', { headers })
     payload = await response.json()
     check(payload.science_eligible === false && payload.time_clock === 'receipt_time', 'missing feed binding must stay transitional')
+    check(!Object.prototype.hasOwnProperty.call(payload, 'publisher_time_transition_expires_at'), 'response must not advertise retired expiry authority')
 
     check(queries.some((text) => text.includes("content_time_status = 'source_valid'") && text.includes('content_time_utc')), 'event SQL must enforce valid content time')
     const validityQuery = queries.find((text) => text.includes('FROM candidates'))

@@ -5,12 +5,12 @@
 #   env: E PACKET_PATH (the approved packet file) EXPECTED_PACKET_SHA (from the ledger approval) TREE_CATALOG (the DEPLOYED
 #        catalog /opt/newsflows/config/newsflows/catalogs/publishers.yml) CATALOG_SOURCE_SHA (merged origin/main commit whose
 #        config/newsflows/catalogs/publishers.yml must be byte-identical to TREE_CATALOG; verified against ROOT_CHECKOUT)
-#        EXPECTED_UPDATE_RKEYS(csv) EXPECTED_CLOCK EXPECTED_EXPIRY EXPECTED_FLOOR EXPECTED_CONTRACT (each must literally
+#        EXPECTED_UPDATE_RKEYS(csv) EXPECTED_CLOCK EXPECTED_FLOOR EXPECTED_CONTRACT (each must literally
 #        appear in the approved packet) EXPECTED_TOOL_REFS (bsky-ops=<sha>,newsflows-bskyhealth=<sha>,blueskyranker=<sha>)
 #        FEEDGEN_URL(http://127.0.0.1:3020) EFFECTIVE_CONFIG_JSON APPLIED_AT (battery: ISO time of the apply, from apply-transport.txt)
 #   sub: preview | apply | parity | rollback-dryrun | rollback | battery <label>
 set -euo pipefail
-: "${E:?}"; : "${PACKET_PATH:?}"; : "${EXPECTED_PACKET_SHA:?}"; : "${TREE_CATALOG:?}"; : "${CATALOG_SOURCE_SHA:?}"; : "${EXPECTED_UPDATE_RKEYS:?}"; : "${EXPECTED_CLOCK:=content_time_v1}"; : "${EXPECTED_EXPIRY:?}"; : "${EXPECTED_FLOOR:?}"; : "${EXPECTED_CONTRACT:=newsflows-content-time/v2}"; : "${EXPECTED_TOOL_REFS:?}"
+: "${E:?}"; : "${PACKET_PATH:?}"; : "${EXPECTED_PACKET_SHA:?}"; : "${TREE_CATALOG:?}"; : "${CATALOG_SOURCE_SHA:?}"; : "${EXPECTED_UPDATE_RKEYS:?}"; : "${EXPECTED_CLOCK:=content_time_v1}"; : "${EXPECTED_FLOOR:?}"; : "${EXPECTED_CONTRACT:=newsflows-content-time/v2}"; : "${EXPECTED_TOOL_REFS:?}"
 # PREDECESSOR_SOURCE_SHA: the origin/main commit BEFORE the activation catalog change (its publishers.yml is the exact predecessor file;
 # rollback re-projects it and parity is then evaluated against it). CONFORMANCE_BASELINE_DRIFT: the pre-existing drift items (csv).
 : "${PREDECESSOR_SOURCE_SHA:?}"; CONFORMANCE_BASELINE_DRIFT="${CONFORMANCE_BASELINE_DRIFT:-health-secrets,venv-ownership}"
@@ -46,7 +46,7 @@ assert_bindings_minimal() {  # what a RESTORE needs and nothing more: the approv
   local ph; ph=$(sha256sum "$PACKET_PATH" | cut -d' ' -f1); [[ "$ph" == "$EXPECTED_PACKET_SHA" ]] || die "packet $PACKET_PATH sha256 $ph != EXPECTED_PACKET_SHA $EXPECTED_PACKET_SHA"
   # every literal must appear in the approved packet OR in the owner's approval-B record (APPROVAL_B_PATH: the ledger text naming the
   # merged/predecessor commits and the request/rollback body hashes, which exist only after merge+projection+preview)
-  local v; for v in "$EXPECTED_CLOCK" "$EXPECTED_EXPIRY" "$EXPECTED_FLOOR" "$EXPECTED_CONTRACT" "$EXPECTED_CATALOG_SHA" "$EXPECTED_PREDECESSOR_CATALOG_SHA"; do grep -qF -- "$v" "$PACKET_PATH" || die "value '$v' does not appear in the approved packet"; done
+  local v; for v in "$EXPECTED_CLOCK" "$EXPECTED_FLOOR" "$EXPECTED_CONTRACT" "$EXPECTED_CATALOG_SHA" "$EXPECTED_PREDECESSOR_CATALOG_SHA"; do grep -qF -- "$v" "$PACKET_PATH" || die "value '$v' does not appear in the approved packet"; done
   # approval records are the OWNER'S verbatim words saved by the executing agent without paraphrase (header line
   # "OWNER APPROVAL (verbatim) -- Philipp -- <voice|chat|matrix> -- <UTC>"): B1 names the merged + predecessor commits (needed from
   # preview on), B2 names the request + rollback body hashes (needed from apply on). A pre-activation BASELINE (EXPECTED_CLOCK=receipt_time)
@@ -116,19 +116,19 @@ dry_run_gate() { node -e 'const j=JSON.parse(require("fs").readFileSync(process.
 gate_packet() {  # <packet.json>: exactly the expected rows x fields, symmetric rollback
   local f=$1
   node -e '
-const j=JSON.parse(require("fs").readFileSync(process.argv[1]));const [rkeys,clock,expiry,floor,contract]=process.argv.slice(2);const exp=rkeys.split(",").sort();
+const j=JSON.parse(require("fs").readFileSync(process.argv[1]));const [rkeys,clock,floor,contract]=process.argv.slice(2);const exp=rkeys.split(",").sort();
 const fail=(m)=>{console.error("gate: "+m);process.exit(2)};
 if(j.status!=="ready-for-apply"||!(j.atomic_change_set&&j.atomic_change_set.atomic===true))fail("status "+j.status);
 const b=j.atomic_change_set.request_body,rb=j.atomic_change_set.rollback_request_body;
 const got=b.updates.map(u=>u.rkey).sort();if(JSON.stringify(got)!==JSON.stringify(exp))fail("rkeys "+got);
 for(const u of b.updates){const k=Object.keys(u).filter(x=>!["op","rkey","if_current"].includes(x)).sort();
- if(JSON.stringify(k)!==JSON.stringify(["content_time_contract_version","content_time_cutover_min_valid_share","publisher_time_clock","publisher_time_transition_expires_at"]))fail(u.rkey+" fields "+k);
- if(u.publisher_time_clock!==clock||u.publisher_time_transition_expires_at!==expiry||Number(u.content_time_cutover_min_valid_share)!==Number(floor)||u.content_time_contract_version!==contract)fail(u.rkey+" values");
+ if(JSON.stringify(k)!==JSON.stringify(["content_time_contract_version","content_time_cutover_min_valid_share","publisher_time_clock"]))fail(u.rkey+" fields "+k);
+ if(u.publisher_time_clock!==clock||Number(u.content_time_cutover_min_valid_share)!==Number(floor)||u.content_time_contract_version!==contract)fail(u.rkey+" values");
  if(u.if_current.publisher_time_clock!=="receipt_time")fail(u.rkey+" if_current clock");}
 if(!rb||rb.updates.length!==b.updates.length)fail("rollback size");
 for(const u of rb.updates){if(u.publisher_time_clock!=="receipt_time"||u.if_current.publisher_time_clock!==clock)fail("rollback "+u.rkey)}
 if((j.blockers||[]).length||(j.findings||[]).length)fail("blockers/findings");
-console.log("gate ok updates="+b.updates.length);' "$f" "$EXPECTED_UPDATE_RKEYS" "$EXPECTED_CLOCK" "$EXPECTED_EXPIRY" "$EXPECTED_FLOOR" "$EXPECTED_CONTRACT"
+console.log("gate ok updates="+b.updates.length);' "$f" "$EXPECTED_UPDATE_RKEYS" "$EXPECTED_CLOCK" "$EXPECTED_FLOOR" "$EXPECTED_CONTRACT"
 }
 cmd_preview() {
   if [[ "$EXPECTED_CLOCK" != "receipt_time" ]]; then install -d -o root -g newsflows -m 750 "$E"; [[ -n "${APPROVAL_A_PATH:-}" && ! -f "$E/approval-A.txt" ]] && install -o root -g newsflows -m 640 "$APPROVAL_A_PATH" "$E/approval-A.txt"; [[ -n "${APPROVAL_B1_PATH:-}" && ! -f "$E/approval-B1.txt" ]] && install -o root -g newsflows -m 640 "$APPROVAL_B1_PATH" "$E/approval-B1.txt"; fi
@@ -139,8 +139,8 @@ cmd_preview() {
   node -e 'const j=JSON.parse(require("fs").readFileSync(process.argv[1]));console.log(JSON.stringify(j.atomic_change_set.rollback_request_body))' "$p" | emit feedgen-bulk-rollback.json
   # per-row dry-run against the running feedgen (read-only)
   local n=0; while IFS= read -r u; do local rk; rk=$(node -e 'console.log(JSON.parse(process.argv[1]).rkey)' "$u"); curl --fail -sS --max-time 30 -H "@$HDR" -H 'content-type: application/json' --data-binary "$u" "$FEEDGEN_URL/api/admin/feed_catalog/dry-run" | emit "dry-run-$rk.json"; dry_run_gate "$E/dry-run-$rk.json" || die "dry-run $rk not clean"; n=$((n+1)); done < <(node -e 'const j=JSON.parse(require("fs").readFileSync(process.argv[1]));for(const u of j.updates)console.log(JSON.stringify(u))' "$E/feedgen-bulk-request.json")
-  { echo "generated_at=$(ts)"; echo "packet_path=$PACKET_PATH"; echo "packet_sha256=$EXPECTED_PACKET_SHA"; echo "catalog_sha256=$CATALOG_SHA (== deployed == origin@$CATALOG_SOURCE_SHA)"; echo "request_sha256=$(sha256sum "$E/feedgen-bulk-request.json" | cut -d' ' -f1)"; echo "rollback_sha256=$(sha256sum "$E/feedgen-bulk-rollback.json" | cut -d' ' -f1)"; echo "dry_runs=$n"; echo "feedgen_image=$(docker inspect feedgen --format '{{.Image}}')"; echo "expected=$EXPECTED_UPDATE_RKEYS clock=$EXPECTED_CLOCK expiry=$EXPECTED_EXPIRY floor=$EXPECTED_FLOOR contract=$EXPECTED_CONTRACT"; tool_refs_line; } | emit preview-summary.txt
-  psqlq -c "SELECT rkey, catalog_revision, publisher_time_clock, publisher_time_transition_expires_at, content_time_cutover_min_valid_share, content_time_contract_version FROM feedgen_ops.feed_catalog WHERE enabled ORDER BY 1" | emit catalog-prestate.tsv
+  { echo "generated_at=$(ts)"; echo "packet_path=$PACKET_PATH"; echo "packet_sha256=$EXPECTED_PACKET_SHA"; echo "catalog_sha256=$CATALOG_SHA (== deployed == origin@$CATALOG_SOURCE_SHA)"; echo "request_sha256=$(sha256sum "$E/feedgen-bulk-request.json" | cut -d' ' -f1)"; echo "rollback_sha256=$(sha256sum "$E/feedgen-bulk-rollback.json" | cut -d' ' -f1)"; echo "dry_runs=$n"; echo "feedgen_image=$(docker inspect feedgen --format '{{.Image}}')"; echo "expected=$EXPECTED_UPDATE_RKEYS clock=$EXPECTED_CLOCK floor=$EXPECTED_FLOOR contract=$EXPECTED_CONTRACT"; tool_refs_line; } | emit preview-summary.txt
+  psqlq -c "SELECT rkey, catalog_revision, publisher_time_clock, content_time_cutover_min_valid_share, content_time_contract_version FROM feedgen_ops.feed_catalog WHERE enabled ORDER BY 1" | emit catalog-prestate.tsv
   # rollback artifacts recorded BEFORE the mutation: the predecessor catalog file (exact bytes) + its commit; and a NEGATIVE control of the
   # rollback dry-run gate: pre-apply the rollback body must be REFUSED by CAS (blockers non-empty) -- proves the gate discriminates
   local pd; pd=$(predecessor_stage); install -o root -g newsflows -m 640 "$pd/publishers.yml" "$E/catalog-predecessor.publishers.yml"; { echo "predecessor_source_sha=$PREDECESSOR_SOURCE_SHA"; echo "predecessor_publishers_sha256=$(sha256sum "$pd/publishers.yml" | cut -d' ' -f1)"; echo "activation_source_sha=$CATALOG_SOURCE_SHA"; echo "activation_publishers_sha256=$CATALOG_SHA"; } | emit rollback-artifacts.txt
@@ -169,7 +169,7 @@ cmd_apply() {
   emit feedgen-bulk-response.json < "$resp"; { echo "applied_at=$(ts)"; echo "http=$http"; echo "request_id=$rid"; echo "packet_sha256=$EXPECTED_PACKET_SHA"; tool_refs_line; } | emit apply-transport.txt
   [[ "$http" == "200" ]] || die "bulk apply http=$http (see feedgen-bulk-response.json); if ambiguous, run parity before deciding"
   node -e 'const j=JSON.parse(require("fs").readFileSync(process.argv[1]));const n=Number(process.argv[2]);if(!(j.status==="applied"&&j.applied===true&&j.result_count===n&&j.results.length===n))process.exit(2)' "$resp" "$(echo "$EXPECTED_UPDATE_RKEYS" | tr ',' '\n' | wc -l | tr -d ' ')" || die "bulk response not a clean apply"
-  psqlq -c "SELECT rkey, catalog_revision, publisher_time_clock, publisher_time_transition_expires_at, content_time_cutover_min_valid_share, content_time_contract_version FROM feedgen_ops.feed_catalog WHERE enabled ORDER BY 1" | emit catalog-poststate.tsv
+  psqlq -c "SELECT rkey, catalog_revision, publisher_time_clock, content_time_cutover_min_valid_share, content_time_contract_version FROM feedgen_ops.feed_catalog WHERE enabled ORDER BY 1" | emit catalog-poststate.tsv
   # the intended cutover revisions (per rkey) -- every battery asserts served/catalog revisions against these
   awk -F'|' -v want=",$EXPECTED_UPDATE_RKEYS," 'index(want, ","$1",") {print $1"="$2}' "$E/catalog-poststate.tsv" | emit expected-catalog-revisions.txt
   [[ $(grep -c . "$E/expected-catalog-revisions.txt") -eq $(echo "$EXPECTED_UPDATE_RKEYS" | tr ',' '\n' | wc -l | tr -d ' ') ]] || die "expected-catalog-revisions.txt incomplete"
@@ -191,7 +191,7 @@ cmd_rollback_dryrun() {  # only meaningful AFTER apply (the rollback CAS expects
   assert_bindings >/dev/null; load_keys; local n=0 stamp; stamp=$(date -u +%H%M%S); tool_refs_line | emit "rollback-dry-run-$stamp-bindings.txt"; while IFS= read -r u; do local rk; rk=$(node -e 'console.log(JSON.parse(process.argv[1]).rkey)' "$u"); curl --fail -sS --max-time 30 -H "@$HDR" -H 'content-type: application/json' --data-binary "$u" "$FEEDGEN_URL/api/admin/feed_catalog/dry-run" | emit "rollback-dry-run-$rk-$stamp.json"; dry_run_gate "$E/rollback-dry-run-$rk-$stamp.json" || die "rollback dry-run $rk not clean (see rollback-dry-run-$rk-$stamp.json)"; n=$((n+1)); done < <(node -e 'const j=JSON.parse(require("fs").readFileSync(process.argv[1]));for(const u of j.updates)console.log(JSON.stringify(u))' "$E/feedgen-bulk-rollback.json"); log "rollback dry-run ok ($n rows, all would_write=false, no blockers)"; }
 cmd_rollback() { BINDINGS_MODE=restore assert_bindings_minimal >/dev/null; load_keys; local resp; resp=$(mktemp); local http; ROWS_RESTORED=no; http=$(curl -sS --max-time 60 -H "@$HDR" -H "x-feedgen-actor: approved-activation-packet-rollback" -H "x-feedgen-source: $EXPECTED_PACKET_SHA" -H "x-feedgen-request-id: rollback-$(sha256sum "$E/feedgen-bulk-rollback.json" | cut -c1-64)" -H 'content-type: application/json' --data-binary "@$E/feedgen-bulk-rollback.json" --output "$resp" --write-out '%{http_code}' "$FEEDGEN_URL/api/admin/feed_catalog/bulk") || true; emit "feedgen-bulk-rollback-response-$(date -u +%H%M%S).json" < "$resp"; echo "rolled_back_at=$(ts) http=$http" | emit "rollback-transport-$(date -u +%H%M%S).txt"; [[ "$http" == "200" ]] || escalate "rollback bulk POST http=$http (layer i failed; see the rollback response receipt)" no unknown
   node -e 'const j=JSON.parse(require("fs").readFileSync(process.argv[1]));const n=Number(process.argv[2]);if(!(j.status==="applied"&&j.applied===true&&j.result_count===n&&j.results.length===n))process.exit(2)' "$resp" "$(echo "$EXPECTED_UPDATE_RKEYS" | tr ',' '\n' | wc -l | tr -d ' ')" || escalate "rollback bulk response is not a clean apply of all rows (layer i)" no unknown
-  local rs2; rs2=$(date -u +%H%M%S); psqlq -c "SELECT rkey, catalog_revision, publisher_time_clock, publisher_time_transition_expires_at, content_time_cutover_min_valid_share, content_time_contract_version FROM feedgen_ops.feed_catalog WHERE enabled ORDER BY 1" | emit "catalog-after-rollback-$rs2.tsv"
+  local rs2; rs2=$(date -u +%H%M%S); psqlq -c "SELECT rkey, catalog_revision, publisher_time_clock, content_time_cutover_min_valid_share, content_time_contract_version FROM feedgen_ops.feed_catalog WHERE enabled ORDER BY 1" | emit "catalog-after-rollback-$rs2.tsv"
   node -e 'const rows=require("fs").readFileSync(process.argv[1],"utf8").split("\n").filter(l=>l.startsWith("newsflow-"));const want=process.argv[2].split(",");let bad=[];for(const w of want){const r=rows.find(l=>l.split("|")[0]===w);if(!r){bad.push(w+" missing");continue}const c=r.split("|");if(!(c[2]==="receipt_time"&&c[3]===""&&c[4]===""&&c[5]===""))bad.push(w+" state="+c.slice(2).join("|"))}console.log(bad.length?bad.join("; "):"rows restored: "+want.join(",")+" = receipt_time/null/null/null");if(bad.length)process.exit(2)' "$E/catalog-after-rollback-$rs2.tsv" "$EXPECTED_UPDATE_RKEYS" | emit "rollback-rowstate-gate-$rs2.txt" || escalate "post-restore row state is not receipt_time/null/null/null for all four rows (layer i)" no unknown
   ROWS_RESTORED=yes; { echo "rows_restored_at=$(ts)"; tool_refs_line; } | emit "rollback-transport-$rs2-bindings.txt"; rm -f "$resp" "$HDR"; log "rollback applied and verified (DB rows)"
   # (ii) re-project the PREDECESSOR catalog file so the deployed desired state matches the restored rows, then (iii) parity vs the predecessor.

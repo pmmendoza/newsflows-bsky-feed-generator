@@ -95,7 +95,6 @@ async function main() {
       SET publisher_post_max_age_days = 10,
           publisher_post_max_age_source = 'study_default',
           publisher_time_clock = 'content_time_v1',
-          publisher_time_transition_expires_at = '2026-09-30T00:00:00Z',
           content_time_cutover_min_valid_share = 0.99,
           content_time_contract_version = 'newsflows-content-time/v2'
       WHERE rkey = 'newsflow-be-k'
@@ -150,7 +149,6 @@ async function main() {
       SET publisher_post_max_age_days = 7,
           publisher_post_max_age_source = 'feed_override',
           publisher_time_clock = 'receipt_time',
-          publisher_time_transition_expires_at = NULL,
           content_time_cutover_min_valid_share = NULL,
           content_time_contract_version = NULL
       WHERE rkey = 'newsflow-be-k'

@@ -69,7 +69,6 @@ type EngagementExportFeedClock = {
   publisher_time_clock?: string | null
   content_time_cutover_min_valid_share?: number | null
   content_time_contract_version?: string | null
-  publisher_time_transition_expires_at?: string | null
 }
 
 type EngagementCursor = {
@@ -1114,7 +1113,6 @@ export default function registerMonitorEndpoints(server: Server, ctx: AppContext
             'publisher_time_clock',
             'content_time_cutover_min_valid_share',
             'content_time_contract_version',
-            'publisher_time_transition_expires_at',
           ])
           .where('feed_id', '=', feedId)
           .where('enabled', '=', true)
@@ -1130,7 +1128,6 @@ export default function registerMonitorEndpoints(server: Server, ctx: AppContext
         return res.status(503).json({ error: 'FeedClockUnavailable', message: 'feed catalog row has no publisher_did' })
       }
     }
-    const referenceMs = Date.now()
     const explicitBounds = typeof req.query?.since === 'string' && typeof req.query?.until === 'string'
     const contentTime = !responseSource && feedClock?.publisher_time_clock === 'content_time_v1'
     const contractVersion = contentTime ? feedClock?.content_time_contract_version ?? null : null
@@ -1609,8 +1606,6 @@ export default function registerMonitorEndpoints(server: Server, ctx: AppContext
         explicitBounds,
         contractVersion,
         expectedContractVersion: activeCatalogVersion ?? '',
-        transitionExpiresAt: feedClock?.publisher_time_transition_expires_at ?? null,
-        referenceMs,
         minimumValidShare,
         numerator: validity.numerator,
         denominator: validity.denominator,
@@ -1631,7 +1626,6 @@ export default function registerMonitorEndpoints(server: Server, ctx: AppContext
         science_eligible: finalScienceEligible,
         time_clock: contentTime ? 'content_time_v1' : 'receipt_time',
         content_time_contract_version: contractVersion,
-        publisher_time_transition_expires_at: feedClock?.publisher_time_transition_expires_at ?? null,
         validity: {
           ...validity,
           empty_population: emptyPopulation,

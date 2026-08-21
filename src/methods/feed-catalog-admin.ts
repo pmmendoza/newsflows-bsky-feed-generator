@@ -82,7 +82,6 @@ const UPDATE_FIELDS = [
   'publisher_post_max_age_days',
   'publisher_post_max_age_source',
   'publisher_time_clock',
-  'publisher_time_transition_expires_at',
   'content_time_cutover_min_valid_share',
   'content_time_contract_version',
   'enabled',
@@ -111,7 +110,6 @@ type CatalogInsertBody = {
   publisher_post_max_age_days?: number | null
   publisher_post_max_age_source?: 'study_default' | 'feed_override' | null
   publisher_time_clock?: 'receipt_time' | 'content_time_v1'
-  publisher_time_transition_expires_at?: string | null
   content_time_cutover_min_valid_share?: number | null
   content_time_contract_version?: string | null
   enabled?: boolean
@@ -136,7 +134,6 @@ type CatalogUpdateBody = {
   publisher_post_max_age_days?: number | null
   publisher_post_max_age_source?: 'study_default' | 'feed_override' | null
   publisher_time_clock?: 'receipt_time' | 'content_time_v1'
-  publisher_time_transition_expires_at?: string | null
   content_time_cutover_min_valid_share?: number | null
   content_time_contract_version?: string | null
   if_current?: Partial<Record<UpdateField, boolean | number | string | null>>
@@ -166,7 +163,6 @@ type CatalogUpdatePatch = Partial<Pick<
   | 'publisher_post_max_age_days'
   | 'publisher_post_max_age_source'
   | 'publisher_time_clock'
-  | 'publisher_time_transition_expires_at'
   | 'content_time_cutover_min_valid_share'
   | 'content_time_contract_version'
   | 'enabled'
@@ -328,7 +324,7 @@ function validateCurrentValues(
     if ((field === 'study_id' || field === 'retired_at') && !nullableString(fieldValue)) {
       return { ok: false, error: `if_current.${field} must be string or null` }
     }
-    if ((field === 'publisher_time_transition_expires_at' || field === 'content_time_contract_version') && !nullableString(fieldValue)) {
+    if (field === 'content_time_contract_version' && !nullableString(fieldValue)) {
       return { ok: false, error: `if_current.${field} must be string or null` }
     }
     if (field === 'content_time_cutover_min_valid_share' && fieldValue !== null && (typeof fieldValue !== 'number' || !Number.isFinite(fieldValue) || fieldValue <= 0 || fieldValue > 1)) {
@@ -348,7 +344,7 @@ function validateCurrentValues(
   return { ok: true, current }
 }
 
-function publisherAgeErrors(row: Pick<FeedCatalog, 'enabled' | 'publisher_post_max_age_days' | 'publisher_post_max_age_source' | 'publisher_time_clock' | 'publisher_time_transition_expires_at' | 'content_time_cutover_min_valid_share' | 'content_time_contract_version'>): string[] {
+function publisherAgeErrors(row: Pick<FeedCatalog, 'enabled' | 'publisher_post_max_age_days' | 'publisher_post_max_age_source' | 'publisher_time_clock' | 'content_time_cutover_min_valid_share' | 'content_time_contract_version'>): string[] {
   const errors: string[] = []
   const days = row.publisher_post_max_age_days
   const source = row.publisher_post_max_age_source
@@ -370,9 +366,6 @@ function publisherAgeErrors(row: Pick<FeedCatalog, 'enabled' | 'publisher_post_m
   if (row.content_time_cutover_min_valid_share != null && (!Number.isFinite(row.content_time_cutover_min_valid_share) || row.content_time_cutover_min_valid_share <= 0 || row.content_time_cutover_min_valid_share > 1)) {
     errors.push('content_time_cutover_min_valid_share must be > 0 and <= 1')
   }
-  if (row.publisher_time_transition_expires_at != null && !Number.isFinite(Date.parse(row.publisher_time_transition_expires_at))) {
-    errors.push('publisher_time_transition_expires_at must be a valid ISO timestamp')
-  }
   if (row.publisher_time_clock === 'content_time_v1') {
     if (row.content_time_cutover_min_valid_share == null) errors.push('content_time_v1 requires content_time_cutover_min_valid_share')
     if (!row.content_time_contract_version) {
@@ -383,9 +376,6 @@ function publisherAgeErrors(row: Pick<FeedCatalog, 'enabled' | 'publisher_post_m
     ) {
       errors.push('content_time_contract_version must be newsflows-content-time/v2 or newsflows-content-time/v3')
     }
-    // No expiry means the transition is permanent (FT-FU-6), which is the target
-    // state; a malformed value is still rejected above. The floor and contract
-    // version remain required -- they are what keep the clock auditable.
   }
   return errors
 }
@@ -463,7 +453,6 @@ export function feedCatalogItemPayload(row: FeedCatalog) {
     publisher_post_max_age_days: row.publisher_post_max_age_days ?? null,
     publisher_post_max_age_source: row.publisher_post_max_age_source ?? null,
     publisher_time_clock: row.publisher_time_clock ?? 'receipt_time',
-    publisher_time_transition_expires_at: row.publisher_time_transition_expires_at ?? null,
     content_time_cutover_min_valid_share: row.content_time_cutover_min_valid_share ?? null,
     content_time_contract_version: row.content_time_contract_version ?? null,
     catalog_revision: Number(row.catalog_revision ?? 0),
@@ -520,6 +509,9 @@ export function feedCatalogNotFoundPayload(rkey: string) {
 }
 
 export function validateInsert(body: any): { ok: true; row: CatalogInsertBody } | { ok: false; error: string } {
+  if (body?.publisher_time_transition_expires_at !== undefined) {
+    return { ok: false, error: 'publisher_time_transition_expires_at is retired and read-only provenance' }
+  }
   if (!isString(body?.feed_id)) return { ok: false, error: 'feed_id required' }
   if (!isString(body?.rkey)) return { ok: false, error: 'rkey required' }
   if (body.rkey.length > 15) return { ok: false, error: 'rkey must be ≤15 chars (ATProto record-key constraint)' }
@@ -540,7 +532,6 @@ export function validateInsert(body: any): { ok: true; row: CatalogInsertBody } 
     publisher_post_max_age_days: body.publisher_post_max_age_days,
     publisher_post_max_age_source: body.publisher_post_max_age_source,
     publisher_time_clock: body.publisher_time_clock ?? 'receipt_time',
-    publisher_time_transition_expires_at: body.publisher_time_transition_expires_at ?? null,
     content_time_cutover_min_valid_share: body.content_time_cutover_min_valid_share ?? null,
     content_time_contract_version: body.content_time_contract_version ?? null,
   })
@@ -579,6 +570,9 @@ export function validateInsert(body: any): { ok: true; row: CatalogInsertBody } 
 }
 
 export function validateUpdate(body: any): { ok: true; row: ValidatedCatalogUpdate } | { ok: false; error: string } {
+  if (body?.publisher_time_transition_expires_at !== undefined) {
+    return { ok: false, error: 'publisher_time_transition_expires_at is retired and read-only provenance' }
+  }
   if (body?.op !== undefined && body.op !== 'update') {
     return { ok: false, error: "op must be 'update' when provided" }
   }
@@ -635,9 +629,6 @@ export function validateUpdate(body: any): { ok: true; row: ValidatedCatalogUpda
   if (body.publisher_time_clock !== undefined && body.publisher_time_clock !== 'receipt_time' && body.publisher_time_clock !== 'content_time_v1') {
     return { ok: false, error: 'publisher_time_clock must be receipt_time or content_time_v1' }
   }
-  if (body.publisher_time_transition_expires_at !== undefined && !nullableString(body.publisher_time_transition_expires_at)) {
-    return { ok: false, error: 'publisher_time_transition_expires_at must be string or null' }
-  }
   if (body.content_time_cutover_min_valid_share !== undefined && body.content_time_cutover_min_valid_share !== null && (typeof body.content_time_cutover_min_valid_share !== 'number' || !Number.isFinite(body.content_time_cutover_min_valid_share) || body.content_time_cutover_min_valid_share <= 0 || body.content_time_cutover_min_valid_share > 1)) {
     return { ok: false, error: 'content_time_cutover_min_valid_share must be > 0 and <= 1, or null' }
   }
@@ -661,7 +652,6 @@ export function validateUpdate(body: any): { ok: true; row: ValidatedCatalogUpda
     publisher_post_max_age_days: body.publisher_post_max_age_days,
     publisher_post_max_age_source: body.publisher_post_max_age_source,
     publisher_time_clock: body.publisher_time_clock,
-    publisher_time_transition_expires_at: body.publisher_time_transition_expires_at,
     content_time_cutover_min_valid_share: body.content_time_cutover_min_valid_share,
     content_time_contract_version: body.content_time_contract_version,
   }
@@ -865,7 +855,6 @@ async function readCatalogRows(ctx: AppContext): Promise<FeedCatalog[]> {
       'publisher_post_max_age_days',
       'publisher_post_max_age_source',
       'publisher_time_clock',
-      'publisher_time_transition_expires_at',
       'content_time_cutover_min_valid_share',
       'content_time_contract_version',
       'catalog_revision',
@@ -902,7 +891,6 @@ export async function readCatalogRowFromDb(
       'publisher_post_max_age_days',
       'publisher_post_max_age_source',
       'publisher_time_clock',
-      'publisher_time_transition_expires_at',
       'content_time_cutover_min_valid_share',
       'content_time_contract_version',
       'catalog_revision',
@@ -1326,7 +1314,6 @@ export default function registerFeedCatalogAdminEndpoint(
               publisher_post_max_age_days: v.row.publisher_post_max_age_days,
               publisher_post_max_age_source: v.row.publisher_post_max_age_source,
               publisher_time_clock: v.row.publisher_time_clock,
-              publisher_time_transition_expires_at: v.row.publisher_time_transition_expires_at,
               content_time_cutover_min_valid_share: v.row.content_time_cutover_min_valid_share,
               content_time_contract_version: v.row.content_time_contract_version,
               catalog_revision: 1,
