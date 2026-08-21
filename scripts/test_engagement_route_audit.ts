@@ -68,7 +68,8 @@ async function main() {
     const path = `/api/engagement?requester_did=${encodeURIComponent(requester)}&publisher_did=${encodeURIComponent(publisher)}`
     for (const [envName] of keyCases) {
       const response = await requestJson(server, path, process.env[envName])
-      assert.equal(response.status, 400)
+      assert.equal(response.status, 410)
+      assert.equal(response.body?.error, 'retired_endpoint')
     }
 
     const unauthorized = await requestJson(server, path)
@@ -87,7 +88,7 @@ async function main() {
   const records = auditLines.map((line) => JSON.parse(line))
   assert.deepEqual(
     records.map((record) => [record.key_class, record.status]),
-    [...keyCases.map(([, keyClass]) => [keyClass, 400]), ['unauthorized', 401]],
+    [...keyCases.map(([, keyClass]) => [keyClass, 410]), ['unauthorized', 401]],
   )
   for (const record of records) {
     assert.equal(record.event, 'feedgen_engagement_route_hit')
