@@ -7,6 +7,8 @@ must() { grep -Fq -- "$1" "$packet" || { echo "missing: $1" >&2; exit 1; }; }
 must 'RKEYS=newsflow-nl-2,newsflow-fr-2,newsflow-cz-2,newsflow-ir-2,newsflow-be-k,newsflow-be-m'
 must "fields.length!==1||fields[0]!=='content_time_contract_version'"
 must 'check(j.atomic_change_set.request_body,from,to);check(j.atomic_change_set.rollback_request_body,to,from)'
+must "j.blockers[0].code==='feedgen-projection-blocked'"
+must "x.code==='catalog-ranker-feed-time-contract-mismatch'"
 must 'catalog_sync_apply "$SOURCE_ROOT"'
 must '--source-root "$1/config/newsflows/catalogs"'
 must '--bsr-effective-config-json "$BSR_EFFECTIVE_CONFIG_JSON"'

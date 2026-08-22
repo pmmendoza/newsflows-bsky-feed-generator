@@ -140,8 +140,10 @@ catalog_packet() {
 gate_body() {
   node - "$1" "$2" "$3" "$RKEYS" <<'NODE'
 const fs=require('fs');const [f,from,to,rkeys]=process.argv.slice(2);const j=JSON.parse(fs.readFileSync(f));
-if(j.status!=='ready-for-apply'||j.atomic_change_set?.atomic!==true)throw Error(`packet status ${j.status}`);
-const expected=rkeys.split(',').sort(), check=(body,a,b)=>{const u=body.updates||[];if(JSON.stringify(u.map(x=>x.rkey).sort())!==JSON.stringify(expected))throw Error('not exact six');for(const x of u){const fields=Object.keys(x).filter(k=>!['op','rkey','if_current'].includes(k));if(fields.length!==1||fields[0]!=='content_time_contract_version')throw Error(`${x.rkey} not version-only`);if(x.content_time_contract_version!==b||x.if_current?.content_time_contract_version!==a)throw Error(`${x.rkey} asymmetric ${a}->${b}`)}};
+const expected=rkeys.split(',').sort();
+const transitionBlocked=j.status==='blocked'&&j.blockers?.length===1&&j.blockers[0].code==='feedgen-projection-blocked'&&(j.findings||[]).length===expected.length&&JSON.stringify(j.findings.map(x=>x.field?.match(/^feeds\.(.+)\.publisher_time_clock$/)?.[1]).sort())===JSON.stringify(expected)&&j.findings.every(x=>x.code==='catalog-ranker-feed-time-contract-mismatch'&&x.actual?.clock==='content_time_v1'&&x.actual?.contract_version===from&&x.expected?.clock==='content_time_v1'&&x.expected?.contract_version===to);
+if((j.status!=='ready-for-apply'&&!transitionBlocked)||j.atomic_change_set?.atomic!==true)throw Error(`packet status ${j.status}`);
+const check=(body,a,b)=>{const u=body.updates||[];if(JSON.stringify(u.map(x=>x.rkey).sort())!==JSON.stringify(expected))throw Error('not exact six');for(const x of u){const fields=Object.keys(x).filter(k=>!['op','rkey','if_current'].includes(k));if(fields.length!==1||fields[0]!=='content_time_contract_version')throw Error(`${x.rkey} not version-only`);if(x.content_time_contract_version!==b||x.if_current?.content_time_contract_version!==a)throw Error(`${x.rkey} asymmetric ${a}->${b}`)}};
 check(j.atomic_change_set.request_body,from,to);check(j.atomic_change_set.rollback_request_body,to,from);
 NODE
 }
