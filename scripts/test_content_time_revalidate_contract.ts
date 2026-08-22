@@ -487,6 +487,10 @@ console.log('receipt raw-free shape checks passed')
   const rollbackArgs = parseRevalidateCliArgs(['--from-version', 'newsflows-content-time/v3', '--to-version', 'newsflows-content-time/v2'])
   check(rollbackArgs.fromVersion === 'newsflows-content-time/v3', 'captures rollback fromVersion=v3')
   check(rollbackArgs.toVersion === 'newsflows-content-time/v2', 'captures rollback toVersion=v2')
+  const nativeTail = parseRevalidateCliArgs(['--from-version', 'newsflows-content-time/v3', '--to-version', 'newsflows-content-time/v2', '--native-v3-tail'])
+  check(nativeTail.nativeV3Tail === true, 'explicit native-v3 tail permits bounded post rollback')
+  check(throws(() => parseRevalidateCliArgs(['--table', 'engagement', '--from-version', 'newsflows-content-time/v3', '--to-version', 'newsflows-content-time/v2', '--native-v3-tail'])), 'native-v3 tail must not widen to engagement without an indexed path')
+  check(throws(() => parseRevalidateCliArgs(['--from-version', 'newsflows-content-time/v2', '--to-version', 'newsflows-content-time/v3', '--native-v3-tail'])), 'native-v3 tail must reject forward migration')
 
   // Transitions restriction checks
   check(throws(() => parseRevalidateCliArgs(['--from-version', 'newsflows-content-time/v1', '--to-version', 'newsflows-content-time/v3'])), 'must reject v1->v3')

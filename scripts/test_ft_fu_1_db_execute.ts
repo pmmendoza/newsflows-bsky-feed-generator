@@ -90,7 +90,6 @@ async function main() {
         'future_skew_clamped', ${CONTENT_TIME_VALIDATOR_VERSION_V3}
       )
     `.execute(db)
-
     await sql`
       INSERT INTO public.engagement (
         uri, cid, "subjectUri", "subjectCid", type, "indexedAt", "createdAt", author,
@@ -271,7 +270,6 @@ async function main() {
         null, ${CONTENT_TIME_VALIDATOR_VERSION_V3}
       )
     `.execute(db)
-
     // Run reverse post revalidation v3 -> v2
     const reversePostResult = await runContentTimeRevalidation(db, {
       table: 'post',
@@ -298,6 +296,13 @@ async function main() {
       WHERE uri = ${uri(PUBLISHER_A, 'native-v3-after-cutoff')}
     `.execute(db)).rows[0].version
     assert.equal(nativeVersion, CONTENT_TIME_VALIDATOR_VERSION_V3, 'rollback must leave native rows at/after the cutoff untouched')
+    const nativeTailPost = await runContentTimeRevalidation(db, {
+      table: 'post', actors: [PUBLISHER_A], nativeV3Tail: true, since: untilExclusive,
+      fromVersion: CONTENT_TIME_VALIDATOR_VERSION_V3, toVersion: CONTENT_TIME_VALIDATOR_VERSION_V2,
+      batchSize: 500, packetSha256: PACKET_SHA, maxDurationMs: 30_000, pauseMs: 0,
+      lockTimeoutMs: 5000, statementTimeoutMs: 30_000,
+    })
+    assert.equal(nativeTailPost.updated, 1, 'native-tail rollback must include non-clamped post rows at the activation floor')
     const compatibleVersions = await sql<{ version: string; rows: string }>`
       SELECT content_time_validator_version AS version, count(*)::text AS rows
       FROM public.post
@@ -326,7 +331,6 @@ async function main() {
       }),
       /post-only/,
     )
-
     console.log('ft-fu-1 db execution tests passed')
   } finally {
     await db.destroy()

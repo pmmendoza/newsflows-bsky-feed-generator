@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 # FT-FU-1 coordinated newsflows-content-time/v2 -> v3 production packet.
+# The continuation-only normalize-overlap subcommand additionally requires
+# ALLOW_FTFU1_OVERLAP_NORMALIZATION=1.
 # This script is inert unless an explicit subcommand is supplied. It writes
 # raw-free, non-overwriting receipts below the caller-bound evidence root.
 set -euo pipefail
@@ -22,6 +24,8 @@ NETWORK=${NETWORK:-newsflows-bsky-feed-generator-v2_default}
 IMG=${IMG:-}
 HDR=
 TIMERS_FENCED=0
+TIMER_STATE_LABEL=
+KEEP_TIMERS_FENCED_ON_EXIT=0
 MIGRATION_DRAIN_SECONDS=${MIGRATION_DRAIN_SECONDS:-60}
 
 log() { echo "[ft-fu-1] $*" >&2; }
@@ -47,7 +51,7 @@ assert_runtime_provenance() {
 }
 
 restore_timers() {
-  local unit failed=0 state_file=${E:-}/timer-prestate-${COMMAND:-unknown}.tsv
+  local unit failed=0 state_file=${E:-}/timer-prestate-${COMMAND:-unknown}${TIMER_STATE_LABEL:+-$TIMER_STATE_LABEL}.tsv
   [[ $TIMERS_FENCED == 1 && -f $state_file ]] || return 0
   while IFS='|' read -r unit state; do
     if [[ $state == active ]]; then
@@ -58,12 +62,14 @@ restore_timers() {
   TIMERS_FENCED=0
   (( failed == 0 ))
 }
-cleanup() { local rc=$?; trap - EXIT INT TERM HUP; restore_timers || { log 'timer restoration failed'; rc=3; }; [[ -z $HDR ]] || rm -f "$HDR"; exit "$rc"; }
+cleanup() { local rc=$?; trap - EXIT INT TERM HUP; if [[ $KEEP_TIMERS_FENCED_ON_EXIT == 0 ]]; then restore_timers || { log 'timer restoration failed'; rc=3; }; else log 'partial mutation: timers remain fenced'; fi; [[ -z $HDR ]] || rm -f "$HDR"; exit "$rc"; }
 trap cleanup EXIT INT TERM HUP
+complete_timer_window() { restore_timers; KEEP_TIMERS_FENCED_ON_EXIT=0; }
 
 fence_timers() {
   local unit service state enabled service_state tmp i
   local -a timers services
+  local state_file="$E/timer-prestate-$COMMAND${TIMER_STATE_LABEL:+-$TIMER_STATE_LABEL}.tsv"
   IFS=',' read -r -a timers <<<"$TIMER_UNITS"
   IFS=',' read -r -a services <<<"$SERVICE_UNITS"
   [[ ${ALLOW_PRE_FENCED_TIMERS:-0} == 0 || ${ALLOW_PRE_FENCED_TIMERS:-0} == 1 ]] || die 'ALLOW_PRE_FENCED_TIMERS must be 0 or 1'
@@ -83,7 +89,7 @@ fence_timers() {
     fi
     printf '%s|%s\n' "$unit" "$state" >>"$tmp"
   done
-  emit "timer-prestate-$COMMAND.tsv" <"$tmp"; rm -f "$tmp"
+  emit "$(basename "$state_file")" <"$tmp"; rm -f "$tmp"
   TIMERS_FENCED=1
   while IFS= read -r unit; do sudo -n systemctl stop "$unit"; done < <(split_csv "$TIMER_UNITS")
   while IFS= read -r unit; do
@@ -96,6 +102,9 @@ fence_timers() {
 
 if [[ $COMMAND == test-timer-restore && ${FTFU1_TEST_MODE:-0} == 1 ]]; then
   : "${E:?}"; mkdir -p "$E"; fence_timers; false
+fi
+if [[ $COMMAND == test-timer-fenced-failure && ${FTFU1_TEST_MODE:-0} == 1 ]]; then
+  : "${E:?}"; mkdir -p "$E"; fence_timers; KEEP_TIMERS_FENCED_ON_EXIT=1; false
 fi
 if [[ $COMMAND == test-packet-tree-binding && ${FTFU1_TEST_MODE:-0} == 1 ]]; then
   : "${E:?}" "${TREE:?}" "${PACKET_SOURCE_SHA:?}"; assert_packet_tree; exit 0
@@ -123,6 +132,10 @@ REVALIDATE=$TREE/scripts/content_time_revalidate_packet.sh
 load_header() {
   HDR=$(mktemp); chmod 600 "$HDR"
   ( set -a; . "$ENV_FILE"; set +a; : "${FEEDGEN_ADMIN_API_KEY:?}"; printf 'api-key: %s\n' "$FEEDGEN_ADMIN_API_KEY" ) >"$HDR"
+}
+load_read_header() {
+  HDR=$(mktemp); chmod 600 "$HDR"
+  ( set -a; . "$ENV_FILE"; set +a; : "${FEEDGEN_READ_API_KEY:?}"; printf 'api-key: %s\n' "$FEEDGEN_READ_API_KEY" ) >"$HDR"
 }
 bskyops_env() {
   ( set -a; . "$ENV_FILE"; set +a; env -i PATH="$PATH" HOME="$HOME" FEEDGEN_READ_API_KEY="${FEEDGEN_READ_API_KEY:-}" FEEDGEN_ADMIN_API_KEY="${FEEDGEN_ADMIN_API_KEY:-}" "$@" )
@@ -177,9 +190,35 @@ active_version_gate() {
   got=$(sudo -n docker exec -i feedgen-db psql -U feedgen -d feedgen-db -X -qAt -v ON_ERROR_STOP=1 -c "SELECT CASE WHEN count(*)=6 AND count(DISTINCT content_time_contract_version)=1 THEN min(content_time_contract_version) ELSE 'bad:'||count(*)||':'||count(DISTINCT content_time_contract_version) END FROM feedgen_ops.feed_catalog WHERE enabled AND publisher_time_clock='content_time_v1';")
   [[ $got == "$expected" ]] || die "active catalog version is $got, expected $expected"
 }
+bind_activation_floor() {
+  local row floor
+  [[ ! -e $E/activation-floor.txt ]] || die 'activation floor already exists; use a fresh evidence root'
+  row=$(sudo -n docker exec -i feedgen-db psql -U feedgen -d feedgen-db -X -qAt -v ON_ERROR_STOP=1 -c "SELECT to_char(clock_timestamp() AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"');")
+  floor=$row
+  [[ $floor =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{3}Z$ ]] || die 'activation floor readback is malformed'
+  echo "activation_floor=$floor" | emit activation-floor.txt
+}
+gate_v2_engagement_projection() { # <receipt name> <since>
+  local name=$1 since=$2 until response summary http
+  until=$(date -u +%Y-%m-%dT%H:%M:%S.000Z); response=$(mktemp); summary=$(mktemp); load_read_header
+  http=$(curl -sS --max-time 60 -H "@$HDR" --get \
+    --data-urlencode feed_id=newsflow-be-k --data-urlencode since="$since" --data-urlencode until="$until" \
+    --data-urlencode scope=publisher --data-urlencode types=repost,like,quote,comment \
+    -o "$response" -w '%{http_code}' "$FEEDGEN_URL/api/compliance/engagement" || true)
+  if [[ $http != 200 ]]; then rm -f "$response" "$summary" "$HDR"; HDR=; die "$name returned HTTP $http"; fi
+  if ! node - "$response" "$summary" <<'NODE'
+const fs=require('fs'),crypto=require('crypto');const raw=fs.readFileSync(process.argv[2]);const j=JSON.parse(raw);const v=j.validity||{};
+for(const k of ['projected_v3_to_v2_valid','projected_v3_to_v2_invalid','semantic_incompatible'])if(!Object.prototype.hasOwnProperty.call(v,k)||!Number.isInteger(v[k])||v[k]<0)throw Error(`missing/non-numeric validity.${k}`);
+if(j.content_time_contract_version!=='newsflows-content-time/v2'||j.science_eligible!==true||v.semantic_incompatible!==0)throw Error('v2 engagement compatibility projection gate failed');
+fs.writeFileSync(process.argv[3],JSON.stringify({gate:'pass',content_time_contract_version:j.content_time_contract_version,science_eligible:j.science_eligible,projected_v3_to_v2_valid:v.projected_v3_to_v2_valid,projected_v3_to_v2_invalid:v.projected_v3_to_v2_invalid,semantic_incompatible:v.semantic_incompatible,response_sha256:crypto.createHash('sha256').update(raw).digest('hex')},null,2)+'\n');
+NODE
+  then rm -f "$response" "$summary" "$HDR"; HDR=; die "$name validation failed"; fi
+  emit "$name.json" <"$summary"; rm -f "$response" "$summary" "$HDR"; HDR=
+}
 revalidate_runner() {
   EXPECTED_SHA=$PACKET_SOURCE_SHA EXPECTED_DIST_SHA256=$EXPECTED_DIST_SHA EXPECTED_CT_SHA256=$EXPECTED_CT_SHA EXPECTED_IMAGE_CT_SHA256=$EXPECTED_IMAGE_CT_SHA \
-    FROM_VERSION=$V2 TO_VERSION=$V3 IMG=$IMG RUNNER=container MIGRATION_DRAIN_SECONDS=$MIGRATION_DRAIN_SECONDS "$REVALIDATE" "$@"
+    FROM_VERSION=$V2 TO_VERSION=$V3 IMG=$IMG RUNNER=container MIGRATION_DRAIN_SECONDS=$MIGRATION_DRAIN_SECONDS \
+    ALLOW_FTFU1_OVERLAP_NORMALIZATION="${ALLOW_FTFU1_OVERLAP_NORMALIZATION:-0}" "$REVALIDATE" "$@"
 }
 migration_complete() {
   local label=$1 target=post
@@ -197,6 +236,16 @@ forward_to_completion() {
   done
   die 'forward revalidation remained incomplete after five resumable invocations'
 }
+native_tail_to_completion() {
+  local attempt label rc
+  [[ -f $E/native-tail-readback.txt ]] && return 0
+  for attempt in 1 2 3 4 5; do
+    label="native-$attempt"
+    [[ -e $E/native-post-apply-$label.json ]] && continue
+    if revalidate_runner migrate-native-tail-rollback "$label"; then return 0; else rc=$?; [[ $rc == 3 ]] || return "$rc"; fi
+  done
+  die 'native-v3 tail rollback remained incomplete after five resumable invocations'
+}
 catalog_sync_preview() { bskyops_env "$BSKYOPS" ecosystem catalog-sync-packet --source-root "$1/config/newsflows/catalogs" --deployed-root "$DEPLOYED_CATALOG_ROOT" --json; }
 catalog_sync_apply() { bskyops_env "$BSKYOPS" ecosystem catalog-sync-apply --source-root "$1/config/newsflows/catalogs" --deployed-root "$DEPLOYED_CATALOG_ROOT" --confirm-live-host-catalog-sync --json; }
 gate_catalog_sync() {
@@ -211,6 +260,7 @@ cmd_preflight() {
   # Prepare bounds/control while writes are still v2. The exact population is
   # deliberately not bound until the catalog switch makes new writes v3.
   revalidate_runner migrate-prepare
+  gate_v2_engagement_projection engagement-v2-projection-preflight "$(date -u -d '10 minutes ago' +%Y-%m-%dT%H:%M:%S.000Z)"
   { echo "generated_at=$(ts)"; echo "source_sha=$SOURCE_SHA"; echo "source_catalog_sha256=$SOURCE_CATALOG_SHA"; echo "rollback_source_sha=$ROLLBACK_SOURCE_SHA"; echo "rollback_catalog_sha256=$ROLLBACK_CATALOG_SHA"; echo "packet_source_sha=$PACKET_SOURCE_SHA"; echo "feedgen_runtime_sha=$FEEDGEN_SHA"; echo "feedgen_image=$EXPECTED_IMAGE"; echo "packet_sha256=$PACKET_SHA"; echo "runner_sha256=$EXPECTED_RUNNER_SHA"; echo "since_main=$SINCE_MAIN"; echo "since_be=$SINCE_BE"; echo "since_engagement=$SINCE_ENGAGEMENT"; echo "migration_drain_seconds=$MIGRATION_DRAIN_SECONDS"; echo "rkeys=$RKEYS"; echo "tool_refs=$EXPECTED_TOOL_REFS"; } | emit bindings.txt
 }
 cmd_preview() {
@@ -223,17 +273,31 @@ cmd_apply() {
   assert_bindings
   [[ -f $E/feedgen-forward.json ]] || die 'preflight receipts missing'
   fence_timers
+  KEEP_TIMERS_FENCED_ON_EXIT=1
   catalog_sync_apply "$SOURCE_ROOT" | emit 01-catalog-sync-forward-apply.json; gate_catalog_sync "$E/01-catalog-sync-forward-apply.json"
   catalog_packet | emit 02-feedgen-sync-apply-packet.json; gate_body "$E/02-feedgen-sync-apply-packet.json" "$V2" "$V3"
   node -e 'const fs=require("fs"),a=JSON.parse(fs.readFileSync(process.argv[1])),j=JSON.parse(fs.readFileSync(process.argv[2]));if(JSON.stringify(a)!==JSON.stringify(j.atomic_change_set.request_body))throw Error("fresh apply body differs from bound preview body")' "$E/feedgen-forward.json" "$E/02-feedgen-sync-apply-packet.json"
+  gate_v2_engagement_projection engagement-v2-projection-apply "$(date -u -d '10 minutes ago' +%Y-%m-%dT%H:%M:%S.000Z)"
+  bind_activation_floor
   post_bulk "$E/feedgen-forward.json" 03-feedgen-forward-apply
   active_version_gate "$V3"
+  revalidate_runner migrate-native-tail-plan
   revalidate_runner migrate-freeze
   forward_to_completion
   { echo '01 catalog-sync forward'; echo '02 feedgen sync packet gate'; echo '03 exact-six bulk v2->v3'; echo '04 drain and bind stable v2 semantic-delta population'; echo '05 affected post rows'; echo '06 engagement projection (no historical writes)'; } | emit apply-order.txt
-  restore_timers
+  complete_timer_window
 }
-cmd_revalidate() { assert_bindings; active_version_gate "$V3"; fence_timers; [[ -f $E/migrate-stable-population.txt ]] || revalidate_runner migrate-freeze; revalidate_runner migrate-stable-check; forward_to_completion; restore_timers; }
+cmd_revalidate() { assert_bindings; active_version_gate "$V3"; fence_timers; KEEP_TIMERS_FENCED_ON_EXIT=1; [[ -f $E/migrate-stable-population.txt ]] || revalidate_runner migrate-freeze; revalidate_runner migrate-stable-check; forward_to_completion; complete_timer_window; }
+cmd_normalize_overlap() {
+  local label=${2:?unique label is required} maxb=${3:-}
+  [[ ${ALLOW_FTFU1_OVERLAP_NORMALIZATION:-0} == 1 ]] || die 'set ALLOW_FTFU1_OVERLAP_NORMALIZATION=1 for the explicit continuation path'
+  [[ "$label" =~ ^[a-zA-Z0-9][a-zA-Z0-9._-]*$ ]] || die 'normalization label is unsafe'
+  TIMER_STATE_LABEL=$label
+  assert_bindings; active_version_gate "$V2"; fence_timers
+  KEEP_TIMERS_FENCED_ON_EXIT=1
+  revalidate_runner migrate-normalize-overlap "$label" "$maxb"
+  complete_timer_window
+}
 cmd_readback() {
   assert_bindings
   active_version_gate "$V3"
@@ -262,12 +326,15 @@ cmd_rollback() {
   assert_bindings
   [[ -f $E/feedgen-rollback.json ]] || die 'rollback body missing'
   fence_timers
+  KEEP_TIMERS_FENCED_ON_EXIT=1
   post_bulk "$E/feedgen-rollback.json" 01-feedgen-rollback-v3-to-v2
   active_version_gate "$V2"
   catalog_sync_apply "$ROLLBACK_SOURCE_ROOT" | emit 02-catalog-sync-rollback-apply.json; gate_catalog_sync "$E/02-catalog-sync-rollback-apply.json"
   revalidate_runner migrate-rollback apply reverse
-  { echo '01 exact-six bulk v3->v2'; echo '02 catalog desired-state rollback'; echo '03 reverse affected post rows'; echo '04 engagement projection disabled by v2 contract'; } | emit rollback-order.txt
-  restore_timers
+  native_tail_to_completion
+  gate_v2_engagement_projection engagement-v2-projection-rollback "$(awk -F= '$1=="activation_floor"{print $2}' "$E/activation-floor.txt")"
+  { echo '01 exact-six bulk v3->v2'; echo '02 catalog desired-state rollback'; echo '03 reverse historical semantic-delta post rows below activation floor'; echo '04 after drain reverse native v3 post tail at/after activation floor'; echo '05 retain engagement provenance; require v2 compatibility projection'; } | emit rollback-order.txt
+  complete_timer_window
 }
 cmd_finalize() {
   assert_bindings
@@ -277,6 +344,7 @@ cmd_finalize() {
 
 case "$COMMAND" in
   test-forward-resume) [[ ${FTFU1_TEST_MODE:-0} == 1 ]] || die 'test-only command'; forward_to_completion;;
-  preflight) cmd_preflight;; preview) cmd_preview;; apply) cmd_apply;; revalidate) cmd_revalidate;; readback) cmd_readback;; rollback-dryrun) cmd_rollback_dryrun;; rollback) cmd_rollback;; finalize) cmd_finalize "$@";;
-  *) echo 'usage: content_time_contract_upgrade_packet.sh preflight|preview|apply|revalidate|readback|rollback-dryrun|rollback|finalize <start> <end>' >&2; exit 2;;
+  test-native-tail-resume) [[ ${FTFU1_TEST_MODE:-0} == 1 ]] || die 'test-only command'; native_tail_to_completion;;
+  preflight) cmd_preflight;; preview) cmd_preview;; apply) cmd_apply;; revalidate) cmd_revalidate;; normalize-overlap) cmd_normalize_overlap "$@";; readback) cmd_readback;; rollback-dryrun) cmd_rollback_dryrun;; rollback) cmd_rollback;; finalize) cmd_finalize "$@";;
+  *) echo 'usage: content_time_contract_upgrade_packet.sh preflight|preview|apply|revalidate|normalize-overlap <unique-label> [max-batches]|readback|rollback-dryrun|rollback|finalize <start> <end>' >&2; exit 2;;
 esac

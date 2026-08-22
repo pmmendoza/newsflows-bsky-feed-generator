@@ -36,6 +36,7 @@
 #   finalize <start> <end>
 #                        SHA256SUMS over every file (recursive), RESULT.txt last
 #   migrate-prereg | migrate-prepare | migrate-preflight | migrate-freeze
+#   migrate-normalize-overlap <label> [max_batches]  explicit continuation-only
 #   migrate-preview | migrate-apply <label>
 #   migrate-readback | migrate-rollback <dry-run|apply> | migrate-secret-scan
 #   migrate-finalize <start> <end>
@@ -57,6 +58,8 @@
 #   (container|host; host = rehearsal with HOST_DSN) CEIL_WAL_BASELINE_MULTIPLE CEIL_WAL_FLOOR_BYTES CEIL_REL_BYTES
 #   RANKED_RKEYS MAIN_RKEY_PATTERN BE_RKEY_PATTERN READBACK_JSON (BSR effective-config readback)
 #   (READBACK_JSON is required to exist and be fresh: stale_at > now)
+#   ALLOW_FTFU1_OVERLAP_NORMALIZATION=1 explicitly authorizes continuation-only
+#   v3 future_skew_clamped -> v2 normalization while the catalog remains v2.
 #   SECRET_KEY_REGEX (default: keys matching PASSWORD|SECRET|TOKEN|KEY|PASS) selects which env-file values the secret scan hunts for
 #   PREREG_TOLERANCE_PCT (default 5) SKIP_LIVE_IMAGE_CHECKS=1 (rehearsal only) RESTORE_STOP_AFTER_BATCH (rehearsal only)
 set -euo pipefail
@@ -522,18 +525,28 @@ migration_target_actors() {
     *) die "unknown migration target $1";;
   esac
 }
+migration_semantic_predicate() { # <version>; canonical v2<->v3 delta cohort
+  case "$1" in
+    "$V2") echo "content_time_validator_version='$V2' AND ((content_time_status='source_valid' AND content_time_utc>\"indexedAt\") OR (content_time_status='source_invalid' AND content_time_clamp_reason='future_skew'))";;
+    "$V3") echo "content_time_validator_version='$V3' AND content_time_clamp_reason='future_skew_clamped'";;
+    *) die "unsupported semantic cohort version $1";;
+  esac
+}
 migration_cutoff_sql() { # <target> -> index-probe max FROM, min TO, exclusive cutoff
-  local target=$1 table since
+  local target=$1 table since from_predicate to_predicate cutoff_expr
   table=$(migration_target_table "$target"); since=$(migration_target_since "$target")
+  from_predicate=$(migration_semantic_predicate "$FROM_VERSION"); to_predicate=$(migration_semantic_predicate "$TO_VERSION")
+  cutoff_expr="coalesce(min_to,to_char(clock_timestamp() AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'))"
+  [[ ! -s "$E/activation-floor.txt" ]] || cutoff_expr="'$(awk -F= '$1=="activation_floor"{print $2}' "$E/activation-floor.txt")'"
   cat <<SQL
 WITH bounds AS (
   SELECT
-    (SELECT max("indexedAt") FROM public.$table WHERE content_time_validator_version='$FROM_VERSION' AND "indexedAt">='$since') AS max_from,
-    (SELECT min("indexedAt") FROM public.$table WHERE content_time_validator_version='$TO_VERSION' AND "indexedAt">='$since') AS min_to
+    (SELECT max("indexedAt") FROM public.$table WHERE $from_predicate AND "indexedAt">='$since') AS max_from,
+    (SELECT min("indexedAt") FROM public.$table WHERE $to_predicate AND "indexedAt">='$since') AS min_to
 )
 SELECT 'max_from='||coalesce(max_from,'')||
   '|min_to='||coalesce(min_to,'')||
-  '|cutoff='||coalesce(min_to,to_char(clock_timestamp() AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'))
+  '|cutoff='||$cutoff_expr
 FROM bounds;
 SQL
 }
@@ -551,16 +564,19 @@ migration_derive_cutoff() { # <target> <attempt> -> evidence file
   [[ "$max_from" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{3}Z$ ]] || die "$target has no valid in-horizon $FROM_VERSION max indexedAt"
   [[ "$cutoff" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{3}Z$ ]] || die "$target migration cutoff evidence is malformed"
   if [[ -n "$min_to" ]]; then
-    [[ "$min_to" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{3}Z$ && "$max_from" < "$min_to" ]] || die "$target FROM/TO indexedAt cohorts overlap or have no strict millisecond gap; replan"
+    [[ "$min_to" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{3}Z$ ]] || die "$target TO cohort boundary is malformed"
+    if [[ -s "$E/activation-floor.txt" ]]; then [[ "$min_to" > "$cutoff" || "$min_to" == "$cutoff" ]] || die "$target native v3 semantic rows precede the activation floor"
+    else [[ "$max_from" < "$min_to" ]] || die "$target FROM/TO indexedAt cohorts overlap or have no strict millisecond gap; replan"; fi
   fi
   [[ "$max_from" < "$cutoff" ]] || die "$target FROM cohort is not strictly below exclusive cutoff; replan"
   { echo "target=$target"; echo "max_from=$max_from"; echo "min_to=$min_to"; echo "cutoff=$cutoff"; } | emit "$(basename "$file")"
 }
 assert_from_before_cutoff() { # <target> <cutoff>
-  local target=$1 cutoff=$2 table since rows
+  local target=$1 cutoff=$2 table since rows predicate
   table=$(migration_target_table "$target"); since=$(migration_target_since "$target")
-  rows=$(psql_ro -t -c "SELECT count(*) FROM public.$table WHERE content_time_validator_version='$FROM_VERSION' AND \"indexedAt\">='$since' AND \"indexedAt\">='$cutoff';")
-  [[ "$rows" == 0 ]] || die "$target gained $rows in-horizon $FROM_VERSION rows at/after exclusive cutoff"
+  predicate=$(migration_semantic_predicate "$FROM_VERSION")
+  rows=$(psql_ro -t -c "SELECT count(*) FROM public.$table WHERE $predicate AND \"indexedAt\">='$since' AND \"indexedAt\">='$cutoff';")
+  [[ "$rows" == 0 ]] || die "$target gained $rows in-horizon $FROM_VERSION semantic-delta rows at/after exclusive cutoff"
 }
 migration_scope_sql() { # <target>
   local target=$1 table since
@@ -577,10 +593,11 @@ assert_active_catalog_version() {
 }
 migration_run_tool() { # <artifact> <target> <from> <to> [extra args...]
   local out=$1 target=$2 from=$3 to=$4 table since actors cutoff=''; shift 4
-  table=$(migration_target_table "$target"); since=$(migration_target_since "$target"); actors=$(migration_target_actors "$target")
+  table=$(migration_target_table "$target"); since=${MIGRATION_SINCE_OVERRIDE:-$(migration_target_since "$target")}; actors=$(migration_target_actors "$target")
   local -a scope=(); [[ -n "$actors" ]] && scope=(--actors "$actors"); [[ "$table" == post && -z "$actors" ]] && scope+=(--all-authors)
-  local -a until=(); if [[ -s "$E/migrate-stable-population.txt" ]]; then cutoff=$(migration_cutoff_value "$target"); until=(--until "$cutoff"); fi
-  run_tool "$out" --mode revalidate --table "$table" --since "$since" "${until[@]}" --max-preview-rows "$MIGRATION_MAX_PREVIEW_ROWS" "${scope[@]}" --from-version "$from" --to-version "$to" --packet-sha256 "$PACKET_SHA" --json "$@"
+  local -a until=() native=(); if [[ -s "$E/migrate-stable-population.txt" && ${MIGRATION_NATIVE_V3_TAIL:-0} == 0 ]]; then cutoff=$(migration_cutoff_value "$target"); until=(--until "$cutoff"); fi
+  [[ ${MIGRATION_NATIVE_V3_TAIL:-0} == 0 ]] || native=(--native-v3-tail)
+  run_tool "$out" --mode revalidate --table "$table" --since "$since" "${until[@]}" --max-preview-rows "$MIGRATION_MAX_PREVIEW_ROWS" "${scope[@]}" "${native[@]}" --from-version "$from" --to-version "$to" --packet-sha256 "$PACKET_SHA" --json "$@"
 }
 prereg_spec_value() { # <spec> <key>
   local v; v=$(echo "$1" | tr ',' '\n' | awk -F= -v k="$2" '$1==k{print $2}')
@@ -804,6 +821,136 @@ rollback_remaining_rows() {
   (( applied <= total )) || die "$target prior rollback receipts exceed dry-run denominator"
   echo $((total-applied))
 }
+normalization_marker() { echo "$E/migrate-normalize-overlap.txt"; }
+normalization_spec() { migration_cells "$E/migrate-normalize-overlap-preview.json" "$TO_VERSION" "$FROM_VERSION"; }
+normalization_remaining_spec() {
+  local key total applied cells=""
+  for key in $(migration_outcomes "$TO_VERSION" "$FROM_VERSION"); do
+    total=$(prereg_spec_value "$(normalization_spec)" "$key")
+    applied=$(migration_receipt_value normalize post "revalidation.counts.$key")
+    (( applied <= total )) || die "normalization receipts exceed bound $key"
+    cells+="$key=$((total-applied)),"
+  done
+  echo "${cells%,}"
+}
+normalization_remaining_rows() {
+  local total applied
+  total=$(awk -F= '$1=="rows"{print $2}' "$(normalization_marker)")
+  applied=$(migration_receipt_value normalize post revalidation.updated)
+  [[ "$total" =~ ^[0-9]+$ ]] || die 'normalization denominator missing'
+  (( applied <= total )) || die 'normalization receipts exceed bound denominator'
+  echo $((total-applied))
+}
+cmd_migrate_normalize_overlap() { # <unique label> [max-batches]
+  local label=${1:?label} maxb=${2:-} f rows updated skipped key expected actual
+  [[ ${ALLOW_FTFU1_OVERLAP_NORMALIZATION:-0} == 1 ]] || die 'set ALLOW_FTFU1_OVERLAP_NORMALIZATION=1 for the explicit continuation path'
+  [[ "$label" =~ ^[a-zA-Z0-9][a-zA-Z0-9._-]*$ ]] || die 'normalization label is unsafe'
+  validate_migration_inputs; assert_tree; assert_active_catalog_version "$FROM_VERSION"
+  [[ ! -e "$E/migrate-stable-population.txt" ]] || die 'stable forward population already exists; overlap normalization is no longer applicable'
+  if [[ ! -e "$(normalization_marker)" ]]; then
+    sleep "$MIGRATION_DRAIN_SECONDS"
+    f=$(migration_preview_one migrate-normalize-overlap-preview post "$TO_VERSION" "$FROM_VERSION")
+    gate_migration_preview "$f" "$(migration_cells "$f" "$TO_VERSION" "$FROM_VERSION")" 'overlap normalization' "$TO_VERSION" "$FROM_VERSION"
+    [[ $(jsonq "$f" preview.counts.v3_valid_to_v2_valid) == 0 && $(jsonq "$f" preview.counts.v3_to_v2_invalid) == 0 ]] || die 'normalization preview escaped future_skew_clamped rows'
+    rows=$(jsonq "$f" preview.scanned); [[ "$rows" =~ ^[0-9]+$ ]] || die 'normalization denominator is malformed'
+    { echo "transition=$TO_VERSION->$FROM_VERSION"; echo "drain_seconds=$MIGRATION_DRAIN_SECONDS"; echo "rows=$rows"; echo "preview_sha256=$(sha256sum "$f" | cut -d' ' -f1)"; } | emit "$(basename "$(normalization_marker)")"
+  fi
+  [[ $(awk -F= '$1=="drain_seconds"{print $2}' "$(normalization_marker)") == "$MIGRATION_DRAIN_SECONDS" ]] || die 'normalization drain binding differs'
+  [[ $(awk -F= '$1=="preview_sha256"{print $2}' "$(normalization_marker)") == "$(sha256sum "$E/migrate-normalize-overlap-preview.json" | cut -d' ' -f1)" ]] || die 'normalization preview hash differs'
+  rows=$(normalization_remaining_rows post)
+  f=$(migration_preview_one "migrate-normalize-overlap-preview-before-$label" post "$TO_VERSION" "$FROM_VERSION")
+  gate_migration_preview "$f" "$(normalization_remaining_spec)" 'overlap normalization remaining' "$TO_VERSION" "$FROM_VERSION"
+  [[ $(jsonq "$f" preview.scanned) == "$rows" ]] || die 'normalization remaining population differs from bound denominator minus receipts'
+  if (( rows > 0 )); then
+    migration_apply_one post "$label" "$TO_VERSION" "$FROM_VERSION" normalize "$maxb"
+    [[ $(jsonq "$E/normalize-post-apply-$label.json" revalidation.complete) == true ]] || return 3
+  fi
+  f=$(migration_preview_one "migrate-normalize-overlap-preview-after-$label" post "$TO_VERSION" "$FROM_VERSION")
+  [[ $(jsonq "$f" preview.truncated) == false && $(jsonq "$f" preview.scanned) == 0 ]] || die 'overlap normalization is incomplete'
+  rows=$(awk -F= '$1=="rows"{print $2}' "$(normalization_marker)")
+  updated=$(migration_receipt_value normalize post revalidation.updated); [[ "$updated" == "$rows" ]] || die "normalization updated=$updated but bound denominator=$rows"
+  skipped=$(migration_receipt_value normalize post revalidation.skipped_cas); [[ "$skipped" == 0 ]] || die "normalization recorded skipped_cas=$skipped"
+  for key in $(migration_outcomes "$TO_VERSION" "$FROM_VERSION"); do
+    expected=$(prereg_spec_value "$(normalization_spec)" "$key"); actual=$(migration_receipt_value normalize post "revalidation.counts.$key")
+    [[ "$actual" == "$expected" ]] || die "normalization realized $key=$actual but bound=$expected"
+  done
+  { echo "normalized_rows=$rows"; echo 'bounded_v3_future_skew_clamped_residual=0'; echo 'skipped_cas=0'; } | emit migrate-normalize-overlap-readback.txt
+}
+activation_floor() {
+  local floor; floor=$(awk -F= '$1=="activation_floor"{print $2}' "$E/activation-floor.txt" 2>/dev/null || true)
+  [[ "$floor" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{3}Z$ ]] || die 'activation floor receipt is missing or malformed'
+  echo "$floor"
+}
+native_tail_targets() { echo 'post'; }
+native_tail_preview() { # <artifact> <target>
+  local out=$1 target=$2 floor rc
+  floor=$(activation_floor)
+  rc=$(MIGRATION_NATIVE_V3_TAIL=1 MIGRATION_SINCE_OVERRIDE="$floor" migration_run_tool "$out" "$target" "$TO_VERSION" "$FROM_VERSION")
+  [[ "$rc" == 0 ]] || die "$target native-tail preview failed (exit=$rc)"
+  echo "$E/$out.json"
+}
+native_tail_spec() { migration_cells "$E/native-tail-$1-preview.json" "$TO_VERSION" "$FROM_VERSION"; }
+native_tail_remaining_spec() {
+  local target=$1 key total applied cells=""
+  for key in $(migration_outcomes "$TO_VERSION" "$FROM_VERSION"); do
+    total=$(prereg_spec_value "$(native_tail_spec "$target")" "$key"); applied=$(migration_receipt_value native "$target" "revalidation.counts.$key")
+    (( applied <= total )) || die "$target native-tail receipts exceed bound $key"
+    cells+="$key=$((total-applied)),"
+  done
+  echo "${cells%,}"
+}
+native_tail_remaining_rows() {
+  local target=$1 total applied
+  total=$(awk -F= -v k="${target}_rows" '$1==k{print $2}' "$E/native-tail-stable.txt"); applied=$(migration_receipt_value native "$target" revalidation.updated)
+  [[ "$total" =~ ^[0-9]+$ ]] || die "$target native-tail denominator missing"
+  (( applied <= total )) || die "$target native-tail receipts exceed bound denominator"
+  echo $((total-applied))
+}
+cmd_migrate_native_tail_plan() {
+  local floor target table order
+  validate_migration_inputs; assert_tree; assert_active_catalog_version "$TO_VERSION"; floor=$(activation_floor)
+  for target in $(native_tail_targets); do
+    table=$(migration_target_table "$target"); [[ $target == post ]] && order='author,uri' || order='uri'
+    psql_ro -c "EXPLAIN SELECT uri FROM public.$table WHERE \"indexedAt\">='$floor' AND content_time_validator_version='$TO_VERSION' ORDER BY $order LIMIT 500;" | emit "native-tail-$target-plan.txt"
+    ! grep -Fq 'Seq Scan' "$E/native-tail-$target-plan.txt" || die "$target native-tail plan is a broad sequential scan"
+    grep -F 'Index Cond:' "$E/native-tail-$target-plan.txt" | grep -Fq 'indexedAt' || die "$target native-tail plan does not index-bound activation_floor"
+  done
+}
+cmd_migrate_native_tail_rollback() { # <unique label> [max-batches]
+  local label=${1:?label} maxb=${2:-} floor target f rows updated skipped key expected actual
+  [[ "$label" =~ ^[a-zA-Z0-9][a-zA-Z0-9._-]*$ ]] || die 'native-tail label is unsafe'
+  validate_migration_inputs; assert_tree; assert_active_catalog_version "$FROM_VERSION"; floor=$(activation_floor)
+  if [[ ! -e "$E/native-tail-stable.txt" ]]; then
+    sleep "$MIGRATION_DRAIN_SECONDS"
+    for target in $(native_tail_targets); do
+      [[ -s "$E/native-tail-$target-plan.txt" ]] || die "$target native-tail activation-bound plan receipt is missing"
+      f=$(native_tail_preview "native-tail-$target-preview" "$target")
+      gate_migration_preview "$f" "$(migration_cells "$f" "$TO_VERSION" "$FROM_VERSION")" "$target native tail" "$TO_VERSION" "$FROM_VERSION"
+    done
+    { echo "activation_floor=$floor"; echo "drain_seconds=$MIGRATION_DRAIN_SECONDS"; for target in $(native_tail_targets); do echo "${target}_rows=$(jsonq "$E/native-tail-$target-preview.json" preview.scanned)"; echo "${target}_preview_sha256=$(sha256sum "$E/native-tail-$target-preview.json" | cut -d' ' -f1)"; done; } | emit native-tail-stable.txt
+  fi
+  grep -Fxq "activation_floor=$floor" "$E/native-tail-stable.txt" || die 'native-tail floor binding differs'
+  grep -Fxq "drain_seconds=$MIGRATION_DRAIN_SECONDS" "$E/native-tail-stable.txt" || die 'native-tail drain binding differs'
+  for target in $(native_tail_targets); do
+    [[ $(awk -F= -v k="${target}_preview_sha256" '$1==k{print $2}' "$E/native-tail-stable.txt") == "$(sha256sum "$E/native-tail-$target-preview.json" | cut -d' ' -f1)" ]] || die "$target native-tail preview hash differs"
+    rows=$(native_tail_remaining_rows "$target")
+    f=$(native_tail_preview "native-tail-$target-preview-before-$label" "$target")
+    gate_migration_preview "$f" "$(native_tail_remaining_spec "$target")" "$target native-tail remaining" "$TO_VERSION" "$FROM_VERSION"
+    [[ $(jsonq "$f" preview.scanned) == "$rows" ]] || die "$target native-tail population differs from bound denominator minus receipts"
+    if (( rows > 0 )); then
+      MIGRATION_NATIVE_V3_TAIL=1 MIGRATION_SINCE_OVERRIDE="$floor" migration_apply_one "$target" "$label" "$TO_VERSION" "$FROM_VERSION" native "$maxb"
+      [[ $(jsonq "$E/native-$target-apply-$label.json" revalidation.complete) == true ]] || return 3
+    fi
+  done
+  for target in $(native_tail_targets); do
+    f=$(native_tail_preview "native-tail-$target-preview-after-$label" "$target")
+    [[ $(jsonq "$f" preview.truncated) == false && $(jsonq "$f" preview.scanned) == 0 ]] || die "$target native-tail rollback is incomplete"
+    rows=$(awk -F= -v k="${target}_rows" '$1==k{print $2}' "$E/native-tail-stable.txt"); updated=$(migration_receipt_value native "$target" revalidation.updated); [[ "$updated" == "$rows" ]] || die "$target native-tail updated=$updated but bound=$rows"
+    skipped=$(migration_receipt_value native "$target" revalidation.skipped_cas); [[ "$skipped" == 0 ]] || die "$target native-tail skipped_cas=$skipped"
+    for key in $(migration_outcomes "$TO_VERSION" "$FROM_VERSION"); do expected=$(prereg_spec_value "$(native_tail_spec "$target")" "$key"); actual=$(migration_receipt_value native "$target" "revalidation.counts.$key"); [[ "$actual" == "$expected" ]] || die "$target native-tail $key=$actual but bound=$expected"; done
+  done
+  { echo "activation_floor=$floor"; for target in $(native_tail_targets); do echo "$target restored_rows=$(awk -F= -v k="${target}_rows" '$1==k{print $2}' "$E/native-tail-stable.txt") residual=0 skipped_cas=0"; done; echo 'historical_v3_before_floor_out_of_scope=true'; } | emit native-tail-readback.txt
+}
 cmd_migrate_apply() {
   local label=${1:?label} maxb=${2:-} target f rows spec cutoff attempt=1
   assert_tree; assert_active_catalog_version "$TO_VERSION"; assert_stable_population_bound
@@ -928,11 +1075,14 @@ case "${1:-}" in
   migrate-preflight) cmd_migrate_preflight;;
   migrate-freeze) cmd_migrate_freeze;;
   migrate-stable-check) cmd_migrate_stable_check;;
+  migrate-normalize-overlap) cmd_migrate_normalize_overlap "${2:?label}" "${3:-}";;
+  migrate-native-tail-plan) cmd_migrate_native_tail_plan;;
+  migrate-native-tail-rollback) cmd_migrate_native_tail_rollback "${2:?label}" "${3:-}";;
   migrate-preview) cmd_migrate_preview;;
   migrate-apply) cmd_migrate_apply "${2:?label}" "${3:-}";;
   migrate-readback) cmd_migrate_readback;;
   migrate-rollback) cmd_migrate_rollback "${2:?dry-run|apply}" "${3:-}" "${4:-}";;
   migrate-secret-scan) cmd_secret_scan;;
   migrate-finalize) cmd_migrate_finalize "${2:-}" "${3:-}";;
-  *) echo "usage: $0 prereg|preflight|control|preview <group>|apply <group> <label> [max_batches]|readback|restore <group>|secret-scan|finalize <start> <end>|migrate-prereg|migrate-prepare|migrate-preflight|migrate-freeze|migrate-stable-check|migrate-preview|migrate-apply <label> [max_batches]|migrate-readback|migrate-rollback <dry-run|apply> [label] [max_batches]|migrate-secret-scan|migrate-finalize <start> <end>" >&2; exit 2;;
+  *) echo "usage: $0 prereg|preflight|control|preview <group>|apply <group> <label> [max_batches]|readback|restore <group>|secret-scan|finalize <start> <end>|migrate-prereg|migrate-prepare|migrate-preflight|migrate-freeze|migrate-stable-check|migrate-normalize-overlap <label> [max_batches]|migrate-native-tail-rollback <label> [max_batches]|migrate-preview|migrate-apply <label> [max_batches]|migrate-readback|migrate-rollback <dry-run|apply> [label] [max_batches]|migrate-secret-scan|migrate-finalize <start> <end>" >&2; exit 2;;
 esac

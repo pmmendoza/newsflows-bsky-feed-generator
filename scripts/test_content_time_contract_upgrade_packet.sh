@@ -15,6 +15,21 @@ must '--bsr-effective-config-json "$BSR_EFFECTIVE_CONFIG_JSON"'
 must 'post_bulk "$E/feedgen-forward.json" 03-feedgen-forward-apply'
 must 'revalidate_runner migrate-prepare'
 must 'revalidate_runner migrate-freeze'
+must 'ALLOW_FTFU1_OVERLAP_NORMALIZATION'
+must 'revalidate_runner migrate-normalize-overlap'
+must 'TIMER_STATE_LABEL=$label'
+must 'bind_activation_floor'
+must 'native_tail_to_completion'
+must 'migrate-native-tail-rollback'
+must 'revalidate_runner migrate-native-tail-plan'
+must 'gate_v2_engagement_projection engagement-v2-projection-preflight'
+must 'gate_v2_engagement_projection engagement-v2-projection-apply'
+must 'gate_v2_engagement_projection engagement-v2-projection-rollback'
+must "'projected_v3_to_v2_valid','projected_v3_to_v2_invalid','semantic_incompatible'"
+must "j.science_eligible!==true||v.semantic_incompatible!==0"
+! grep -Fq -- 'v.projected_v3_to_v2_invalid!==0' "$packet"
+must 'response_sha256:crypto.createHash'
+! grep -Fq -- 'emit "$name.json" <"$response"' "$packet"
 must 'forward_to_completion'
 must '"$REVALIDATE" "$@"'
 must 'EXPECTED_REVALIDATE_RUNNER_SHA'
@@ -34,6 +49,8 @@ line() { grep -nF -- "$1" "$packet" | tail -1 | cut -d: -f1; }
 first_line() { grep -nF -- "$1" "$packet" | head -1 | cut -d: -f1; }
 (( $(line 'catalog_sync_apply "$SOURCE_ROOT"') < $(line 'post_bulk "$E/feedgen-forward.json" 03-feedgen-forward-apply') ))
 (( $(line 'revalidate_runner migrate-prepare') < $(line 'post_bulk "$E/feedgen-forward.json" 03-feedgen-forward-apply') ))
+(( $(line 'bind_activation_floor') + 1 == $(line 'post_bulk "$E/feedgen-forward.json" 03-feedgen-forward-apply') ))
+(( $(line 'post_bulk "$E/feedgen-forward.json" 03-feedgen-forward-apply') < $(line 'revalidate_runner migrate-native-tail-plan') ))
 (( $(line 'post_bulk "$E/feedgen-forward.json" 03-feedgen-forward-apply') < $(line 'revalidate_runner migrate-freeze') ))
 (( $(first_line '  revalidate_runner migrate-freeze') < $(first_line '  forward_to_completion') ))
 (( $(line 'post_bulk "$E/feedgen-forward.json" 03-feedgen-forward-apply') < $(line 'forward_to_completion') ))
@@ -76,9 +93,17 @@ set -e
 mkdir -p "$tmp/resume-tree/scripts" "$tmp/resume-tree/dist/tools" "$tmp/resume-tree/dist/util" "$tmp/resume-evidence"
 cat >"$tmp/resume-tree/scripts/content_time_revalidate_packet.sh" <<'SH'
 #!/usr/bin/env bash
-[[ "$1" == migrate-apply ]]
-label=$2; echo "$label" >>"$E/coordinator-labels.txt"
-printf '{"revalidation":{"complete":true}}\n' >"$E/migrate-post-apply-$label.json"
+label=$2
+case "$1" in
+  migrate-apply)
+    echo "$label" >>"$E/coordinator-labels.txt"
+    printf '{"revalidation":{"complete":true}}\n' >"$E/migrate-post-apply-$label.json";;
+  migrate-native-tail-rollback)
+    echo "$label" >>"$E/native-coordinator-labels.txt"
+    if [[ $label == native-1 ]]; then printf '{}\n' >"$E/native-post-apply-$label.json"; exit 3; fi
+    printf 'complete=true\n' >"$E/native-tail-readback.txt";;
+  *) exit 9;;
+esac
 SH
 touch "$tmp/resume-tree/dist/tools/backfill-publisher-posts.js" "$tmp/resume-tree/dist/util/content-time.js"
 chmod +x "$tmp/resume-tree/scripts/content_time_revalidate_packet.sh"
@@ -100,6 +125,17 @@ PATH="$tmp/runtime-mock:$PATH" FTFU1_TEST_MODE=1 E="$tmp/resume-evidence" \
   bash "$packet" test-forward-resume
 grep -Fxq 'forward-2' "$tmp/resume-evidence/coordinator-labels.txt"
 [[ -s "$tmp/resume-evidence/migrate-post-apply-forward-2.json" ]]
+PATH="$tmp/runtime-mock:$PATH" FTFU1_TEST_MODE=1 E="$tmp/resume-evidence" \
+  SOURCE_ROOT="$tmp/packet-tree" SOURCE_SHA="$packet_tree_sha" SOURCE_CATALOG_SHA="$hex64" \
+  ROLLBACK_SOURCE_ROOT="$tmp/packet-tree" ROLLBACK_SOURCE_SHA="$packet_tree_sha" ROLLBACK_CATALOG_SHA="$hex64" \
+  TREE="$tmp/resume-tree" PACKET_SOURCE_SHA="$resume_tree_sha" FEEDGEN_SHA="$runtime_sha" \
+  EXPECTED_DIST_SHA="$hex64" EXPECTED_CT_SHA="$hex64" EXPECTED_IMAGE_CT_SHA="$hex64" EXPECTED_IMAGE=fixture \
+  EXPECTED_TOOL_REFS=x EXPECTED_RUNNER_SHA="$hex64" EXPECTED_REVALIDATE_RUNNER_SHA="$hex64" BSR_EFFECTIVE_CONFIG_JSON=x \
+  PACKET_PATH="$packet" PACKET_SHA="$hex64" SINCE_MAIN=2026-08-18T00:00:00.000Z \
+  SINCE_BE=2026-08-11T00:00:00.000Z SINCE_ENGAGEMENT=2026-08-11T00:00:00.000Z \
+  bash "$packet" test-native-tail-resume
+grep -Fxq 'native-1' "$tmp/resume-evidence/native-coordinator-labels.txt"
+grep -Fxq 'native-2' "$tmp/resume-evidence/native-coordinator-labels.txt"
 (
   export CONTENT_TIME_PACKET_SOURCE_ONLY=1 E="$tmp/library-evidence" TREE="$tmp/library-tree" EXPECTED_SHA=x \
     EXPECTED_DIST_SHA256=x EXPECTED_CT_SHA256=x EXPECTED_IMAGE_CT_SHA256=x EXPECTED_TOOL_REFS=x \
@@ -112,7 +148,7 @@ grep -Fxq 'forward-2' "$tmp/resume-evidence/coordinator-labels.txt"
   . "$runner"
   [[ $(migration_targets) == 'post' ]]
   [[ $(migration_target_since post) == "$SINCE_ENGAGEMENT" ]]
-  [[ $(migration_cutoff_sql post) == *'(SELECT max("indexedAt")'* ]]
+  [[ $(migration_cutoff_sql post) == *"content_time_clamp_reason='future_skew_clamped'"* ]]
 )
 
 # Execute the post-switch population freeze with a fake DB. The single complete
@@ -228,6 +264,19 @@ set -e
 [[ $rc != 0 ]]
 grep -Fxq 'start one.timer' "$MOCK_LOG"
 grep -Fxq 'start two.timer' "$MOCK_LOG"
+
+# Once a mutating command starts, any failure keeps initially active timers
+# fenced rather than restoring dispatch into a partially changed estate.
+mkdir "$tmp/evidence-partial"
+set +e
+PATH="$mock:$PATH" MOCK_LOG="$tmp/partial.log" FTFU1_TEST_MODE=1 E="$tmp/evidence-partial" \
+  TIMER_UNITS=one.timer,two.timer SERVICE_UNITS=one.service,two.service bash "$packet" test-timer-fenced-failure >/dev/null 2>&1
+partial_timer_rc=$?
+set -e
+[[ $partial_timer_rc != 0 ]]
+grep -Fxq 'stop one.timer' "$tmp/partial.log"
+grep -Fxq 'stop two.timer' "$tmp/partial.log"
+if grep -Eq '^start (one|two)\.timer$' "$tmp/partial.log"; then exit 1; fi
 
 # Inactive timers remain fail-closed unless the continuation opt-in proves the
 # timer enabled and its corresponding service inactive.

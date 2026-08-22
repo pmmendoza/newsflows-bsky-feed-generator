@@ -901,7 +901,10 @@ export function validateRevalidationTransition(fromVersion: string, toVersion: s
   }
 }
 
-export function validateRevalidationTarget(table: 'post' | 'engagement', fromVersion: string, toVersion: string): void {
+export function validateRevalidationTarget(table: 'post' | 'engagement', fromVersion: string, toVersion: string, nativeV3Tail = false): void {
+  if (nativeV3Tail && `${fromVersion}->${toVersion}` !== `${CONTENT_TIME_VALIDATOR_VERSION_V3}->${CONTENT_TIME_VALIDATOR_VERSION_V2}`) {
+    throw new Error('nativeV3Tail is rollback-only (v3->v2)')
+  }
   if (table === 'engagement' && fromVersion !== CONTENT_TIME_VALIDATOR_VERSION_V1) {
     throw new Error('v2/v3 semantic migration is post-only; engagement is projected at export time')
   }
@@ -1083,6 +1086,8 @@ export type ContentTimeRevalidationOptions = {
   actors?: string[]
   /** Explicitly select every author in the bounded time window (post only). */
   allAuthors?: boolean
+  /** Explicit rollback-only selection of every v3 row in the bounded tail. */
+  nativeV3Tail?: boolean
   since: Date
   /** Exclusive receipt-time upper bound; immutable when resuming. */
   untilExclusive?: Date
@@ -1111,6 +1116,7 @@ export function contentTimeRevalidationConfigSha256(
   toVersion: string = CONTENT_TIME_VALIDATOR_VERSION_V2,
   allAuthors: boolean = false,
   untilExclusiveIso?: string,
+  nativeV3Tail: boolean = false,
 ): string {
   const sortedActors = table === 'post' ? [...new Set(actors)].sort() : []
   const payload = {
@@ -1121,6 +1127,7 @@ export function contentTimeRevalidationConfigSha256(
     to_validator_version: toVersion,
     ...(allAuthors ? { all_authors: true } : {}),
     ...(untilExclusiveIso ? { until_exclusive: untilExclusiveIso } : {}),
+    ...(nativeV3Tail ? { native_v3_tail: true } : {}),
   }
   return sha256(JSON.stringify(payload))
 }
@@ -1175,7 +1182,9 @@ async function selectRevalidationBatch(
   afterUri: string,
   limit: number,
   forUpdate: boolean,
+  nativeV3Tail: boolean = false,
 ): Promise<RevalidationSelectRow[]> {
+  const transitionPredicate = nativeV3Tail ? sql<boolean>`true` : revalidationSemanticDeltaSql(table, fromVersion, toVersion)
   if (table === 'post') {
     const authorPredicate = allAuthors ? sql`TRUE` : sql`author = ANY(${actors}::text[])`
     const untilPredicate = untilExclusiveIso ? sql`"indexedAt" < ${untilExclusiveIso}` : sql`TRUE`
@@ -1187,7 +1196,7 @@ async function selectRevalidationBatch(
             AND "indexedAt" >= ${sinceIso}
             AND ${untilPredicate}
             AND content_time_validator_version = ${fromVersion}
-            AND ${revalidationSemanticDeltaSql('post', fromVersion, toVersion)}
+            AND ${transitionPredicate}
             AND (author, uri) > (${afterAuthor}, ${afterUri})
           ORDER BY author, uri
           LIMIT ${limit}
@@ -1200,7 +1209,7 @@ async function selectRevalidationBatch(
             AND "indexedAt" >= ${sinceIso}
             AND ${untilPredicate}
             AND content_time_validator_version = ${fromVersion}
-            AND ${revalidationSemanticDeltaSql('post', fromVersion, toVersion)}
+            AND ${transitionPredicate}
             AND (author, uri) > (${afterAuthor}, ${afterUri})
           ORDER BY author, uri
           LIMIT ${limit}
@@ -1214,7 +1223,7 @@ async function selectRevalidationBatch(
           WHERE "indexedAt" >= ${sinceIso}
             AND ${untilPredicate}
             AND content_time_validator_version = ${fromVersion}
-            AND ${revalidationSemanticDeltaSql('engagement', fromVersion, toVersion)}
+            AND ${transitionPredicate}
             AND uri > ${afterUri}
           ORDER BY uri
           LIMIT ${limit}
@@ -1226,7 +1235,7 @@ async function selectRevalidationBatch(
           WHERE "indexedAt" >= ${sinceIso}
             AND ${untilPredicate}
             AND content_time_validator_version = ${fromVersion}
-            AND ${revalidationSemanticDeltaSql('engagement', fromVersion, toVersion)}
+            AND ${transitionPredicate}
             AND uri > ${afterUri}
           ORDER BY uri
           LIMIT ${limit}
@@ -1261,6 +1270,7 @@ async function applyRevalidationBatch(
   lockTimeoutMs: number,
   statementTimeoutMs: number,
   deadlineMs: number,
+  nativeV3Tail: boolean = false,
 ): Promise<RevalidationBatchResult> {
   return db.transaction().execute(async (trx) => {
     const remainingMs = deadlineMs - Date.now()
@@ -1275,7 +1285,7 @@ async function applyRevalidationBatch(
              pg_total_relation_size(${tableName})::text AS relation_bytes
     `.execute(trx)).rows[0]
 
-    const rows = await selectRevalidationBatch(trx, table, actors, allAuthors, sinceIso, untilExclusiveIso, fromVersion, toVersion, afterAuthor, afterUri, batchSize, true)
+    const rows = await selectRevalidationBatch(trx, table, actors, allAuthors, sinceIso, untilExclusiveIso, fromVersion, toVersion, afterAuthor, afterUri, batchSize, true, nativeV3Tail)
     if (rows.length === 0) {
       return {
         candidates: 0,
@@ -1401,9 +1411,10 @@ export async function runContentTimeRevalidation(
   const table = options.table ?? 'post'
   const fromVersion = options.fromVersion ?? CONTENT_TIME_VALIDATOR_VERSION_V1
   const toVersion = options.toVersion ?? CONTENT_TIME_VALIDATOR_VERSION_V2
+  const nativeV3Tail = options.nativeV3Tail === true
 
   validateRevalidationTransition(fromVersion, toVersion)
-  validateRevalidationTarget(table, fromVersion, toVersion)
+  validateRevalidationTarget(table, fromVersion, toVersion, nativeV3Tail)
 
   if (table !== 'post' && table !== 'engagement') {
     throw new Error(`invalid table: ${table}; must be post or engagement`)
@@ -1434,7 +1445,7 @@ export async function runContentTimeRevalidation(
   validateContentTimeRevalidationWindow(options.since, options.untilExclusive)
   const sinceIso = options.since.toISOString()
   const untilExclusiveIso = options.untilExclusive?.toISOString()
-  const configSha256 = contentTimeRevalidationConfigSha256(actors, sinceIso, table, fromVersion, toVersion, allAuthors, untilExclusiveIso)
+  const configSha256 = contentTimeRevalidationConfigSha256(actors, sinceIso, table, fromVersion, toVersion, allAuthors, untilExclusiveIso, nativeV3Tail)
   if (options.afterAuthor || options.afterUri) {
     if (options.configSha256 !== configSha256) {
       throw new Error('checkpoint does not match the immutable revalidation config (actors, time window, table, or validator versions changed)')
@@ -1482,6 +1493,7 @@ export async function runContentTimeRevalidation(
       options.lockTimeoutMs,
       Math.min(options.statementTimeoutMs, remainingMs),
       deadlineMs,
+      nativeV3Tail,
     )
     if (result.candidates === 0) {
       complete = true
@@ -1578,9 +1590,10 @@ export async function previewContentTimeRevalidation(
   toVersion: string = CONTENT_TIME_VALIDATOR_VERSION_V2,
   allAuthors: boolean = false,
   untilExclusive?: Date,
+  nativeV3Tail: boolean = false,
 ): Promise<{ scanned: number; counts: ContentTimeRevalidationCounts; truncated: boolean }> {
   validateRevalidationTransition(fromVersion, toVersion)
-  validateRevalidationTarget(table, fromVersion, toVersion)
+  validateRevalidationTarget(table, fromVersion, toVersion, nativeV3Tail)
   const sortedActors = table === 'post' ? [...new Set(actors)].sort() : []
   validateContentTimeRevalidationScope(table, sortedActors, allAuthors)
   validateContentTimeRevalidationWindow(since, untilExclusive)
@@ -1607,6 +1620,7 @@ export async function previewContentTimeRevalidation(
       cursorUri,
       limit,
       false,
+      nativeV3Tail,
     )
     if (rows.length === 0) break
     for (const row of rows) {
@@ -1826,6 +1840,7 @@ export type RevalidateCliOptions = {
   toVersion: string
   actors?: string[]
   allAuthors: boolean
+  nativeV3Tail: boolean
   since: Date
   untilExclusive?: Date
   apply: boolean
@@ -1843,6 +1858,7 @@ export function parseRevalidateCliArgs(argv: string[]): RevalidateCliOptions {
   let apply = false
   let json = false
   let allAuthors = false
+  let nativeV3Tail = false
 
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i]
@@ -1860,6 +1876,10 @@ export function parseRevalidateCliArgs(argv: string[]): RevalidateCliOptions {
     }
     if (arg === '--all-authors') {
       allAuthors = true
+      continue
+    }
+    if (arg === '--native-v3-tail') {
+      nativeV3Tail = true
       continue
     }
     if (!arg.startsWith('--')) throw new Error(`Unexpected positional argument: ${arg}`)
@@ -1883,7 +1903,7 @@ export function parseRevalidateCliArgs(argv: string[]): RevalidateCliOptions {
   const toVersion = flags.get('to-version')?.at(-1) || CONTENT_TIME_VALIDATOR_VERSION_V2
 
   validateRevalidationTransition(fromVersion, toVersion)
-  validateRevalidationTarget(table, fromVersion, toVersion)
+  validateRevalidationTarget(table, fromVersion, toVersion, nativeV3Tail)
 
   const actorsCsv = [
     ...splitCsv(flags.get('actors')?.join(',')),
@@ -1935,6 +1955,7 @@ export function parseRevalidateCliArgs(argv: string[]): RevalidateCliOptions {
     toVersion,
     actors: actorsCsv.length ? actorsCsv : undefined,
     allAuthors,
+    nativeV3Tail,
     since,
     untilExclusive,
     apply,
@@ -2005,6 +2026,7 @@ async function mainRevalidate(argv: string[]) {
         options.toVersion,
         options.allAuthors,
         options.untilExclusive?.toISOString(),
+        options.nativeV3Tail,
       )
       const checkpoint = readRevalidationCheckpoint(options.checkpointFile, configSha256, options.packetSha256)
       const deadlineMs = startedAt + REVALIDATION_LIMITS.maxDurationMs
@@ -2014,6 +2036,7 @@ async function mainRevalidate(argv: string[]) {
         table: options.table,
         actors,
         allAuthors: options.allAuthors,
+        nativeV3Tail: options.nativeV3Tail,
         since: options.since,
         untilExclusive: options.untilExclusive,
         fromVersion: options.fromVersion,
@@ -2044,6 +2067,7 @@ async function mainRevalidate(argv: string[]) {
         options.toVersion,
         options.allAuthors,
         options.untilExclusive,
+        options.nativeV3Tail,
       )
     }
 
@@ -2052,6 +2076,7 @@ async function mainRevalidate(argv: string[]) {
       mode: options.apply ? 'apply' : 'dry-run',
       table: options.table,
       all_authors: options.allAuthors,
+      native_v3_tail: options.nativeV3Tail,
       actor_count: actors.length,
       actor_sha256: actors.map(sha256).sort(),
       since: options.since.toISOString(),
