@@ -26,6 +26,8 @@ import {
 import {
   REVALIDATION_LIMITS,
   contentTimeRevalidationConfigSha256,
+  validateContentTimeRevalidationScope,
+  validateContentTimeRevalidationWindow,
   revalidateContentTimeCandidate,
   parseRevalidateCliArgs,
   normalizeAppViewPost,
@@ -245,12 +247,42 @@ console.log('revalidateContentTimeCandidate transform checks passed')
   const b = contentTimeRevalidationConfigSha256(['did:plc:a', 'did:plc:b', 'did:plc:a'], '2026-08-01T00:00:00.000Z')
   check(a === b, 'actor order and duplicates must not change the config hash')
   check(/^[0-9a-f]{64}$/.test(a), 'config hash must be a lowercase sha256 hex digest')
+  check(a === '67c65b050c0ecf2e08ed534dd2b74fdca077480d2415f62245e93c28e3efc7bc', 'scoped checkpoint hash must retain the historical payload shape')
 
   const differentSince = contentTimeRevalidationConfigSha256(['did:plc:a', 'did:plc:b'], '2026-08-02T00:00:00.000Z')
   check(a !== differentSince, 'changing --since must change the config hash')
 
   const differentActors = contentTimeRevalidationConfigSha256(['did:plc:a'], '2026-08-01T00:00:00.000Z')
   check(a !== differentActors, 'changing the actor set must change the config hash')
+
+  const boundedConfig = contentTimeRevalidationConfigSha256(
+    ['did:plc:a', 'did:plc:b'],
+    '2026-08-01T00:00:00.000Z',
+    'post',
+    'newsflows-content-time/v1',
+    'newsflows-content-time/v2',
+    false,
+    '2026-08-03T00:00:00.000Z',
+  )
+  check(a !== boundedConfig, 'adding --until must change the config hash')
+
+  const allAuthorsConfig = contentTimeRevalidationConfigSha256(
+    [],
+    '2026-08-01T00:00:00.000Z',
+    'post',
+    'newsflows-content-time/v1',
+    'newsflows-content-time/v2',
+    true,
+  )
+  const emptyActorConfig = contentTimeRevalidationConfigSha256(
+    [],
+    '2026-08-01T00:00:00.000Z',
+    'post',
+    'newsflows-content-time/v1',
+    'newsflows-content-time/v2',
+    false,
+  )
+  check(allAuthorsConfig !== emptyActorConfig, 'all-author and empty-actor scopes must not share a checkpoint hash')
 
   // Table binding
   const engagementConfig = contentTimeRevalidationConfigSha256([], '2026-08-01T00:00:00.000Z', 'engagement')
@@ -381,6 +413,40 @@ console.log('receipt raw-free shape checks passed')
   const bare = parseRevalidateCliArgs([])
   check(bare.packetSha256 === undefined, 'packet-sha256 is optional (only required with --apply, enforced in mainRevalidate)')
   check(bare.maxBatches === undefined, 'max-batches defaults to unlimited (undefined)')
+  check(bare.allAuthors === false, '--all-authors defaults off')
+  check(bare.untilExclusive === undefined, '--until defaults to an unbounded upper window')
+  const bounded = parseRevalidateCliArgs(['--since', '2026-08-01T00:00:00.000Z', '--until', '2026-08-02T00:00:00.000Z'])
+  check(bounded.untilExclusive?.toISOString() === '2026-08-02T00:00:00.000Z', '--until is captured as an exclusive timestamp')
+  validateContentTimeRevalidationWindow(new Date('2026-08-01T00:00:00.000Z'), new Date('2026-08-02T00:00:00.000Z'))
+  check(throws(() => parseRevalidateCliArgs(['--until', 'not-a-date'])), '--until rejects invalid timestamps')
+  check(
+    throws(() => parseRevalidateCliArgs(['--since', '2026-08-02T00:00:00.000Z', '--until', '2026-08-02T00:00:00.000Z'])),
+    '--until must be strictly after --since',
+  )
+  check(
+    throws(() => parseRevalidateCliArgs(['--since', '2026-08-03T00:00:00.000Z', '--until', '2026-08-02T00:00:00.000Z'])),
+    '--until must reject inverted windows',
+  )
+  check(parseRevalidateCliArgs(['--all-authors']).allAuthors === true, '--all-authors enables bounded DB-side author selection')
+  check(
+    throws(() => parseRevalidateCliArgs(['--all-authors', '--actors', 'did:plc:a'])),
+    '--all-authors must reject explicit actor scope',
+  )
+  check(throws(() => parseRevalidateCliArgs(['--table', 'engagement', '--all-authors'])), '--all-authors must reject engagement targets')
+
+  check(
+    throws(() => validateContentTimeRevalidationScope('post', [], false)),
+    'empty post actor scope must fail closed rather than broaden to all authors',
+  )
+  validateContentTimeRevalidationScope('post', [], true)
+  check(
+    throws(() => validateContentTimeRevalidationScope('post', ['did:plc:a'], true)),
+    'all-author scope must reject explicit actors',
+  )
+  check(
+    throws(() => validateContentTimeRevalidationScope('engagement', [], true)),
+    'engagement must reject all-author scope',
+  )
 
   // Preview "may accept it optionally and echo it": a well-formed hash parses through untouched.
   const withPacket = parseRevalidateCliArgs(['--packet-sha256', validSha])

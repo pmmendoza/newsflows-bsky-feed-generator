@@ -113,12 +113,11 @@ grep -Fxq 'forward-2' "$tmp/resume-evidence/coordinator-labels.txt"
   [[ $(migration_targets) == 'post engagement' ]]
   [[ $(migration_target_since post) == "$SINCE_ENGAGEMENT" ]]
   [[ $(migration_target_since engagement) == "$SINCE_ENGAGEMENT" ]]
-  [[ $(migration_snapshot_sql post "$FROM_VERSION") != *'author=ANY('* ]]
+  [[ $(migration_cutoff_sql post) == *'(SELECT max("indexedAt")'* ]]
 )
 
-# Execute the post-switch population freeze with a fake DB. A v2 row arriving
-# during the drain must stop before any canonical denominator is bound; a
-# stable retry must bind the exact snapshot and generated cells.
+# Execute the post-switch population freeze with a fake DB. The single complete
+# bounded preview becomes the denominator; truncation prevents publication.
 (
   export CONTENT_TIME_PACKET_SOURCE_ONLY=1 E="$tmp/freeze-evidence" TREE="$tmp/library-tree" EXPECTED_SHA=x \
     EXPECTED_DIST_SHA256=x EXPECTED_CT_SHA256=x EXPECTED_IMAGE_CT_SHA256=x EXPECTED_TOOL_REFS=x \
@@ -137,67 +136,66 @@ grep -Fxq 'forward-2' "$tmp/resume-evidence/coordinator-labels.txt"
   FTFU1_TEST_MODE=1 MIGRATION_DRAIN_SECONDS=7
   emit() { local name=$1; cat >"$E/$name"; }
   assert_tree() { :; }
-  assert_active_catalog_version() { [[ $1 == newsflows-content-time/v3 ]]; }
+  assert_active_catalog_version() { [[ $1 == newsflows-content-time/v3 || $1 == newsflows-content-time/v2 ]]; }
   latest_control() { echo "$E/pg-control-1.txt"; }
   sleep() { :; }
   psql_ro() {
-    [[ "$*" == *'created_at_source_raw IS NULL'* ]] && { [[ ${INJECT_NULL_AFTER_SCOPE:-0} == 1 && -e "$tmp/scopes-complete" ]] && echo 1 || echo 0; return; }
-    if [[ ${FAIL_SCOPE_ONCE:-0} == 1 && "$*" == *'public.engagement'* && ! -e "$tmp/scope-failed" ]]; then : >"$tmp/scope-failed"; return 9; fi
-    [[ "$*" == *'public.engagement'* ]] && : >"$tmp/scopes-complete"
+    [[ "$*" == *'WITH bounds'* ]] && { printf 'max_from=2026-08-20T00:00:00.000Z|min_to=2026-08-21T00:00:00.000Z|cutoff=2026-08-21T00:00:00.000Z\n'; return; }
+    [[ "$*" == *'created_at_source_raw IS NULL'* ]] && { echo 0; return; }
+    [[ "$*" == *'SELECT count(*) FROM public.'* ]] && { echo 0; return; }
     printf 'from_in_horizon|1\nfrom_outside_horizon|0\nfrom_total|1\nto_in_horizon|0\n'
   }
-  psql_copy() {
-    local sql=$1 target=engagement state n rows=1
-    [[ "$sql" == *'public.post'* ]] && target=post
-    state="$tmp/$target-calls"; n=$(cat "$state" 2>/dev/null || echo 0); n=$((n+1)); echo "$n" >"$state"
-    [[ $target == post && ${INJECT_V2:-0} == 1 && $n -ge 2 ]] && rows=2
-    [[ $target == post && ${INJECT_V2:-0} == 0 ]] && rows=2
-    [[ $target == post && ${INJECT_AFTER_SCOPE:-0} == 1 && -e "$tmp/scopes-complete" ]] && rows=3
-    for i in $(seq 1 "$rows"); do printf 'uri-%s-%s\tauthor\t2026-08-20T00:00:00.000Z\t2026-08-20T00:00:00.000Z\t2026-08-20T00:00:00.000Z\tsource_valid\t\tnewsflows-content-time/v2\t31\n' "$target" "$i"; done
-  }
   migration_preview_one() {
-    local out=$1 target=$2 actors=${5:-} n=1
-    [[ $target == post && -z $actors ]] && n=2
-    printf '{"preview":{"scanned":%s,"counts":{"v2_valid_to_v3_valid":%s,"v2_skew_to_v3_clamped":0,"v2_invalid_to_v3_clamped":0,"v2_to_v3_invalid":0,"gt_5m_restored":0,"zero_to_5m_clamped":0}}}\n' "$n" "$n" >"$E/$out.json"
+    local out=$1 target=$2 actors=${5:-} n=1 truncated=${INJECT_TRUNCATED:-false}
+    [[ -z $actors ]] && n=2
+    printf '{"preview":{"scanned":%s,"truncated":%s,"counts":{"v2_valid_to_v3_valid":%s,"v2_skew_to_v3_clamped":0,"v2_invalid_to_v3_clamped":0,"v2_to_v3_invalid":0,"gt_5m_restored":0,"zero_to_5m_clamped":0}}}\n' "$n" "$truncated" "$n" >"$E/$out.json"
     echo "$E/$out.json"
   }
-  export INJECT_V2=1
+  export INJECT_TRUNCATED=true
   set +e; ( cmd_migrate_freeze ) >/dev/null 2>&1; rc=$?; set -e
   [[ $rc == 2 && ! -e "$E/migrate-stable-population.txt" ]]
-  rm -f "$tmp/post-calls" "$tmp/engagement-calls"; export INJECT_V2=0 FAIL_SCOPE_ONCE=1
-  set +e; ( cmd_migrate_freeze ) >/dev/null 2>&1; publish_rc=$?; set -e
-  [[ $publish_rc != 0 && -s "$E/migrate-freeze-post-scope-2.tsv" && ! -e "$E/migrate-stable-population.txt" ]]
-  rm -f "$tmp/post-calls" "$tmp/engagement-calls" "$tmp/scopes-complete"; export FAIL_SCOPE_ONCE=0 INJECT_AFTER_SCOPE=1
-  set +e; ( cmd_migrate_freeze ) >/dev/null 2>&1; late_rc=$?; set -e
-  [[ $late_rc == 2 && ! -e "$E/migrate-stable-population.txt" ]]
-  rm -f "$tmp/post-calls" "$tmp/engagement-calls" "$tmp/scopes-complete"; export INJECT_AFTER_SCOPE=0 INJECT_NULL_AFTER_SCOPE=1
-  set +e; ( cmd_migrate_freeze ) >/dev/null 2>&1; null_rc=$?; set -e
-  [[ $null_rc == 2 && ! -e "$E/migrate-stable-population.txt" ]]
-  rm -f "$tmp/post-calls" "$tmp/engagement-calls" "$tmp/scopes-complete"; export INJECT_NULL_AFTER_SCOPE=0
+  export INJECT_TRUNCATED=false
   cmd_migrate_freeze >/dev/null
-  [[ $(migration_stable_attempt) == 5 ]]
-  (( $(wc -l <"$(migration_prestate_file post)") == 2 ))
+  [[ $(migration_stable_attempt) == 2 ]]
+  grep -Fxq 'post_rows=2' "$E/migrate-stable-population.txt"
+  grep -Fxq 'engagement_rows=2' "$E/migrate-stable-population.txt"
   grep -Fq 'v2_valid_to_v3_valid=2' <(migration_prereg_spec post)
-  grep -Fq 'v2_valid_to_v3_valid=1' <(migration_prereg_spec engagement)
+  grep -Fq 'v2_valid_to_v3_valid=2' <(migration_prereg_spec engagement)
   grep -Fq 'v2_valid_to_v3_valid=1' <(migration_cells "$(migration_ir_preview_file)")
   grep -Fxq 'drain_seconds=7' "$E/migrate-stable-population.txt"
+
+  # Rollback resumes against remaining cells/rows: post can already be complete
+  # while engagement has only a partial receipt.
   migration_preview_one() {
-    local out=$1 target=$2 actors=${5:-} n=1
-    [[ $target == post && -z $actors ]] && n=$(migration_remaining_rows post)
-    [[ $target == engagement ]] && n=$(migration_remaining_rows engagement)
-    printf '{"preview":{"scanned":%s,"counts":{"v2_valid_to_v3_valid":%s,"v2_skew_to_v3_clamped":0,"v2_invalid_to_v3_clamped":0,"v2_to_v3_invalid":0,"gt_5m_restored":0,"zero_to_5m_clamped":0}}}\n' "$n" "$n" >"$E/$out.json"
+    local out=$1 target=$2 from=$3 n
+    if [[ $from == "$TO_VERSION" ]]; then
+      if [[ -s "$E/rollback-$target-preview.json" ]]; then n=$(rollback_remaining_rows "$target"); else n=2; fi
+      printf '{"preview":{"scanned":%s,"truncated":false,"counts":{"v3_valid_to_v2_valid":%s,"v3_clamped_to_v2_valid":0,"v3_clamped_to_v2_invalid":0,"v3_to_v2_invalid":0,"gt_5m_invalidated":0,"zero_to_5m_unclamped":0}}}\n' "$n" "$n" >"$E/$out.json"
+    else
+      n=2
+      printf '{"preview":{"scanned":%s,"truncated":false,"counts":{"v2_valid_to_v3_valid":%s,"v2_skew_to_v3_clamped":0,"v2_invalid_to_v3_clamped":0,"v2_to_v3_invalid":0,"gt_5m_restored":0,"zero_to_5m_clamped":0}}}\n' "$n" "$n" >"$E/$out.json"
+    fi
     echo "$E/$out.json"
   }
   migration_apply_one() {
-    local target=$1 label=$2 updated=0 complete=true
-    case "$label/$target" in forward-1/post) updated=1; complete=false;; forward-1/engagement) updated=1;; forward-2/post) updated=1;; esac
-    printf '{"revalidation":{"updated":%s,"complete":%s,"counts":{"v2_valid_to_v3_valid":%s,"v2_skew_to_v3_clamped":0,"v2_invalid_to_v3_clamped":0,"v2_to_v3_invalid":0,"gt_5m_restored":0,"zero_to_5m_clamped":0}}}\n' "$updated" "$complete" "$updated" >"$E/migrate-$target-apply-$label.json"
+    local target=$1 label=$2 updated complete
+    case "$label/$target" in
+      reverse-1/post) updated=2; complete=true;;
+      reverse-1/engagement) updated=1; complete=false;;
+      reverse-2/engagement) updated=1; complete=true;;
+      *) echo "unexpected rollback apply $label/$target" >&2; return 2;;
+    esac
+    printf '{"revalidation":{"updated":%s,"skipped_cas":0,"complete":%s,"counts":{"v3_valid_to_v2_valid":%s,"v3_clamped_to_v2_valid":0,"v3_clamped_to_v2_invalid":0,"v3_to_v2_invalid":0,"gt_5m_invalidated":0,"zero_to_5m_unclamped":0}}}\n' "$updated" "$complete" "$updated" >"$E/rollback-$target-apply-$label.json"
   }
-  cmd_migrate_apply forward-1
-  [[ $(migration_remaining_rows post) == 1 && $(migration_remaining_rows engagement) == 0 ]]
-  cmd_migrate_apply forward-2
-  [[ $(migration_remaining_rows post) == 0 && $(migration_remaining_rows engagement) == 0 ]]
-  grep -q '"complete":true' "$E/migrate-post-apply-forward-2.json"
+  cmd_migrate_rollback dry-run
+  set +e; cmd_migrate_rollback apply reverse-1; partial_rc=$?; set -e
+  [[ $partial_rc == 3 ]]
+  [[ $(rollback_remaining_rows post) == 0 && $(rollback_remaining_rows engagement) == 1 ]]
+  [[ $(rollback_remaining_spec engagement) == *'v3_valid_to_v2_valid=1'* ]]
+  cmd_migrate_rollback apply reverse-2
+  [[ $(rollback_remaining_rows post) == 0 && $(rollback_remaining_rows engagement) == 0 ]]
+  [[ ! -e "$E/rollback-post-apply-reverse-2.json" ]]
+  grep -Fxq 'restored_rows=2' "$E/rollback-engagement-diff-1.txt"
 )
 
 mock=$tmp/mock; mkdir "$mock" "$tmp/evidence"

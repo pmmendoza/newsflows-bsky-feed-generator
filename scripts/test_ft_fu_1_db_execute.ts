@@ -169,6 +169,7 @@ async function main() {
 
     // 3. Post forward (v2->v3) and reverse (v3->v2) revalidation
     const since = new Date('2026-08-01T00:00:00Z')
+    const untilExclusive = new Date('2026-08-13T00:00:00.000Z')
 
     // Seed post rows
     // a. normal valid past
@@ -221,6 +222,7 @@ async function main() {
       table: 'post',
       actors: [PUBLISHER_A],
       since,
+      untilExclusive,
       fromVersion: CONTENT_TIME_VALIDATOR_VERSION_V2,
       toVersion: CONTENT_TIME_VALIDATOR_VERSION_V3,
       batchSize: 500,
@@ -236,11 +238,27 @@ async function main() {
     assert.equal(forwardPostResult.counts.v2_valid_to_v3_valid, 1)
     assert.deepEqual(forwardPostResult.counts.by_invalid_reason, {}, 'clamped valid rows must not appear in invalid reasons')
 
+    // A native v3 row at the exclusive cutoff is outside the migrated cohort.
+    await sql`
+      INSERT INTO public.post (
+        uri, cid, "indexedAt", "createdAt", author, text, "rootUri", "rootCid",
+        link_uri, link_title, link_description, "linkUrl", "linkTitle", "linkDescription",
+        created_at_source_raw, content_time_utc, content_time_status,
+        content_time_clamp_reason, content_time_validator_version
+      ) VALUES (
+        ${uri(PUBLISHER_A, 'native-v3-after-cutoff')}, 'cid-native', ${untilExclusive.toISOString()}, '2026-08-12T23:59:00.000Z',
+        ${PUBLISHER_A}, 'test', '', '', '', '', '', '', '', '',
+        ${Buffer.from('2026-08-12T23:59:00.000Z', 'utf8')}, '2026-08-12T23:59:00.000Z', 'source_valid',
+        null, ${CONTENT_TIME_VALIDATOR_VERSION_V3}
+      )
+    `.execute(db)
+
     // Run reverse post revalidation v3 -> v2
     const reversePostResult = await runContentTimeRevalidation(db, {
       table: 'post',
       actors: [PUBLISHER_A],
       since,
+      untilExclusive,
       fromVersion: CONTENT_TIME_VALIDATOR_VERSION_V3,
       toVersion: CONTENT_TIME_VALIDATOR_VERSION_V2,
       batchSize: 500,
@@ -255,6 +273,12 @@ async function main() {
     assert.equal(reversePostResult.counts.gt_5m_invalidated, 1)
     assert.equal(reversePostResult.counts.v3_valid_to_v2_valid, 1)
     assert.equal(reversePostResult.counts.by_invalid_reason.future_skew, 1)
+    const nativeVersion = (await sql<{ version: string }>`
+      SELECT content_time_validator_version AS version
+      FROM public.post
+      WHERE uri = ${uri(PUBLISHER_A, 'native-v3-after-cutoff')}
+    `.execute(db)).rows[0].version
+    assert.equal(nativeVersion, CONTENT_TIME_VALIDATOR_VERSION_V3, 'rollback must leave native rows at/after the cutoff untouched')
 
     // 4. Engagement forward (v2->v3) and reverse (v3->v2) revalidation
     await sql`

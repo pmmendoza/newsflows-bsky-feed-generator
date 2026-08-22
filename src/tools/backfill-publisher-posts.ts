@@ -1074,7 +1074,11 @@ export type ContentTimeRevalidationCheckpoint = ContentTimeRevalidationProgress 
 export type ContentTimeRevalidationOptions = {
   table?: 'post' | 'engagement'
   actors?: string[]
+  /** Explicitly select every author in the bounded time window (post only). */
+  allAuthors?: boolean
   since: Date
+  /** Exclusive receipt-time upper bound; immutable when resuming. */
+  untilExclusive?: Date
   fromVersion?: string
   toVersion?: string
   batchSize: number
@@ -1098,15 +1102,48 @@ export function contentTimeRevalidationConfigSha256(
   table: 'post' | 'engagement' = 'post',
   fromVersion: string = CONTENT_TIME_VALIDATOR_VERSION_V1,
   toVersion: string = CONTENT_TIME_VALIDATOR_VERSION_V2,
+  allAuthors: boolean = false,
+  untilExclusiveIso?: string,
 ): string {
   const sortedActors = table === 'post' ? [...new Set(actors)].sort() : []
-  return sha256(JSON.stringify({
+  const payload = {
     table,
     actors: sortedActors,
     since: sinceIso,
     from_validator_version: fromVersion,
     to_validator_version: toVersion,
-  }))
+    ...(allAuthors ? { all_authors: true } : {}),
+    ...(untilExclusiveIso ? { until_exclusive: untilExclusiveIso } : {}),
+  }
+  return sha256(JSON.stringify(payload))
+}
+
+export function validateContentTimeRevalidationWindow(since: Date, untilExclusive?: Date): void {
+  if (Number.isNaN(since.getTime())) throw new Error('since must be a valid timestamp')
+  if (untilExclusive !== undefined) {
+    if (Number.isNaN(untilExclusive.getTime())) throw new Error('untilExclusive must be a valid timestamp')
+    if (untilExclusive.getTime() <= since.getTime()) {
+      throw new Error('untilExclusive must be strictly after since')
+    }
+  }
+}
+
+/** Keep programmatic callers from accidentally widening an empty post scope. */
+export function validateContentTimeRevalidationScope(
+  table: 'post' | 'engagement',
+  actors: string[],
+  allAuthors: boolean,
+): void {
+  if (table === 'post') {
+    if (allAuthors && actors.length > 0) {
+      throw new Error('allAuthors cannot be combined with actors')
+    }
+    if (!allAuthors && actors.length === 0) {
+      throw new Error('post revalidation requires non-empty actors or allAuthors=true')
+    }
+  } else if (allAuthors) {
+    throw new Error('allAuthors is only valid with table=post')
+  }
 }
 
 type RevalidationSelectRow = {
@@ -1122,7 +1159,9 @@ async function selectRevalidationBatch(
   db: Database,
   table: 'post' | 'engagement',
   actors: string[],
+  allAuthors: boolean,
   sinceIso: string,
+  untilExclusiveIso: string | undefined,
   fromVersion: string,
   afterAuthor: string,
   afterUri: string,
@@ -1130,12 +1169,15 @@ async function selectRevalidationBatch(
   forUpdate: boolean,
 ): Promise<RevalidationSelectRow[]> {
   if (table === 'post') {
+    const authorPredicate = allAuthors ? sql`TRUE` : sql`author = ANY(${actors}::text[])`
+    const untilPredicate = untilExclusiveIso ? sql`"indexedAt" < ${untilExclusiveIso}` : sql`TRUE`
     return forUpdate
       ? (await sql<RevalidationSelectRow>`
           SELECT uri, author, "indexedAt", created_at_source_raw, content_time_status, content_time_clamp_reason
           FROM public.post
-          WHERE author = ANY(${actors}::text[])
+          WHERE ${authorPredicate}
             AND "indexedAt" >= ${sinceIso}
+            AND ${untilPredicate}
             AND content_time_validator_version = ${fromVersion}
             AND (author, uri) > (${afterAuthor}, ${afterUri})
           ORDER BY author, uri
@@ -1145,19 +1187,22 @@ async function selectRevalidationBatch(
       : (await sql<RevalidationSelectRow>`
           SELECT uri, author, "indexedAt", created_at_source_raw, content_time_status, content_time_clamp_reason
           FROM public.post
-          WHERE author = ANY(${actors}::text[])
+          WHERE ${authorPredicate}
             AND "indexedAt" >= ${sinceIso}
+            AND ${untilPredicate}
             AND content_time_validator_version = ${fromVersion}
             AND (author, uri) > (${afterAuthor}, ${afterUri})
           ORDER BY author, uri
           LIMIT ${limit}
         `.execute(db)).rows
   } else {
+    const untilPredicate = untilExclusiveIso ? sql`"indexedAt" < ${untilExclusiveIso}` : sql`TRUE`
     return forUpdate
       ? (await sql<RevalidationSelectRow>`
           SELECT uri, author, "indexedAt", created_at_source_raw, content_time_status, content_time_clamp_reason
           FROM public.engagement
           WHERE "indexedAt" >= ${sinceIso}
+            AND ${untilPredicate}
             AND content_time_validator_version = ${fromVersion}
             AND uri > ${afterUri}
           ORDER BY uri
@@ -1168,6 +1213,7 @@ async function selectRevalidationBatch(
           SELECT uri, author, "indexedAt", created_at_source_raw, content_time_status, content_time_clamp_reason
           FROM public.engagement
           WHERE "indexedAt" >= ${sinceIso}
+            AND ${untilPredicate}
             AND content_time_validator_version = ${fromVersion}
             AND uri > ${afterUri}
           ORDER BY uri
@@ -1192,7 +1238,9 @@ async function applyRevalidationBatch(
   db: Database,
   table: 'post' | 'engagement',
   actors: string[],
+  allAuthors: boolean,
   sinceIso: string,
+  untilExclusiveIso: string | undefined,
   fromVersion: string,
   toVersion: string,
   afterAuthor: string,
@@ -1215,7 +1263,7 @@ async function applyRevalidationBatch(
              pg_total_relation_size(${tableName})::text AS relation_bytes
     `.execute(trx)).rows[0]
 
-    const rows = await selectRevalidationBatch(trx, table, actors, sinceIso, fromVersion, afterAuthor, afterUri, batchSize, true)
+    const rows = await selectRevalidationBatch(trx, table, actors, allAuthors, sinceIso, untilExclusiveIso, fromVersion, afterAuthor, afterUri, batchSize, true)
     if (rows.length === 0) {
       return {
         candidates: 0,
@@ -1351,9 +1399,8 @@ export async function runContentTimeRevalidation(
     throw new Error('packetSha256 must be a lowercase SHA-256')
   }
   const actors = options.actors ? [...new Set(options.actors)].sort() : []
-  if (table === 'post' && actors.length === 0) {
-    throw new Error('content-time revalidation for post table requires at least one publisher DID')
-  }
+  const allAuthors = options.allAuthors === true
+  validateContentTimeRevalidationScope(table, actors, allAuthors)
   if (!Number.isInteger(options.batchSize) || options.batchSize < 1 || options.batchSize > REVALIDATION_LIMITS.batchSize) {
     throw new Error(`batchSize must be an integer from 1 to ${REVALIDATION_LIMITS.batchSize}`)
   }
@@ -1371,11 +1418,13 @@ export async function runContentTimeRevalidation(
     throw new Error('maxBatches must be a positive integer')
   }
 
+  validateContentTimeRevalidationWindow(options.since, options.untilExclusive)
   const sinceIso = options.since.toISOString()
-  const configSha256 = contentTimeRevalidationConfigSha256(actors, sinceIso, table, fromVersion, toVersion)
+  const untilExclusiveIso = options.untilExclusive?.toISOString()
+  const configSha256 = contentTimeRevalidationConfigSha256(actors, sinceIso, table, fromVersion, toVersion, allAuthors, untilExclusiveIso)
   if (options.afterAuthor || options.afterUri) {
     if (options.configSha256 !== configSha256) {
-      throw new Error('checkpoint does not match the immutable revalidation config (actors, since, table, or validator versions changed)')
+      throw new Error('checkpoint does not match the immutable revalidation config (actors, time window, table, or validator versions changed)')
     }
   }
 
@@ -1409,7 +1458,9 @@ export async function runContentTimeRevalidation(
       db,
       table,
       actors,
+      allAuthors,
       sinceIso,
+      untilExclusiveIso,
       fromVersion,
       toVersion,
       cursorAuthor,
@@ -1512,10 +1563,15 @@ export async function previewContentTimeRevalidation(
   table: 'post' | 'engagement' = 'post',
   fromVersion: string = CONTENT_TIME_VALIDATOR_VERSION_V1,
   toVersion: string = CONTENT_TIME_VALIDATOR_VERSION_V2,
+  allAuthors: boolean = false,
+  untilExclusive?: Date,
 ): Promise<{ scanned: number; counts: ContentTimeRevalidationCounts; truncated: boolean }> {
   validateRevalidationTransition(fromVersion, toVersion)
   const sortedActors = table === 'post' ? [...new Set(actors)].sort() : []
+  validateContentTimeRevalidationScope(table, sortedActors, allAuthors)
+  validateContentTimeRevalidationWindow(since, untilExclusive)
   const sinceIso = since.toISOString()
+  const untilExclusiveIso = untilExclusive?.toISOString()
   let cursorAuthor = ''
   let cursorUri = ''
   let scanned = 0
@@ -1528,7 +1584,9 @@ export async function previewContentTimeRevalidation(
       db,
       table,
       sortedActors,
+      allAuthors,
       sinceIso,
+      untilExclusiveIso,
       fromVersion,
       cursorAuthor,
       cursorUri,
@@ -1752,7 +1810,9 @@ export type RevalidateCliOptions = {
   fromVersion: string
   toVersion: string
   actors?: string[]
+  allAuthors: boolean
   since: Date
+  untilExclusive?: Date
   apply: boolean
   json: boolean
   dbUrl?: string
@@ -1767,6 +1827,7 @@ export function parseRevalidateCliArgs(argv: string[]): RevalidateCliOptions {
   const flags = new Map<string, string[]>()
   let apply = false
   let json = false
+  let allAuthors = false
 
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i]
@@ -1782,6 +1843,10 @@ export function parseRevalidateCliArgs(argv: string[]): RevalidateCliOptions {
       json = true
       continue
     }
+    if (arg === '--all-authors') {
+      allAuthors = true
+      continue
+    }
     if (!arg.startsWith('--')) throw new Error(`Unexpected positional argument: ${arg}`)
     const value = argv[i + 1]
     if (!value || value.startsWith('--')) throw new Error(`Missing value for ${arg}`)
@@ -1795,6 +1860,9 @@ export function parseRevalidateCliArgs(argv: string[]): RevalidateCliOptions {
     throw new Error('--table must be post or engagement')
   }
   const table = tableRaw as 'post' | 'engagement'
+  if (allAuthors && table !== 'post') {
+    throw new Error('--all-authors is only valid with --table post')
+  }
 
   const fromVersion = flags.get('from-version')?.at(-1) || CONTENT_TIME_VALIDATOR_VERSION_V1
   const toVersion = flags.get('to-version')?.at(-1) || CONTENT_TIME_VALIDATOR_VERSION_V2
@@ -1805,10 +1873,17 @@ export function parseRevalidateCliArgs(argv: string[]): RevalidateCliOptions {
     ...splitCsv(flags.get('actors')?.join(',')),
     ...splitCsv(flags.get('dids')?.join(',')),
   ]
+  if (allAuthors && actorsCsv.length > 0) {
+    throw new Error('--all-authors cannot be combined with --actors or --dids')
+  }
 
   const sinceRaw = flags.get('since')?.at(-1)
   const since = sinceRaw ? new Date(sinceRaw) : new Date(Date.now() - 14 * 24 * 60 * 60 * 1000)
   if (isNaN(since.getTime())) throw new Error('--since must be an ISO timestamp')
+  const untilRaw = flags.get('until')?.at(-1)
+  const untilExclusive = untilRaw ? new Date(untilRaw) : undefined
+  if (untilRaw && Number.isNaN(untilExclusive!.getTime())) throw new Error('--until must be an ISO timestamp')
+  validateContentTimeRevalidationWindow(since, untilExclusive)
 
   const maxPreviewRows = Number.parseInt(flags.get('max-preview-rows')?.at(-1) || '50000', 10)
   if (!Number.isInteger(maxPreviewRows) || maxPreviewRows < 1) {
@@ -1843,7 +1918,9 @@ export function parseRevalidateCliArgs(argv: string[]): RevalidateCliOptions {
     fromVersion,
     toVersion,
     actors: actorsCsv.length ? actorsCsv : undefined,
+    allAuthors,
     since,
+    untilExclusive,
     apply,
     json,
     dbUrl: flags.get('db-url')?.at(-1) || process.env.FEEDGEN_POSTGRES_URL,
@@ -1867,7 +1944,7 @@ export function readRevalidationCheckpoint(
     checkpoint.packet_sha256 !== packetSha256 ||
     typeof checkpoint.cursor_uri !== 'string'
   ) {
-    throw new Error('checkpoint does not match the approved revalidation packet (actors, since, table, validator versions, or packet-sha256 changed)')
+    throw new Error('checkpoint does not match the approved revalidation packet (actors, time window, table, validator versions, or packet-sha256 changed)')
   }
   return {
     cursorAuthor: typeof checkpoint.cursor_author === 'string' ? checkpoint.cursor_author : '',
@@ -1886,10 +1963,12 @@ async function mainRevalidate(argv: string[]) {
   try {
     let actors: string[] = []
     if (options.table === 'post') {
-      actors = options.actors && options.actors.length
+      actors = options.allAuthors
+        ? []
+        : options.actors && options.actors.length
         ? [...new Set(options.actors)].sort()
         : (await resolvePublisherDids(db)).sort()
-      if (!actors.length) {
+      if (!options.allAuthors && !actors.length) {
         throw new Error('no enabled publisher DIDs resolved from feedgen_ops.feed_catalog; pass --actors explicitly')
       }
     }
@@ -1908,6 +1987,8 @@ async function mainRevalidate(argv: string[]) {
         options.table,
         options.fromVersion,
         options.toVersion,
+        options.allAuthors,
+        options.untilExclusive?.toISOString(),
       )
       const checkpoint = readRevalidationCheckpoint(options.checkpointFile, configSha256, options.packetSha256)
       const deadlineMs = startedAt + REVALIDATION_LIMITS.maxDurationMs
@@ -1916,7 +1997,9 @@ async function mainRevalidate(argv: string[]) {
       revalidation = await runContentTimeRevalidation(db, {
         table: options.table,
         actors,
+        allAuthors: options.allAuthors,
         since: options.since,
+        untilExclusive: options.untilExclusive,
         fromVersion: options.fromVersion,
         toVersion: options.toVersion,
         batchSize: REVALIDATION_LIMITS.batchSize,
@@ -1943,6 +2026,8 @@ async function mainRevalidate(argv: string[]) {
         options.table,
         options.fromVersion,
         options.toVersion,
+        options.allAuthors,
+        options.untilExclusive,
       )
     }
 
@@ -1950,9 +2035,11 @@ async function mainRevalidate(argv: string[]) {
       operation: 'content-time-revalidate',
       mode: options.apply ? 'apply' : 'dry-run',
       table: options.table,
+      all_authors: options.allAuthors,
       actor_count: actors.length,
       actor_sha256: actors.map(sha256).sort(),
       since: options.since.toISOString(),
+      until_exclusive: options.untilExclusive?.toISOString() ?? null,
       from_validator_version: options.fromVersion,
       to_validator_version: options.toVersion,
       packet_sha256: options.packetSha256 ?? null,
