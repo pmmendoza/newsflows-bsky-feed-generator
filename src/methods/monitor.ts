@@ -1345,6 +1345,18 @@ export default function registerMonitorEndpoints(server: Server, ctx: AppContext
           : targetMode === 'non_publisher'
             ? buildAtUriDidMembershipFilter(sql`p."rootUri"`, publisherDids, false)
             : sql<boolean>`true`
+      const postSource =
+        !validityCohort && contentTime && contractVersion === 'newsflows-content-time/v3' && targetMode === 'publisher'
+          ? sql`(
+              -- OFFSET 0 is an intentional planner barrier: narrow by the
+              -- publisher-root index before applying the v2/v3 contract filter.
+              SELECT p0.* FROM post p0
+              WHERE p0."rootUri" != ''
+                AND p0.content_time_status = 'source_valid'
+                AND (${buildAtUriDidMembershipFilter(sql`p0."rootUri"`, publisherDids, true)})
+              OFFSET 0
+            ) p`
+          : sql`post p`
 
       const engagementEventTime = contentTime ? effectiveContentTimeSql('e', contractVersion, true) : sql`e."createdAt"`
       const postEventTime = contentTime ? effectiveContentTimeSql('p', contractVersion, false) : sql`p."createdAt"`
@@ -1425,7 +1437,7 @@ export default function registerMonitorEndpoints(server: Server, ctx: AppContext
             ${postSemanticIncompatible} AS semantic_incompatible,
             ${postContractEligible} AS contract_eligible,
             (${subscriberActorExpr(sql`p.author`)}) AS is_subscriber_actor
-          FROM post p
+          FROM ${postSource}
           ${postJoin}
           WHERE
             p."rootUri" != ''

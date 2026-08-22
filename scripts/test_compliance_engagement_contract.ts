@@ -126,6 +126,8 @@ async function main() {
     check(!Object.prototype.hasOwnProperty.call(payload, 'publisher_time_transition_expires_at'), 'response must not advertise retired expiry authority')
 
     check(queries.some((text) => text.includes("content_time_status = 'source_valid'") && text.includes('content_time_utc')), 'event SQL must enforce valid content time')
+    const v3EventQuery = queries.find((text) => text.includes('p0.* FROM post p0'))
+    check(v3EventQuery !== undefined && v3EventQuery.includes('OFFSET 0'), 'v3 publisher comment query must narrow by publisher before contract filtering')
     const validityQuery = queries.find((text) => text.includes('FROM candidates'))
     check(validityQuery !== undefined && validityQuery.includes('e."indexedAt"') && validityQuery.includes('p."indexedAt"'), 'validity denominator must use bounded receipt time')
     check(!validityQuery.includes('"indexedAt")::timestamptz'), 'validity receipt-time bounds must not cast indexed columns')
