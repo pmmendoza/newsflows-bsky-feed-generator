@@ -322,7 +322,14 @@ cmd_apply() {
   { echo '01 catalog-sync forward'; echo '02 feedgen sync packet gate'; echo '03 exact-six bulk v2->v3'; echo '04 drain and bind stable v2 semantic-delta population'; echo '05 affected post rows'; echo '06 engagement projection (no historical writes)'; } | emit apply-order.txt
   complete_timer_window
 }
-cmd_revalidate() { assert_bindings; active_version_gate "$V3"; fence_timers; KEEP_TIMERS_FENCED_ON_EXIT=1; [[ -f $E/migrate-stable-population.txt ]] || revalidate_runner migrate-freeze; revalidate_runner migrate-stable-check; forward_to_completion; complete_timer_window; }
+cmd_revalidate() {
+  local attempt=1
+  while [[ -e "$E/timer-prestate-revalidate-resume-$attempt.tsv" ]]; do attempt=$((attempt+1)); done
+  TIMER_STATE_LABEL="resume-$attempt"
+  assert_bindings; active_version_gate "$V3"; fence_timers; KEEP_TIMERS_FENCED_ON_EXIT=1
+  [[ -f $E/migrate-stable-population.txt ]] || revalidate_runner migrate-freeze
+  revalidate_runner migrate-stable-check; forward_to_completion; complete_timer_window
+}
 cmd_normalize_overlap() {
   local label=${2:?unique label is required} maxb=${3:-}
   [[ ${ALLOW_FTFU1_OVERLAP_NORMALIZATION:-0} == 1 ]] || die 'set ALLOW_FTFU1_OVERLAP_NORMALIZATION=1 for the explicit continuation path'
