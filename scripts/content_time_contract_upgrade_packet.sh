@@ -62,13 +62,27 @@ cleanup() { local rc=$?; trap - EXIT INT TERM HUP; restore_timers || { log 'time
 trap cleanup EXIT INT TERM HUP
 
 fence_timers() {
-  local unit state tmp
+  local unit service state enabled service_state tmp i
+  local -a timers services
+  IFS=',' read -r -a timers <<<"$TIMER_UNITS"
+  IFS=',' read -r -a services <<<"$SERVICE_UNITS"
+  [[ ${ALLOW_PRE_FENCED_TIMERS:-0} == 0 || ${ALLOW_PRE_FENCED_TIMERS:-0} == 1 ]] || die 'ALLOW_PRE_FENCED_TIMERS must be 0 or 1'
+  [[ ${ALLOW_PRE_FENCED_TIMERS:-0} == 0 || ${#timers[@]} == "${#services[@]}" ]] || die 'timer/service unit counts differ'
   tmp=$(mktemp)
-  while IFS= read -r unit; do
+  for i in "${!timers[@]}"; do
+    unit=${timers[$i]}
     state=$(systemctl is-active "$unit" 2>/dev/null || true)
-    [[ $state == active ]] || die "$unit is $state before fencing (expected active)"
+    if [[ $state == inactive && ${ALLOW_PRE_FENCED_TIMERS:-0} == 1 ]]; then
+      service=${services[$i]}
+      enabled=$(systemctl is-enabled "$unit" 2>/dev/null || true)
+      service_state=$(systemctl is-active "$service" 2>/dev/null || true)
+      [[ $enabled == enabled ]] || die "$unit is inactive but $enabled (expected enabled)"
+      [[ $service_state == inactive ]] || die "$unit is inactive but $service is $service_state (expected inactive)"
+    else
+      [[ $state == active ]] || die "$unit is $state before fencing (expected active)"
+    fi
     printf '%s|%s\n' "$unit" "$state" >>"$tmp"
-  done < <(split_csv "$TIMER_UNITS")
+  done
   emit "timer-prestate-$COMMAND.tsv" <"$tmp"; rm -f "$tmp"
   TIMERS_FENCED=1
   while IFS= read -r unit; do sudo -n systemctl stop "$unit"; done < <(split_csv "$TIMER_UNITS")

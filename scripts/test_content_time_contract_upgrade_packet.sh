@@ -205,8 +205,17 @@ echo "$*" >>"$MOCK_LOG"
 SH
 cat >"$mock/systemctl" <<'SH'
 #!/usr/bin/env bash
+listed() { [[ ",${1:-}," == *",$2,"* ]]; }
 case "$1" in
-  is-active) [[ $(grep -E "^(stop|start) $2$" "$MOCK_LOG" 2>/dev/null | tail -1) == "stop $2" ]] && echo inactive || echo active;;
+  is-active)
+    action=$(grep -E "^(stop|start) $2$" "$MOCK_LOG" 2>/dev/null | tail -1 | cut -d' ' -f1)
+    if [[ $action == stop ]]; then echo inactive
+    elif [[ $action == start ]]; then echo active
+    elif listed "${MOCK_INITIAL_INACTIVE:-}" "$2" || [[ $2 == *.service ]]; then echo inactive
+    else echo active
+    fi
+    ;;
+  is-enabled) listed "${MOCK_DISABLED:-}" "$2" && echo disabled || echo enabled;;
   stop|start) echo "$1 $2" >>"$MOCK_LOG";;
 esac
 SH
@@ -219,5 +228,26 @@ set -e
 [[ $rc != 0 ]]
 grep -Fxq 'start one.timer' "$MOCK_LOG"
 grep -Fxq 'start two.timer' "$MOCK_LOG"
+
+# Inactive timers remain fail-closed unless the continuation opt-in proves the
+# timer enabled and its corresponding service inactive.
+for scenario in default accepted disabled active-service; do mkdir "$tmp/evidence-$scenario"; done
+set +e
+PATH="$mock:$PATH" MOCK_LOG="$tmp/default.log" MOCK_INITIAL_INACTIVE=one.timer,one.worker FTFU1_TEST_MODE=1 E="$tmp/evidence-default" \
+  TIMER_UNITS=one.timer SERVICE_UNITS=one.worker bash "$packet" test-timer-restore >/dev/null 2>&1
+default_rc=$?
+PATH="$mock:$PATH" MOCK_LOG="$tmp/accepted.log" MOCK_INITIAL_INACTIVE=one.timer,one.worker ALLOW_PRE_FENCED_TIMERS=1 FTFU1_TEST_MODE=1 E="$tmp/evidence-accepted" \
+  TIMER_UNITS=one.timer SERVICE_UNITS=one.worker bash "$packet" test-timer-restore >/dev/null 2>&1
+accepted_rc=$?
+PATH="$mock:$PATH" MOCK_LOG="$tmp/disabled.log" MOCK_INITIAL_INACTIVE=one.timer,one.worker MOCK_DISABLED=one.timer ALLOW_PRE_FENCED_TIMERS=1 FTFU1_TEST_MODE=1 E="$tmp/evidence-disabled" \
+  TIMER_UNITS=one.timer SERVICE_UNITS=one.worker bash "$packet" test-timer-restore >/dev/null 2>&1
+disabled_rc=$?
+PATH="$mock:$PATH" MOCK_LOG="$tmp/active-service.log" MOCK_INITIAL_INACTIVE=one.timer ALLOW_PRE_FENCED_TIMERS=1 FTFU1_TEST_MODE=1 E="$tmp/evidence-active-service" \
+  TIMER_UNITS=one.timer SERVICE_UNITS=one.worker bash "$packet" test-timer-restore >/dev/null 2>&1
+active_service_rc=$?
+set -e
+[[ $default_rc == 2 && $accepted_rc == 1 && $disabled_rc == 2 && $active_service_rc == 2 ]]
+grep -Fxq 'one.timer|inactive' "$tmp/evidence-accepted/timer-prestate-test-timer-restore.tsv"
+if grep -Fxq 'start one.timer' "$tmp/accepted.log"; then exit 1; fi
 rm -rf "$tmp"
 echo 'content-time contract upgrade packet ok'
