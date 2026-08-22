@@ -20,6 +20,8 @@ must 'ALLOW_FTFU1_OVERLAP_NORMALIZATION'
 must 'revalidate_runner migrate-normalize-overlap'
 must 'TIMER_STATE_LABEL=$label'
 must 'bind_activation_floor'
+must 'bind_catalog_commit_floor'
+must 'feed_catalog_history h ON h.rkey=c.rkey AND h.revision=c.catalog_revision'
 must 'native_tail_to_completion'
 must 'migrate-native-tail-rollback'
 must 'revalidate_runner migrate-native-tail-plan'
@@ -55,6 +57,7 @@ first_line() { grep -nF -- "$1" "$packet" | head -1 | cut -d: -f1; }
 (( $(line 'catalog_sync_apply "$SOURCE_ROOT"') < $(line 'post_bulk "$E/feedgen-forward.json" 03-feedgen-forward-apply') ))
 (( $(line 'revalidate_runner migrate-prepare') < $(line 'post_bulk "$E/feedgen-forward.json" 03-feedgen-forward-apply') ))
 (( $(line 'bind_activation_floor') + 1 == $(line 'post_bulk "$E/feedgen-forward.json" 03-feedgen-forward-apply') ))
+(( $(line 'post_bulk "$E/feedgen-forward.json" 03-feedgen-forward-apply') < $(line 'bind_catalog_commit_floor') ))
 (( $(line 'post_bulk "$E/feedgen-forward.json" 03-feedgen-forward-apply') < $(line 'revalidate_runner migrate-native-tail-plan') ))
 (( $(line 'post_bulk "$E/feedgen-forward.json" 03-feedgen-forward-apply') < $(line 'revalidate_runner migrate-freeze') ))
 (( $(first_line '  revalidate_runner migrate-freeze') < $(first_line '  forward_to_completion') ))

@@ -198,6 +198,14 @@ bind_activation_floor() {
   [[ $floor =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{3}Z$ ]] || die 'activation floor readback is malformed'
   echo "activation_floor=$floor" | emit activation-floor.txt
 }
+bind_catalog_commit_floor() {
+  local row floor
+  [[ ! -e $E/catalog-commit-floor.txt ]] || die 'catalog commit floor already exists; use a fresh evidence root'
+  row=$(sudo -n docker exec -i feedgen-db psql -U feedgen -d feedgen-db -X -qAt -v ON_ERROR_STOP=1 -c "WITH current_history AS (SELECT h.changed_at FROM feedgen_ops.feed_catalog c JOIN feedgen_ops.feed_catalog_history h ON h.rkey=c.rkey AND h.revision=c.catalog_revision WHERE c.rkey=ANY(string_to_array('$RKEYS', ',')) AND c.content_time_contract_version='$V3') SELECT CASE WHEN count(*)=6 AND count(DISTINCT changed_at)=1 THEN to_char(min(changed_at) AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"') ELSE 'bad:'||count(*)||':'||count(DISTINCT changed_at) END FROM current_history;")
+  floor=$row
+  [[ $floor =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{3}Z$ ]] || die "catalog commit floor readback is $floor"
+  { echo "catalog_commit_floor=$floor"; echo 'source=feed_catalog_history.current_revision.changed_at'; } | emit catalog-commit-floor.txt
+}
 gate_v2_engagement_projection() { # <receipt name> <since>
   local name=$1 since=$2 until response summary http
   until=$(date -u +%Y-%m-%dT%H:%M:%S.000Z); response=$(mktemp); summary=$(mktemp); load_read_header
@@ -316,6 +324,7 @@ cmd_apply() {
   bind_activation_floor
   post_bulk "$E/feedgen-forward.json" 03-feedgen-forward-apply
   active_version_gate "$V3"
+  bind_catalog_commit_floor
   revalidate_runner migrate-native-tail-plan
   revalidate_runner migrate-freeze
   forward_to_completion

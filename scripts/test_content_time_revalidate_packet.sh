@@ -241,13 +241,14 @@ fwd_e="$scratch/fwd-flow-e"; mkdir -p "$fwd_e"
   printf 'cutoff=2026-08-21T00:00:00.000Z\n' >"$E/migrate-freeze-post-cutoff-1.txt"
   printf 'from_in_horizon|10\nto_in_horizon|0\n' >"$E/migrate-freeze-post-scope-1.tsv"
   printf 'activation_floor=2026-08-20T23:59:59.000Z\n' >"$E/activation-floor.txt"
+  printf 'catalog_commit_floor=2026-08-21T00:00:00.000Z\n' >"$E/catalog-commit-floor.txt"
 
   assert_tree() { :; }
   assert_active_catalog_version() { [[ $1 == "$TO_VERSION" ]]; }
   sleep() { :; }
   psql_ro() {
     [[ "$*" == *'feedgen_ops.feed_catalog'* ]] && { echo "$EXPECTED_CONTRACT_ROWS|1|$TO_VERSION"; return; }
-    [[ "$*" == *'content_time_validator_version='\''newsflows-content-time/v2'\'''* && "$*" == *'2026-08-20T23:59:59.000Z'* ]] && { echo "${INJECT_LATE_V2_ALL:-0}"; return; }
+    [[ "$*" == *'content_time_validator_version='\''newsflows-content-time/v2'\'''* && "$*" == *'2026-08-21T00:00:00.000Z'* ]] && { echo "${INJECT_LATE_V2_ALL:-0}"; return; }
     [[ "$*" == *'content_time_status='\''source_valid'\'''* ]] && { echo "${INJECT_LATE_V2_SEMANTIC:-0}"; return; }
     [[ "$*" == *'<'* ]] && { echo "${INJECT_AFTER_IN:-0}"; return; }
     echo 0
@@ -391,6 +392,7 @@ all_conv_e="$scratch/all-conv-e"; mkdir -p "$all_conv_e"
   printf 'cutoff=2026-08-21T00:00:00.000Z\n' >"$E/migrate-freeze-post-cutoff-1.txt"
   printf 'from_in_horizon|5\nto_in_horizon|0\n' >"$E/migrate-freeze-post-scope-1.tsv"
   printf 'activation_floor=2026-08-20T23:59:59.000Z\n' >"$E/activation-floor.txt"
+  printf 'catalog_commit_floor=2026-08-21T00:00:00.000Z\n' >"$E/catalog-commit-floor.txt"
 
   assert_tree() { :; }
   assert_active_catalog_version() { [[ $1 == "$TO_VERSION" ]]; }
@@ -465,7 +467,7 @@ prepare_forward_candidate_e() {
   local dst=$1
   mkdir -p "$dst"
   cp "$fwd_e"/migrate-stable-population.txt "$fwd_e"/migrate-freeze-{post,ir}-preview-1.json \
-    "$fwd_e"/migrate-freeze-post-{cutoff-1.txt,scope-1.tsv} "$fwd_e"/activation-floor.txt "$dst/"
+    "$fwd_e"/migrate-freeze-post-{cutoff-1.txt,scope-1.tsv} "$fwd_e"/{activation-floor,catalog-commit-floor}.txt "$dst/"
 }
 assert_active_catalog_version() { [[ $1 == "$TO_VERSION" ]]; }
 psql_ro() {

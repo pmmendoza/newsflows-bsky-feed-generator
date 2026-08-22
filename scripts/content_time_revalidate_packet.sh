@@ -540,7 +540,7 @@ migration_cutoff_sql() { # <target> -> index-probe max FROM, min TO, exclusive c
   table=$(migration_target_table "$target"); since=$(migration_target_since "$target")
   from_predicate=$(migration_semantic_predicate "$FROM_VERSION"); to_predicate=$(migration_semantic_predicate "$TO_VERSION")
   cutoff_expr="coalesce(min_to,to_char(clock_timestamp() AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'))"
-  [[ ! -s "$E/activation-floor.txt" ]] || cutoff_expr="'$(awk -F= '$1=="activation_floor"{print $2}' "$E/activation-floor.txt")'"
+  [[ ! -s "$E/activation-floor.txt" ]] || cutoff_expr="'$(catalog_commit_floor)'"
   cat <<SQL
 WITH bounds AS (
   SELECT
@@ -568,7 +568,7 @@ migration_derive_cutoff() { # <target> <attempt> -> evidence file
   [[ "$cutoff" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{3}Z$ ]] || die "$target migration cutoff evidence is malformed"
   if [[ -n "$min_to" ]]; then
     [[ "$min_to" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{3}Z$ ]] || die "$target TO cohort boundary is malformed"
-    if [[ -s "$E/activation-floor.txt" ]]; then [[ "$min_to" > "$cutoff" || "$min_to" == "$cutoff" ]] || die "$target native v3 semantic rows precede the activation floor"
+    if [[ -s "$E/activation-floor.txt" ]]; then [[ "$min_to" > "$cutoff" || "$min_to" == "$cutoff" ]] || die "$target native v3 semantic rows precede the catalog commit floor"
     else [[ "$max_from" < "$min_to" ]] || die "$target FROM/TO indexedAt cohorts overlap or have no strict millisecond gap; replan"; fi
   fi
   [[ "$max_from" < "$cutoff" ]] || die "$target FROM cohort is not strictly below exclusive cutoff; replan"
@@ -586,14 +586,19 @@ activation_floor() {
   [[ "$floor" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{3}Z$ ]] || die 'activation floor receipt is missing or malformed'
   echo "$floor"
 }
+catalog_commit_floor() {
+  local floor; floor=$(awk -F= '$1=="catalog_commit_floor"{print $2}' "$E/catalog-commit-floor.txt" 2>/dev/null || true)
+  [[ "$floor" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{3}Z$ ]] || die 'catalog commit floor receipt is missing or malformed'
+  echo "$floor"
+}
 assert_no_late_v2_rows() { # <target>
   local target=$1 table floor rows
   assert_active_catalog_version "$TO_VERSION"
   table=$(migration_target_table "$target")
-  floor=$(activation_floor)
+  floor=$(catalog_commit_floor)
   rows=$(psql_ro -t -c "SELECT count(*) FROM public.$table WHERE content_time_validator_version='$FROM_VERSION' AND \"indexedAt\">='$floor';")
   [[ "$rows" =~ ^[0-9]+$ ]] || die "$target late $FROM_VERSION query failed"
-  [[ "$rows" == 0 ]] || die "$target has $rows $FROM_VERSION rows at/after activation floor $floor"
+  [[ "$rows" == 0 ]] || die "$target has $rows $FROM_VERSION rows at/after catalog commit floor $floor"
 }
 migration_scope_sql() { # <target> [exclusive cutoff]
   local target=$1 cutoff=${2:-} table since upper=""
