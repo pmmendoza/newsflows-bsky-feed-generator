@@ -269,6 +269,7 @@ fwd_e="$scratch/fwd-flow-e"; mkdir -p "$fwd_e"
 
   # 2. Late v2 semantic rows at/after cutoff fails closed
   INJECT_LATE_V2_SEMANTIC=1
+  INJECT_LATE_V2_ALL=1
   migration_preview_one() {
     local out=$1
     printf '{"preview":{"scanned":8,"truncated":false,"counts":{"v2_valid_to_v3_valid":4,"v2_skew_to_v3_clamped":4,"v2_invalid_to_v3_clamped":0,"v2_to_v3_invalid":0,"gt_5m_restored":0,"zero_to_5m_clamped":4}}}\n' >"$E/$out.json"
@@ -279,6 +280,7 @@ fwd_e="$scratch/fwd-flow-e"; mkdir -p "$fwd_e"
   [[ ! -e "$E/migrate-apply-authorized.txt" ]]
   [[ $(find "$E" -maxdepth 1 -name 'migrate-post-convergence-*.txt' | wc -l | tr -d ' ') == 0 ]]
   INJECT_LATE_V2_SEMANTIC=0
+  INJECT_LATE_V2_ALL=0
 
   # 2b. Compatible (non-semantic) late v2 rows at/after floor fails closed
   INJECT_LATE_V2_ALL=1
