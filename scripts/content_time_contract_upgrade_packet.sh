@@ -260,7 +260,7 @@ cmd_preflight() {
   # Prepare bounds/control while writes are still v2. The exact population is
   # deliberately not bound until the catalog switch makes new writes v3.
   revalidate_runner migrate-prepare
-  gate_v2_engagement_projection engagement-v2-projection-preflight "$(date -u -d '10 minutes ago' +%Y-%m-%dT%H:%M:%S.000Z)"
+  gate_v2_engagement_projection engagement-v2-projection-preflight "$(date -u -d '12 hours ago' +%Y-%m-%dT%H:%M:%S.000Z)"
   { echo "generated_at=$(ts)"; echo "source_sha=$SOURCE_SHA"; echo "source_catalog_sha256=$SOURCE_CATALOG_SHA"; echo "rollback_source_sha=$ROLLBACK_SOURCE_SHA"; echo "rollback_catalog_sha256=$ROLLBACK_CATALOG_SHA"; echo "packet_source_sha=$PACKET_SOURCE_SHA"; echo "feedgen_runtime_sha=$FEEDGEN_SHA"; echo "feedgen_image=$EXPECTED_IMAGE"; echo "packet_sha256=$PACKET_SHA"; echo "runner_sha256=$EXPECTED_RUNNER_SHA"; echo "since_main=$SINCE_MAIN"; echo "since_be=$SINCE_BE"; echo "since_engagement=$SINCE_ENGAGEMENT"; echo "migration_drain_seconds=$MIGRATION_DRAIN_SECONDS"; echo "rkeys=$RKEYS"; echo "tool_refs=$EXPECTED_TOOL_REFS"; } | emit bindings.txt
 }
 cmd_preview() {
@@ -277,7 +277,7 @@ cmd_apply() {
   catalog_sync_apply "$SOURCE_ROOT" | emit 01-catalog-sync-forward-apply.json; gate_catalog_sync "$E/01-catalog-sync-forward-apply.json"
   catalog_packet | emit 02-feedgen-sync-apply-packet.json; gate_body "$E/02-feedgen-sync-apply-packet.json" "$V2" "$V3"
   node -e 'const fs=require("fs"),a=JSON.parse(fs.readFileSync(process.argv[1])),j=JSON.parse(fs.readFileSync(process.argv[2]));if(JSON.stringify(a)!==JSON.stringify(j.atomic_change_set.request_body))throw Error("fresh apply body differs from bound preview body")' "$E/feedgen-forward.json" "$E/02-feedgen-sync-apply-packet.json"
-  gate_v2_engagement_projection engagement-v2-projection-apply "$(date -u -d '10 minutes ago' +%Y-%m-%dT%H:%M:%S.000Z)"
+  gate_v2_engagement_projection engagement-v2-projection-apply "$(date -u -d '12 hours ago' +%Y-%m-%dT%H:%M:%S.000Z)"
   bind_activation_floor
   post_bulk "$E/feedgen-forward.json" 03-feedgen-forward-apply
   active_version_gate "$V3"

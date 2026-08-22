@@ -25,6 +25,8 @@ must 'revalidate_runner migrate-native-tail-plan'
 must 'gate_v2_engagement_projection engagement-v2-projection-preflight'
 must 'gate_v2_engagement_projection engagement-v2-projection-apply'
 must 'gate_v2_engagement_projection engagement-v2-projection-rollback'
+[[ $(grep -F "date -u -d '12 hours ago'" "$packet" | wc -l | tr -d ' ') == 2 ]]
+! grep -Fq -- "date -u -d '10 minutes ago'" "$packet"
 must "'projected_v3_to_v2_valid','projected_v3_to_v2_invalid','semantic_incompatible'"
 must "j.science_eligible!==true||v.semantic_incompatible!==0"
 ! grep -Fq -- 'v.projected_v3_to_v2_invalid!==0' "$packet"
