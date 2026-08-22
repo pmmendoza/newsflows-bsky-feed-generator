@@ -20,6 +20,7 @@ export function publisherQueryChronological(
   publisherDid: string,
   shortname = '',
   publisherTimeClock: PublisherTimeClock = 'receipt_time',
+  contentTimeContractVersion: string | null = null,
 ) {
   const base = db
     .selectFrom('post')
@@ -30,7 +31,7 @@ export function publisherQueryChronological(
     .where('author', '=', publisherDid)
   return applyPublisherRecencyOrder(
     applyPoliticianFilterIfEnabled(
-      applyPublisherTimeFilter(base, publisherTimeClock, timeLimit),
+      applyPublisherTimeFilter(base, publisherTimeClock, timeLimit, contentTimeContractVersion),
       shortname,
     ),
     publisherTimeClock,

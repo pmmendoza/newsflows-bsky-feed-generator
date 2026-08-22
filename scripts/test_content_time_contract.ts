@@ -2,6 +2,9 @@ import { applyPublisherRecencyOrder, applyPublisherTimeFilter } from '../src/alg
 import {
   CONTENT_TIME_VALIDATOR_VERSION_V2,
   CONTENT_TIME_VALIDATOR_VERSION_V3,
+  contentTimeSupportedSql,
+  isV2FutureSemanticDeltaSql,
+  revalidationSemanticDeltaSql,
   resolveActiveContentTimeVersionFromRows,
   validateContentTime,
 } from '../src/util/content-time'
@@ -172,12 +175,20 @@ const query: any = {
   orderBy: (...args: any[]) => { calls.push(['orderBy', ...args]); return query },
 }
 applyPublisherRecencyOrder(
-  applyPublisherTimeFilter(query, 'content_time_v1', '2026-08-02T00:00:00Z'),
+  applyPublisherTimeFilter(query, 'content_time_v1', '2026-08-02T00:00:00Z', CONTENT_TIME_VALIDATOR_VERSION_V3),
   'content_time_v1',
 )
-check(calls.some((call) => call[1] === 'post.content_time_status' && call[2] === '=' && call[3] === 'source_valid'), 'content eligibility must require source_valid')
 check(calls.length === 5, 'content eligibility plus deterministic ordering must be complete')
 check(!calls.some((call) => call[0] === 'where' && call[1] === 'post.indexedAt'), 'content eligibility must not substitute receipt time')
+const v2Predicate = JSON.stringify(contentTimeSupportedSql('post', CONTENT_TIME_VALIDATOR_VERSION_V2).toOperationNode())
+const v3Predicate = JSON.stringify(contentTimeSupportedSql('post', CONTENT_TIME_VALIDATOR_VERSION_V3).toOperationNode())
+const deltaPredicate = JSON.stringify(isV2FutureSemanticDeltaSql('post').toOperationNode())
+check(v2Predicate.includes(CONTENT_TIME_VALIDATOR_VERSION_V2) && !v2Predicate.includes(CONTENT_TIME_VALIDATOR_VERSION_V3), 'v2 SQL predicate must require exact v2 provenance')
+check(v3Predicate.includes(CONTENT_TIME_VALIDATOR_VERSION_V2) && v3Predicate.includes(CONTENT_TIME_VALIDATOR_VERSION_V3) && v3Predicate.includes('indexedAt'), 'v3 SQL predicate must accept v3 plus compatible v2 rows')
+check(deltaPredicate.includes('future_skew') && deltaPredicate.includes('content_time_utc') && deltaPredicate.includes('indexedAt'), 'semantic-delta SQL predicate must cover both v2 future encodings')
+check(!deltaPredicate.includes('timestamptz') && !deltaPredicate.includes('5 minutes'), 'semantic-delta SQL predicate must match the canonical-text partial-index predicate')
+const reverseDeltaPredicate = JSON.stringify(revalidationSemanticDeltaSql('post', CONTENT_TIME_VALIDATOR_VERSION_V3, CONTENT_TIME_VALIDATOR_VERSION_V2).toOperationNode())
+check(reverseDeltaPredicate.includes('future_skew_clamped') && !reverseDeltaPredicate.includes('source_valid'), 'rollback SQL predicate must select only clamped v3 rows')
 
 ;(async () => {
   // Generation-guard cache test

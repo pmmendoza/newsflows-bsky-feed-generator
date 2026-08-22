@@ -168,11 +168,9 @@ revalidate_runner() {
     FROM_VERSION=$V2 TO_VERSION=$V3 IMG=$IMG RUNNER=container MIGRATION_DRAIN_SECONDS=$MIGRATION_DRAIN_SECONDS "$REVALIDATE" "$@"
 }
 migration_complete() {
-  local label=$1 target
-  for target in post engagement; do
-    [[ -f "$E/migrate-$target-apply-$label.json" ]] || return 1
-    [[ $(node -e 'console.log(JSON.parse(require("fs").readFileSync(process.argv[1])).revalidation.complete)' "$E/migrate-$target-apply-$label.json") == true ]] || return 1
-  done
+  local label=$1 target=post
+  [[ -f "$E/migrate-$target-apply-$label.json" ]] || return 1
+  [[ $(node -e 'console.log(JSON.parse(require("fs").readFileSync(process.argv[1])).revalidation.complete)' "$E/migrate-$target-apply-$label.json") == true ]] || return 1
 }
 forward_label_used() { [[ -n $(find "$E" -maxdepth 1 -type f -name "*forward-$1*" -print -quit) ]]; }
 forward_to_completion() {
@@ -218,7 +216,7 @@ cmd_apply() {
   active_version_gate "$V3"
   revalidate_runner migrate-freeze
   forward_to_completion
-  { echo '01 catalog-sync forward'; echo '02 feedgen sync packet gate'; echo '03 exact-six bulk v2->v3'; echo '04 drain and bind stable v2 population'; echo '05 global post'; echo '05 global engagement'; } | emit apply-order.txt
+  { echo '01 catalog-sync forward'; echo '02 feedgen sync packet gate'; echo '03 exact-six bulk v2->v3'; echo '04 drain and bind stable v2 semantic-delta population'; echo '05 affected post rows'; echo '06 engagement projection (no historical writes)'; } | emit apply-order.txt
   restore_timers
 }
 cmd_revalidate() { assert_bindings; active_version_gate "$V3"; fence_timers; [[ -f $E/migrate-stable-population.txt ]] || revalidate_runner migrate-freeze; revalidate_runner migrate-stable-check; forward_to_completion; restore_timers; }
@@ -228,8 +226,11 @@ cmd_readback() {
   revalidate_runner migrate-readback
   sleep "${DRAIN_INTERVAL_SECONDS:-60}"
   revalidate_runner migrate-readback
-  local num den; num=$(awk -F= '$1=="ir_gt_5m_restored"{print $2}' "$E/migrate-stable-population.txt"); den=$(awk -F= '$1=="ir_denominator"{print $2}' "$E/migrate-stable-population.txt")
-  { echo "irish_restored_gt_5m_numerator=$num"; echo "irish_in_horizon_v2_denominator=$den"; echo 'participant_exposure_not_inferred=true'; } | emit irish-restoration.txt
+  local changed restored den
+  changed=$(awk -F= '$1=="ir_semantic_changed"{print $2}' "$E/migrate-stable-population.txt")
+  restored=$(awk -F= '$1=="ir_restored_valid"{print $2}' "$E/migrate-stable-population.txt")
+  den=$(awk -F= '$1=="ir_total_denominator"{print $2}' "$E/migrate-stable-population.txt")
+  { echo "irish_semantic_changed=$changed"; echo "irish_restored_valid=$restored"; echo "irish_in_horizon_v2_denominator=$den"; echo 'participant_exposure_not_inferred=true'; } | emit irish-restoration.txt
 }
 cmd_rollback_dryrun() {
   assert_bindings
@@ -251,7 +252,7 @@ cmd_rollback() {
   active_version_gate "$V2"
   catalog_sync_apply "$ROLLBACK_SOURCE_ROOT" | emit 02-catalog-sync-rollback-apply.json; gate_catalog_sync "$E/02-catalog-sync-rollback-apply.json"
   revalidate_runner migrate-rollback apply reverse
-  { echo '01 exact-six bulk v3->v2'; echo '02 catalog desired-state rollback'; echo '03 reverse global post'; echo '03 reverse global engagement'; } | emit rollback-order.txt
+  { echo '01 exact-six bulk v3->v2'; echo '02 catalog desired-state rollback'; echo '03 reverse affected post rows'; echo '04 engagement projection disabled by v2 contract'; } | emit rollback-order.txt
   restore_timers
 }
 cmd_finalize() {

@@ -477,10 +477,11 @@ console.log('receipt raw-free shape checks passed')
   check(bare.fromVersion === 'newsflows-content-time/v1', 'fromVersion defaults to v1')
   check(bare.toVersion === 'newsflows-content-time/v2', 'toVersion defaults to v2')
 
-  const engagementRevalidate = parseRevalidateCliArgs(['--table', 'engagement', '--from-version', 'newsflows-content-time/v2', '--to-version', 'newsflows-content-time/v3'])
+  const engagementRevalidate = parseRevalidateCliArgs(['--table', 'engagement'])
   check(engagementRevalidate.table === 'engagement', 'captures table=engagement')
-  check(engagementRevalidate.fromVersion === 'newsflows-content-time/v2', 'captures fromVersion=v2')
-  check(engagementRevalidate.toVersion === 'newsflows-content-time/v3', 'captures toVersion=v3')
+  check(engagementRevalidate.fromVersion === 'newsflows-content-time/v1', 'legacy engagement revalidation remains v1')
+  check(engagementRevalidate.toVersion === 'newsflows-content-time/v2', 'legacy engagement revalidation remains v2')
+  check(throws(() => parseRevalidateCliArgs(['--table', 'engagement', '--from-version', 'newsflows-content-time/v2', '--to-version', 'newsflows-content-time/v3'])), 'engagement v2/v3 migration must be projection-only')
 
   // Rollback args
   const rollbackArgs = parseRevalidateCliArgs(['--from-version', 'newsflows-content-time/v3', '--to-version', 'newsflows-content-time/v2'])

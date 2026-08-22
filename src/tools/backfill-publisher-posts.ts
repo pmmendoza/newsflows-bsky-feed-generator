@@ -13,6 +13,7 @@ import {
   validateContentTime,
   isSupportedContentTimeVersion,
   resolveActiveContentTimeContract,
+  revalidationSemanticDeltaSql,
 } from '../util/content-time'
 import type { ContentTimeClampReason } from '../db/schema'
 import { resolvePublisherDids } from '../util/publisher-dids'
@@ -900,6 +901,12 @@ export function validateRevalidationTransition(fromVersion: string, toVersion: s
   }
 }
 
+export function validateRevalidationTarget(table: 'post' | 'engagement', fromVersion: string, toVersion: string): void {
+  if (table === 'engagement' && fromVersion !== CONTENT_TIME_VALIDATOR_VERSION_V1) {
+    throw new Error('v2/v3 semantic migration is post-only; engagement is projected at export time')
+  }
+}
+
 export function revalidateContentTimeCandidate(
   candidate: Pick<
     ContentTimeRevalidationCandidate,
@@ -1163,6 +1170,7 @@ async function selectRevalidationBatch(
   sinceIso: string,
   untilExclusiveIso: string | undefined,
   fromVersion: string,
+  toVersion: string,
   afterAuthor: string,
   afterUri: string,
   limit: number,
@@ -1179,6 +1187,7 @@ async function selectRevalidationBatch(
             AND "indexedAt" >= ${sinceIso}
             AND ${untilPredicate}
             AND content_time_validator_version = ${fromVersion}
+            AND ${revalidationSemanticDeltaSql('post', fromVersion, toVersion)}
             AND (author, uri) > (${afterAuthor}, ${afterUri})
           ORDER BY author, uri
           LIMIT ${limit}
@@ -1191,6 +1200,7 @@ async function selectRevalidationBatch(
             AND "indexedAt" >= ${sinceIso}
             AND ${untilPredicate}
             AND content_time_validator_version = ${fromVersion}
+            AND ${revalidationSemanticDeltaSql('post', fromVersion, toVersion)}
             AND (author, uri) > (${afterAuthor}, ${afterUri})
           ORDER BY author, uri
           LIMIT ${limit}
@@ -1204,6 +1214,7 @@ async function selectRevalidationBatch(
           WHERE "indexedAt" >= ${sinceIso}
             AND ${untilPredicate}
             AND content_time_validator_version = ${fromVersion}
+            AND ${revalidationSemanticDeltaSql('engagement', fromVersion, toVersion)}
             AND uri > ${afterUri}
           ORDER BY uri
           LIMIT ${limit}
@@ -1215,6 +1226,7 @@ async function selectRevalidationBatch(
           WHERE "indexedAt" >= ${sinceIso}
             AND ${untilPredicate}
             AND content_time_validator_version = ${fromVersion}
+            AND ${revalidationSemanticDeltaSql('engagement', fromVersion, toVersion)}
             AND uri > ${afterUri}
           ORDER BY uri
           LIMIT ${limit}
@@ -1263,7 +1275,7 @@ async function applyRevalidationBatch(
              pg_total_relation_size(${tableName})::text AS relation_bytes
     `.execute(trx)).rows[0]
 
-    const rows = await selectRevalidationBatch(trx, table, actors, allAuthors, sinceIso, untilExclusiveIso, fromVersion, afterAuthor, afterUri, batchSize, true)
+    const rows = await selectRevalidationBatch(trx, table, actors, allAuthors, sinceIso, untilExclusiveIso, fromVersion, toVersion, afterAuthor, afterUri, batchSize, true)
     if (rows.length === 0) {
       return {
         candidates: 0,
@@ -1391,6 +1403,7 @@ export async function runContentTimeRevalidation(
   const toVersion = options.toVersion ?? CONTENT_TIME_VALIDATOR_VERSION_V2
 
   validateRevalidationTransition(fromVersion, toVersion)
+  validateRevalidationTarget(table, fromVersion, toVersion)
 
   if (table !== 'post' && table !== 'engagement') {
     throw new Error(`invalid table: ${table}; must be post or engagement`)
@@ -1567,6 +1580,7 @@ export async function previewContentTimeRevalidation(
   untilExclusive?: Date,
 ): Promise<{ scanned: number; counts: ContentTimeRevalidationCounts; truncated: boolean }> {
   validateRevalidationTransition(fromVersion, toVersion)
+  validateRevalidationTarget(table, fromVersion, toVersion)
   const sortedActors = table === 'post' ? [...new Set(actors)].sort() : []
   validateContentTimeRevalidationScope(table, sortedActors, allAuthors)
   validateContentTimeRevalidationWindow(since, untilExclusive)
@@ -1588,6 +1602,7 @@ export async function previewContentTimeRevalidation(
       sinceIso,
       untilExclusiveIso,
       fromVersion,
+      toVersion,
       cursorAuthor,
       cursorUri,
       limit,
@@ -1868,6 +1883,7 @@ export function parseRevalidateCliArgs(argv: string[]): RevalidateCliOptions {
   const toVersion = flags.get('to-version')?.at(-1) || CONTENT_TIME_VALIDATOR_VERSION_V2
 
   validateRevalidationTransition(fromVersion, toVersion)
+  validateRevalidationTarget(table, fromVersion, toVersion)
 
   const actorsCsv = [
     ...splitCsv(flags.get('actors')?.join(',')),

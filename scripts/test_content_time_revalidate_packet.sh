@@ -18,6 +18,7 @@ set -- migrate-preflight
 . "$packet"
 mkdir -p "$E"
 emit() { mkdir -p "$E"; dd of="$E/$1" status=none; }
+[[ $(migration_targets) == post ]]
 
 # The cutoff uses independent min/max probes and fails closed on overlap.
 cutoff_bounds='max_from=2026-08-20T00:00:00.000Z|min_to=2026-08-21T00:00:00.000Z|cutoff=2026-08-21T00:00:00.000Z'
@@ -45,7 +46,7 @@ run_tool() { printf '%s\n' "$*" >"$captured"; echo 0; }
 migration_run_tool prefreeze post "$FROM_VERSION" "$TO_VERSION" >/dev/null
 grep -Fq -- "--max-preview-rows 123456" "$captured"
 if grep -Fq -- '--until' "$captured"; then echo 'prefreeze invocation unexpectedly had a cutoff' >&2; exit 1; fi
-printf 'attempt=1\ndrain_seconds=60\nmax_preview_rows=123456\npost_cutoff=2026-08-21T00:00:00.000Z\npost_rows=1\npost_preview_sha256=x\nengagement_cutoff=2026-08-21T00:00:00.000Z\nengagement_rows=1\nengagement_preview_sha256=x\nir_prereg_sha256=x\n' >"$E/migrate-stable-population.txt"
+printf 'attempt=1\ndrain_seconds=60\nmax_preview_rows=123456\npost_cutoff=2026-08-21T00:00:00.000Z\npost_rows=1\npost_preview_sha256=x\nir_prereg_sha256=x\n' >"$E/migrate-stable-population.txt"
 migration_run_tool forward post "$FROM_VERSION" "$TO_VERSION" --apply >/dev/null
 [[ $(grep -o -- '--until' "$captured" | wc -l | tr -d ' ') == 1 ]]
 grep -Fq -- '--until 2026-08-21T00:00:00.000Z' "$captured"

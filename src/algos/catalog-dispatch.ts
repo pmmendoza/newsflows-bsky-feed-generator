@@ -98,6 +98,7 @@ export async function resolveDynamicHandler(
         'publisher_post_max_age_days',
         'publisher_post_max_age_source',
         'publisher_time_clock',
+        'content_time_contract_version',
         'ranker_score_max_age_hours',
         'ranker_score_max_age_source',
         'ranker_min_score_backed_share',
@@ -137,6 +138,7 @@ export async function resolveDynamicHandler(
         String(row.feed_id),
         row.publisher_time_clock ?? 'receipt_time',
         policy === 'ranker-priority' ? (row.ranker_score_max_age_hours ?? 24) : undefined,
+        row.content_time_contract_version ?? null,
       )
       handler = async (
         ctx: AppContext,

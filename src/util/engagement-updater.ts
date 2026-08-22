@@ -3,6 +3,7 @@ import { sql } from 'kysely';
 import { cutoffFromHours } from '../algos/publisher-serving-window'
 import { resolveEngagementTimeHours } from '../algos/feed-builder'
 import { resolvePublisherDids } from './publisher-dids'
+import { contentTimeSupportedSql, isSupportedContentTimeVersion } from './content-time'
 
 const ENGAGEMENT_TYPE_REPOST = 1
 const ENGAGEMENT_TYPE_LIKE = 2
@@ -16,6 +17,7 @@ type RefreshCatalogRow = {
   publisher_did?: string | null
   publisher_post_max_age_days?: number | null
   publisher_time_clock?: string | null
+  content_time_contract_version?: string | null
 }
 
 export function deriveEngagementRefreshPlan(rows: RefreshCatalogRow[], referenceMs: number) {
@@ -33,11 +35,17 @@ export function deriveEngagementRefreshPlan(rows: RefreshCatalogRow[], reference
   )
   const receiptPublisherRows = rows.filter((row) => row.publisher_time_clock === 'receipt_time')
   const contentPublisherRows = rows.filter((row) => row.publisher_time_clock === 'content_time_v1')
+  const contentVersions = new Set(contentPublisherRows.map((row) => String(row.content_time_contract_version ?? '')))
+  if (contentPublisherRows.length > 0 && (contentVersions.size !== 1 || !isSupportedContentTimeVersion([...contentVersions][0]))) {
+    throw new Error('engagement refresh requires one supported content-time contract version')
+  }
+  const contentContractVersion = contentPublisherRows.length > 0 ? [...contentVersions][0] : null
   const receiptDays = maxDays(receiptPublisherRows)
   const contentDays = maxDays(contentPublisherRows)
   return {
     receiptPublisherRows,
     contentPublisherRows,
+    contentContractVersion,
     receiptDays,
     contentDays,
     receiptCutoff: new Date(referenceMs - receiptDays * 86_400_000).toISOString(),
@@ -64,11 +72,12 @@ export function selectRecentPublisherPosts(
   publishers: string[],
   clock: 'receipt_time' | 'content_time_v1',
   cutoff: string | null,
+  contentTimeContractVersion: string | null = null,
 ) {
   if (publishers.length === 0 || cutoff === null) return null
   let query = db.selectFrom('post').where('post.author', 'in', publishers)
   query = clock === 'content_time_v1'
-    ? query.where('post.content_time_status', '=', 'source_valid').where('post.content_time_utc', '>=', cutoff)
+    ? query.where(contentTimeSupportedSql('post', contentTimeContractVersion)).where('post.content_time_utc', '>=', cutoff)
     : query.where('post.indexedAt', '>=', cutoff)
   return query.select(['post.uri', 'post.author'])
 }
@@ -90,6 +99,7 @@ export async function selectEngagementRefreshPosts(
     refreshPlan.contentPublisherRows.map((row) => String(row.publisher_did)),
     'content_time_v1',
     refreshPlan.contentCutoff,
+    refreshPlan.contentContractVersion,
   )
   const [followedPosts, receiptPosts, contentPosts] = await Promise.all([
     selectRecentFollowedPosts(db, followedCutoff),
@@ -123,7 +133,7 @@ async function runEngagementRefresh(db: Database, referenceMs: number): Promise<
 
     const catalogRows = await db
       .selectFrom('feedgen_ops.feed_catalog')
-      .select(['rkey', 'publisher_did', 'publisher_post_max_age_days', 'publisher_time_clock', 'algo_policy_id'])
+      .select(['rkey', 'publisher_did', 'publisher_post_max_age_days', 'publisher_time_clock', 'content_time_contract_version', 'algo_policy_id'])
       .where('enabled', '=', true)
       .execute()
     const cachedConsumerRows = catalogRows.filter((row) =>

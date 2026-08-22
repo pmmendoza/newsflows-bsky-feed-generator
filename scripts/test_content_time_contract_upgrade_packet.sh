@@ -78,7 +78,7 @@ cat >"$tmp/resume-tree/scripts/content_time_revalidate_packet.sh" <<'SH'
 #!/usr/bin/env bash
 [[ "$1" == migrate-apply ]]
 label=$2; echo "$label" >>"$E/coordinator-labels.txt"
-for target in post engagement; do printf '{"revalidation":{"complete":true}}\n' >"$E/migrate-$target-apply-$label.json"; done
+printf '{"revalidation":{"complete":true}}\n' >"$E/migrate-post-apply-$label.json"
 SH
 touch "$tmp/resume-tree/dist/tools/backfill-publisher-posts.js" "$tmp/resume-tree/dist/util/content-time.js"
 chmod +x "$tmp/resume-tree/scripts/content_time_revalidate_packet.sh"
@@ -99,7 +99,7 @@ PATH="$tmp/runtime-mock:$PATH" FTFU1_TEST_MODE=1 E="$tmp/resume-evidence" \
   SINCE_BE=2026-08-11T00:00:00.000Z SINCE_ENGAGEMENT=2026-08-11T00:00:00.000Z \
   bash "$packet" test-forward-resume
 grep -Fxq 'forward-2' "$tmp/resume-evidence/coordinator-labels.txt"
-[[ -s "$tmp/resume-evidence/migrate-post-apply-forward-2.json" && -s "$tmp/resume-evidence/migrate-engagement-apply-forward-2.json" ]]
+[[ -s "$tmp/resume-evidence/migrate-post-apply-forward-2.json" ]]
 (
   export CONTENT_TIME_PACKET_SOURCE_ONLY=1 E="$tmp/library-evidence" TREE="$tmp/library-tree" EXPECTED_SHA=x \
     EXPECTED_DIST_SHA256=x EXPECTED_CT_SHA256=x EXPECTED_IMAGE_CT_SHA256=x EXPECTED_TOOL_REFS=x \
@@ -110,9 +110,8 @@ grep -Fxq 'forward-2' "$tmp/resume-evidence/coordinator-labels.txt"
   set -- migrate-preflight
   # shellcheck source=content_time_revalidate_packet.sh
   . "$runner"
-  [[ $(migration_targets) == 'post engagement' ]]
+  [[ $(migration_targets) == 'post' ]]
   [[ $(migration_target_since post) == "$SINCE_ENGAGEMENT" ]]
-  [[ $(migration_target_since engagement) == "$SINCE_ENGAGEMENT" ]]
   [[ $(migration_cutoff_sql post) == *'(SELECT max("indexedAt")'* ]]
 )
 
@@ -142,12 +141,13 @@ grep -Fxq 'forward-2' "$tmp/resume-evidence/coordinator-labels.txt"
   psql_ro() {
     [[ "$*" == *'WITH bounds'* ]] && { printf 'max_from=2026-08-20T00:00:00.000Z|min_to=2026-08-21T00:00:00.000Z|cutoff=2026-08-21T00:00:00.000Z\n'; return; }
     [[ "$*" == *'created_at_source_raw IS NULL'* ]] && { echo 0; return; }
+    [[ "$*" == *"WHERE author='$IR_DID'"* ]] && { echo 1; return; }
     [[ "$*" == *'SELECT count(*) FROM public.'* ]] && { echo 0; return; }
     printf 'from_in_horizon|1\nfrom_outside_horizon|0\nfrom_total|1\nto_in_horizon|0\n'
   }
   migration_preview_one() {
     local out=$1 target=$2 actors=${5:-} n=1 truncated=${INJECT_TRUNCATED:-false}
-    [[ -z $actors ]] && n=2
+    [[ $target == post && -z $actors ]] && n=2
     printf '{"preview":{"scanned":%s,"truncated":%s,"counts":{"v2_valid_to_v3_valid":%s,"v2_skew_to_v3_clamped":0,"v2_invalid_to_v3_clamped":0,"v2_to_v3_invalid":0,"gt_5m_restored":0,"zero_to_5m_clamped":0}}}\n' "$n" "$truncated" "$n" >"$E/$out.json"
     echo "$E/$out.json"
   }
@@ -158,14 +158,14 @@ grep -Fxq 'forward-2' "$tmp/resume-evidence/coordinator-labels.txt"
   cmd_migrate_freeze >/dev/null
   [[ $(migration_stable_attempt) == 2 ]]
   grep -Fxq 'post_rows=2' "$E/migrate-stable-population.txt"
-  grep -Fxq 'engagement_rows=2' "$E/migrate-stable-population.txt"
   grep -Fq 'v2_valid_to_v3_valid=2' <(migration_prereg_spec post)
-  grep -Fq 'v2_valid_to_v3_valid=2' <(migration_prereg_spec engagement)
   grep -Fq 'v2_valid_to_v3_valid=1' <(migration_cells "$(migration_ir_preview_file)")
   grep -Fxq 'drain_seconds=7' "$E/migrate-stable-population.txt"
+  grep -Fxq 'ir_semantic_changed=1' "$E/migrate-stable-population.txt"
+  grep -Fxq 'ir_restored_valid=0' "$E/migrate-stable-population.txt"
+  grep -Fxq 'ir_total_denominator=1' "$E/migrate-stable-population.txt"
 
-  # Rollback resumes against remaining cells/rows: post can already be complete
-  # while engagement has only a partial receipt.
+  # Rollback resumes the remaining affected post row after an rc=3 receipt.
   migration_preview_one() {
     local out=$1 target=$2 from=$3 n
     if [[ $from == "$TO_VERSION" ]]; then
@@ -180,9 +180,8 @@ grep -Fxq 'forward-2' "$tmp/resume-evidence/coordinator-labels.txt"
   migration_apply_one() {
     local target=$1 label=$2 updated complete
     case "$label/$target" in
-      reverse-1/post) updated=2; complete=true;;
-      reverse-1/engagement) updated=1; complete=false;;
-      reverse-2/engagement) updated=1; complete=true;;
+      reverse-1/post) updated=1; complete=false;;
+      reverse-2/post) updated=1; complete=true;;
       *) echo "unexpected rollback apply $label/$target" >&2; return 2;;
     esac
     printf '{"revalidation":{"updated":%s,"skipped_cas":0,"complete":%s,"counts":{"v3_valid_to_v2_valid":%s,"v3_clamped_to_v2_valid":0,"v3_clamped_to_v2_invalid":0,"v3_to_v2_invalid":0,"gt_5m_invalidated":0,"zero_to_5m_unclamped":0}}}\n' "$updated" "$complete" "$updated" >"$E/rollback-$target-apply-$label.json"
@@ -190,12 +189,11 @@ grep -Fxq 'forward-2' "$tmp/resume-evidence/coordinator-labels.txt"
   cmd_migrate_rollback dry-run
   set +e; cmd_migrate_rollback apply reverse-1; partial_rc=$?; set -e
   [[ $partial_rc == 3 ]]
-  [[ $(rollback_remaining_rows post) == 0 && $(rollback_remaining_rows engagement) == 1 ]]
-  [[ $(rollback_remaining_spec engagement) == *'v3_valid_to_v2_valid=1'* ]]
+  [[ $(rollback_remaining_rows post) == 1 ]]
+  [[ $(rollback_remaining_spec post) == *'v3_valid_to_v2_valid=1'* ]]
   cmd_migrate_rollback apply reverse-2
-  [[ $(rollback_remaining_rows post) == 0 && $(rollback_remaining_rows engagement) == 0 ]]
-  [[ ! -e "$E/rollback-post-apply-reverse-2.json" ]]
-  grep -Fxq 'restored_rows=2' "$E/rollback-engagement-diff-1.txt"
+  [[ $(rollback_remaining_rows post) == 0 ]]
+  grep -Fxq 'restored_rows=2' "$E/rollback-post-diff-1.txt"
 )
 
 mock=$tmp/mock; mkdir "$mock" "$tmp/evidence"

@@ -1,4 +1,5 @@
 import { Database } from '../db'
+import { sql } from 'kysely'
 import { ContentTimeClampReason, ContentTimeStatus } from '../db/schema'
 
 export const CONTENT_TIME_VALIDATOR_VERSION_V1 = 'newsflows-content-time/v1'
@@ -21,6 +22,81 @@ export function isSupportedContentTimeVersion(
     version === CONTENT_TIME_VALIDATOR_VERSION_V2 ||
     version === CONTENT_TIME_VALIDATOR_VERSION_V3
   )
+}
+
+function contentTimeRef(alias: string, column: string) {
+  return sql.ref(`${alias}.${column}`)
+}
+
+export function isV2FutureSemanticDeltaSql(alias: string) {
+  const status = contentTimeRef(alias, 'content_time_status')
+  const reason = contentTimeRef(alias, 'content_time_clamp_reason')
+  const version = contentTimeRef(alias, 'content_time_validator_version')
+  const contentTime = contentTimeRef(alias, 'content_time_utc')
+  const indexedAt = contentTimeRef(alias, 'indexedAt')
+  return sql<boolean>`${version} = ${CONTENT_TIME_VALIDATOR_VERSION_V2} AND (
+    (${status} = 'source_valid'
+      AND ${contentTime} > ${indexedAt})
+    OR (${status} = 'source_invalid' AND ${reason} = 'future_skew')
+  )`
+}
+
+export function revalidationSemanticDeltaSql(alias: string, fromVersion: string, toVersion: string) {
+  if (fromVersion === CONTENT_TIME_VALIDATOR_VERSION_V2 && toVersion === CONTENT_TIME_VALIDATOR_VERSION_V3) {
+    return isV2FutureSemanticDeltaSql(alias)
+  }
+  if (fromVersion === CONTENT_TIME_VALIDATOR_VERSION_V3 && toVersion === CONTENT_TIME_VALIDATOR_VERSION_V2) {
+    return sql<boolean>`${contentTimeRef(alias, 'content_time_validator_version')} = ${CONTENT_TIME_VALIDATOR_VERSION_V3}
+      AND ${contentTimeRef(alias, 'content_time_clamp_reason')} = 'future_skew_clamped'`
+  }
+  return sql<boolean>`true`
+}
+
+export function contentTimeSupportedSql(
+  alias: string,
+  contractVersion: string | null,
+  projectV2Future = false,
+) {
+  const status = contentTimeRef(alias, 'content_time_status')
+  const version = contentTimeRef(alias, 'content_time_validator_version')
+  const contentTime = contentTimeRef(alias, 'content_time_utc')
+  const indexedAt = contentTimeRef(alias, 'indexedAt')
+  if (contractVersion === CONTENT_TIME_VALIDATOR_VERSION_V2) {
+    return sql<boolean>`${status} = 'source_valid' AND ${version} = ${CONTENT_TIME_VALIDATOR_VERSION_V2}`
+  }
+  if (contractVersion === CONTENT_TIME_VALIDATOR_VERSION_V3) {
+    const storedCompatible = sql<boolean>`${status} = 'source_valid' AND (
+      ${version} = ${CONTENT_TIME_VALIDATOR_VERSION_V3}
+      OR (${version} = ${CONTENT_TIME_VALIDATOR_VERSION_V2}
+        AND ${contentTime} <= ${indexedAt})
+    )`
+    return projectV2Future
+      ? sql<boolean>`(${storedCompatible}) OR (${isV2FutureSemanticDeltaSql(alias)})`
+      : storedCompatible
+  }
+  return sql<boolean>`false`
+}
+
+export function effectiveContentTimeSql(alias: string, contractVersion: string | null, projectV2Future = false) {
+  if (contractVersion === CONTENT_TIME_VALIDATOR_VERSION_V3 && projectV2Future) {
+    return sql`CASE WHEN ${isV2FutureSemanticDeltaSql(alias)} THEN ${contentTimeRef(alias, 'indexedAt')} ELSE ${contentTimeRef(alias, 'content_time_utc')} END`
+  }
+  return sql`${contentTimeRef(alias, 'content_time_utc')}`
+}
+
+export function contentTimeProjectionMarkerSql(alias: string, contractVersion: string | null) {
+  return contractVersion === CONTENT_TIME_VALIDATOR_VERSION_V3
+    ? sql`CASE WHEN ${isV2FutureSemanticDeltaSql(alias)} THEN 'v2_future_to_indexed_at' ELSE NULL END`
+    : sql`NULL`
+}
+
+export function semanticIncompatibleContentTimeSql(alias: string, contractVersion: string | null, projectV2Future = false) {
+  const version = contentTimeRef(alias, 'content_time_validator_version')
+  if (contractVersion !== CONTENT_TIME_VALIDATOR_VERSION_V3) return sql<boolean>`false`
+  const unknownVersion = sql<boolean>`${version} IS NULL OR ${version} NOT IN (${CONTENT_TIME_VALIDATOR_VERSION_V2}, ${CONTENT_TIME_VALIDATOR_VERSION_V3})`
+  return projectV2Future
+    ? unknownVersion
+    : sql<boolean>`(${unknownVersion}) OR (${isV2FutureSemanticDeltaSql(alias)})`
 }
 
 export type ContentTimePolicy = {

@@ -24,6 +24,7 @@ export function publisherQueryRankerPriority(
   publisherTimeClock: PublisherTimeClock = 'receipt_time',
   referenceTimeIso = new Date().toISOString(),
   rankerScoreMaxAgeHours?: number,
+  contentTimeContractVersion: string | null = null,
 ) {
   const base = db
     .selectFrom('post')
@@ -31,7 +32,7 @@ export function publisherQueryRankerPriority(
     .where('author', '=', publisherDid)
   return applyPriorityOrderForFeed(
     applyPoliticianFilterIfEnabled(
-      applyPublisherTimeFilter(base, publisherTimeClock, timeLimit),
+      applyPublisherTimeFilter(base, publisherTimeClock, timeLimit, contentTimeContractVersion),
       shortname,
     ),
     feedId,

@@ -112,7 +112,7 @@ async function main() {
       `.execute(trx)
 
       const plan = deriveEngagementRefreshPlan(await trx.selectFrom('feedgen_ops.feed_catalog')
-        .select(['rkey', 'publisher_did', 'publisher_post_max_age_days', 'publisher_time_clock'])
+        .select(['rkey', 'publisher_did', 'publisher_post_max_age_days', 'publisher_time_clock', 'content_time_contract_version'])
         .where('enabled', '=', true)
         .where('algo_policy_id', 'in', ['engagement-sorted', 'ranker-priority']).execute(), referenceMs)
       assert.equal(plan.receiptDays, 3, 'chronological-only publisher must not widen the cached publisher plan')

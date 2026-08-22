@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Operator runner for the content-time v1->v2 re-validation backfill packet
-# and the FT-FU-1 global v2<->v3 post+engagement migration.
+# and the FT-FU-1 semantic v2<->v3 post migration plus engagement projection.
 # (dev/feedgen/2026-08-17_content_time_revalidation_backfill_packet.md in the
 # BSKY root repo). Every production step is a subcommand here so nothing is
 # hand-composed on the console. Raw-free by construction: the DSN is composed
@@ -39,8 +39,8 @@
 #   migrate-preview | migrate-apply <label>
 #   migrate-readback | migrate-rollback <dry-run|apply> | migrate-secret-scan
 #   migrate-finalize <start> <end>
-#                        FT-FU-1 global storage migration. FROM_VERSION, TO_VERSION,
-#                        widest post/engagement bound plus exact IR evidence cells bind scope.
+#                        FT-FU-1 semantic post migration. Engagement history is
+#                        projected at export time and is never rewritten.
 #
 # Required env (the runner refuses to start without them):
 #   E TREE EXPECTED_SHA EXPECTED_DIST_SHA256 EXPECTED_CT_SHA256 EXPECTED_IMAGE_CT_SHA256 PACKET_SHA
@@ -82,7 +82,6 @@ if [[ "$COMMAND" == migrate-* && $MIGRATION_SEAL == 0 ]]; then
   SINCE_ENGAGEMENT="${SINCE_ENGAGEMENT:-$SINCE_BE}"
   if [[ "$COMMAND" == "migrate-preflight" || "$COMMAND" == "migrate-preview" ]]; then
     : "${PREREG_POST:?PREREG_POST is required}"
-    : "${PREREG_ENGAGEMENT:?PREREG_ENGAGEMENT is required}"
     : "${PREREG_IR:?PREREG_IR is required}"
   fi
 elif [[ "$COMMAND" != migrate-* ]]; then
@@ -129,7 +128,7 @@ EXTRA_CELLS=(createdat_extra createdat_unchanged)   # pre-registered, not tool o
 IR_DID="${IR_DID:-did:plc:vzmnljt7otfbbgrmachtefxh}"
 EXPECTED_CONTRACT_ROWS="${EXPECTED_CONTRACT_ROWS:-6}"
 MIGRATION_DRAIN_SECONDS="${MIGRATION_DRAIN_SECONDS:-60}"
-PREREG_POST="${PREREG_POST:-}"; PREREG_ENGAGEMENT="${PREREG_ENGAGEMENT:-}"; PREREG_IR="${PREREG_IR:-}"
+PREREG_POST="${PREREG_POST:-}"; PREREG_IR="${PREREG_IR:-}"
 
 log() { echo "[packet] $*" >&2; }
 die() { echo "[packet] STOP: $*" >&2; exit 2; }
@@ -500,8 +499,8 @@ cmd_prereg() {  # read-only helper for the ledger approval: cells at the given S
   psql_ro -c "$SCOPE_SQL"; rm -f "$tmp"
 }
 
-# FT-FU-1: one contract governs every post and engagement row in the widest
-# active horizon. The proven v1->v2 packet above remains unchanged. The stable
+# FT-FU-1: one contract governs posts and projected engagement in the widest
+# active horizon. Only semantic-delta post rows are physically rewritten. The stable
 # denominator is one complete cutoff-bounded preview; immutable columns are
 # protected by the runner's UPDATE shape and raw-byte CAS predicate.
 migration_outcomes() {
@@ -512,15 +511,14 @@ migration_outcomes() {
   esac
 }
 assert_migration_transition() { migration_outcomes "$FROM_VERSION" "$TO_VERSION" >/dev/null; }
-migration_targets() { echo 'post engagement'; }
-migration_target_table() { case "$1" in post|engagement) echo "$1";; *) die "unknown migration target $1";; esac; }
-migration_target_since() { case "$1" in post|engagement) echo "$SINCE_ENGAGEMENT";; *) die "unknown migration target $1";; esac; }
+migration_targets() { echo 'post'; }
+migration_target_table() { case "$1" in post) echo "$1";; *) die "unknown migration target $1";; esac; }
+migration_target_since() { case "$1" in post) echo "$SINCE_ENGAGEMENT";; *) die "unknown migration target $1";; esac; }
 migration_target_actors() {
   case "$1" in
     # The contract is storage-global; never materialize a database-sized
     # author list into a shell argument.
     post) echo '';;
-    engagement) echo '';;
     *) die "unknown migration target $1";;
   esac
 }
@@ -591,12 +589,16 @@ prereg_spec_value() { # <spec> <key>
 }
 migration_prereg_spec() {
   if [[ -f "$E/migrate-stable-population.txt" ]]; then migration_cells "$(migration_stable_preview_file "$1")"; return; fi
-  case "$1" in post) echo "$PREREG_POST";; engagement) echo "$PREREG_ENGAGEMENT";; *) die "unknown migration target $1";; esac
+  case "$1" in post) echo "$PREREG_POST";; *) die "unknown migration target $1";; esac
 }
 migration_stable_attempt() { awk -F= '$1=="attempt"{print $2}' "$E/migrate-stable-population.txt"; }
 migration_scope_file() { echo "$E/migrate-freeze-$1-scope-$(migration_stable_attempt).tsv"; }
 migration_stable_preview_file() { echo "$E/migrate-freeze-$1-preview-$(migration_stable_attempt).json"; }
 migration_ir_preview_file() { echo "$E/migrate-freeze-ir-preview-$(migration_stable_attempt).json"; }
+migration_ir_total_denominator() { # <cutoff>; all in-horizon IR v2 rows, not only semantic deltas
+  local cutoff=$1
+  psql_ro -t -c "SELECT count(*) FROM public.post WHERE author='$IR_DID' AND content_time_validator_version='$FROM_VERSION' AND \"indexedAt\">='$SINCE_MAIN' AND \"indexedAt\"<'$cutoff';"
+}
 assert_stable_population_bound() {
   local f target expected actual attempt
   [[ -s "$E/migrate-stable-population.txt" ]] || die 'stable population marker missing'
@@ -675,27 +677,25 @@ cmd_migrate_preflight() {
   validate_migration_inputs
   [[ -d "$E" ]] || sudo -n install -d -o root -g newsflows -m 750 "$E"
   assert_tree; assert_active_catalog_version "$FROM_VERSION"
-  local target table since f nullraw
+  local target table since f
   emit_migration_source_set
   for target in $(migration_targets); do
     table=$(migration_target_table "$target"); since=$(migration_target_since "$target")
     psql_ro -c "$(migration_scope_sql "$target")" | emit "migrate-$target-prestate-scope.tsv"
-    nullraw=$(psql_ro -t -c "SELECT count(*) FROM public.$table WHERE content_time_validator_version='$FROM_VERSION' AND \"indexedAt\">='$since' AND created_at_source_raw IS NULL;")
-    [[ "$nullraw" == 0 ]] || die "$target has $nullraw in-horizon $FROM_VERSION rows with NULL raw"
     f=$(migration_preview_one "migrate-$target-preview-preflight" "$target" "$FROM_VERSION" "$TO_VERSION")
     gate_migration_preview "$f" "$(migration_prereg_spec "$target")" "$target"
   done
   f=$(migration_preview_one migrate-ir-preview-preflight post "$FROM_VERSION" "$TO_VERSION" "$IR_DID" "$SINCE_MAIN")
   gate_migration_preview "$f" "$PREREG_IR" ir
   take_control pg-control-1.txt
-  log 'migration preflight complete for post and engagement'
+  log 'semantic post migration preflight complete; engagement remains projection-only'
 }
 cmd_migrate_freeze() {
   validate_migration_inputs
   assert_tree; assert_active_catalog_version "$TO_VERSION"
   [[ -f "$E/migrate-source-set.txt" && -n "$(latest_control)" ]] || die 'migrate-prepare receipts missing'
   [[ ! -f "$E/migrate-stable-population.txt" ]] || { assert_stable_population_bound; return; }
-  local attempt=1 target table since f rows nullraw spec cutoff
+  local attempt=1 target table since f rows spec cutoff ir_changed ir_restored ir_total
   while [[ -e "$E/migrate-freeze-post-cutoff-$attempt.txt" ]]; do attempt=$((attempt+1)); done
   sleep "$MIGRATION_DRAIN_SECONDS"
   for target in $(migration_targets); do
@@ -713,20 +713,18 @@ cmd_migrate_freeze() {
   for target in $(migration_targets); do
     table=$(migration_target_table "$target"); since=$(migration_target_since "$target")
     cutoff=$(migration_cutoff_field "$(migration_cutoff_file "$target" "$attempt")" cutoff); f="$E/migrate-freeze-$target-preview-$attempt.json"
-    nullraw=$(psql_ro -t -c "SELECT count(*) FROM public.$table WHERE content_time_validator_version='$FROM_VERSION' AND \"indexedAt\">='$since' AND created_at_source_raw IS NULL;")
-    [[ "$nullraw" == 0 ]] || die "$target has $nullraw stable in-horizon $FROM_VERSION rows with NULL raw"
     psql_ro -c "$(migration_scope_sql "$target")" | emit "migrate-freeze-$target-scope-$attempt.tsv" || die "$target scope snapshot failed"
     [[ -s "$E/migrate-freeze-$target-scope-$attempt.tsv" ]] || die "$target scope snapshot is empty"
   done
   for target in $(migration_targets); do
     cutoff=$(migration_cutoff_field "$(migration_cutoff_file "$target" "$attempt")" cutoff)
     assert_from_before_cutoff "$target" "$cutoff"
-    table=$(migration_target_table "$target"); since=$(migration_target_since "$target")
-    nullraw=$(psql_ro -t -c "SELECT count(*) FROM public.$table WHERE content_time_validator_version='$FROM_VERSION' AND \"indexedAt\">='$since' AND created_at_source_raw IS NULL;")
-    [[ "$nullraw" == 0 ]] || die "$target gained $nullraw in-horizon $FROM_VERSION rows with NULL raw before stable marker publication; retry migrate-freeze"
   done
   f="$E/migrate-freeze-ir-preview-$attempt.json"
-  { echo "attempt=$attempt"; echo "drain_seconds=$MIGRATION_DRAIN_SECONDS"; echo "max_preview_rows=$MIGRATION_MAX_PREVIEW_ROWS"; for target in $(migration_targets); do cutoff=$(migration_cutoff_field "$(migration_cutoff_file "$target" "$attempt")" cutoff); echo "${target}_cutoff=$cutoff"; echo "${target}_rows=$(jsonq "$E/migrate-freeze-$target-preview-$attempt.json" preview.scanned)"; echo "${target}_preview_sha256=$(sha256sum "$E/migrate-freeze-$target-preview-$attempt.json" | cut -d' ' -f1)"; done; echo "ir_prereg_sha256=$(migration_cells "$f" | sha256sum | cut -d' ' -f1)"; echo "ir_gt_5m_restored=$(jsonq "$f" preview.counts.gt_5m_restored)"; echo "ir_denominator=$(jsonq "$f" preview.scanned)"; } | emit migrate-stable-population.txt
+  ir_changed=$(jsonq "$f" preview.scanned); ir_restored=$(jsonq "$f" preview.counts.gt_5m_restored); ir_total=$(migration_ir_total_denominator "$cutoff")
+  [[ "$ir_changed" =~ ^[0-9]+$ && "$ir_restored" =~ ^[0-9]+$ && "$ir_total" =~ ^[0-9]+$ ]] || die 'IR migration metrics are malformed'
+  (( ir_restored <= ir_changed && ir_changed <= ir_total )) || die 'IR migration metrics violate restored <= semantic-changed <= total denominator'
+  { echo "attempt=$attempt"; echo "drain_seconds=$MIGRATION_DRAIN_SECONDS"; echo "max_preview_rows=$MIGRATION_MAX_PREVIEW_ROWS"; for target in $(migration_targets); do cutoff=$(migration_cutoff_field "$(migration_cutoff_file "$target" "$attempt")" cutoff); echo "${target}_cutoff=$cutoff"; echo "${target}_rows=$(jsonq "$E/migrate-freeze-$target-preview-$attempt.json" preview.scanned)"; echo "${target}_preview_sha256=$(sha256sum "$E/migrate-freeze-$target-preview-$attempt.json" | cut -d' ' -f1)"; done; echo "ir_prereg_sha256=$(migration_cells "$f" | sha256sum | cut -d' ' -f1)"; echo "ir_semantic_changed=$ir_changed"; echo "ir_restored_valid=$ir_restored"; echo "ir_total_denominator=$ir_total"; } | emit migrate-stable-population.txt
   assert_stable_population_bound
   log "stable post-switch v2 population bound (attempt $attempt)"
 }
@@ -839,7 +837,7 @@ cmd_migrate_readback() {
     table=$(migration_target_table "$target"); since=$(migration_target_since "$target")
     f=$(migration_preview_one "migrate-$target-preview-after-$attempt" "$target" "$FROM_VERSION" "$TO_VERSION")
     gate_migration_preview "$f" "$(migration_remaining_spec "$target")" "$target residual"
-    [[ "$(jsonq "$f" preview.scanned)" == 0 ]] || die "$target still has bounded $FROM_VERSION rows"
+    [[ "$(jsonq "$f" preview.scanned)" == 0 ]] || die "$target still has bounded $FROM_VERSION semantic-delta rows"
     rows=$(awk -F= -v k="${target}_rows" '$1==k{print $2}' "$E/migrate-stable-population.txt")
     updated=$(for f in "$E"/migrate-$target-apply-*.json; do jsonq "$f" revalidation.updated; done | awk '{s+=$1}END{print s+0}')
     [[ "$updated" == "$rows" ]] || die "$target apply updated=$updated but prestate denominator=$rows"
@@ -854,7 +852,7 @@ cmd_migrate_readback() {
     after_out=$(psql_ro -t -c "SELECT count(*) FROM public.$table WHERE content_time_validator_version='$FROM_VERSION' AND \"indexedAt\"<'$since';"); after_total=$(psql_ro -t -c "SELECT count(*) FROM public.$table WHERE content_time_validator_version='$FROM_VERSION';")
     [[ "$before_out" == "$after_out" && $((before_total-after_total)) == "$rows" ]] || die "$target migration escaped the in-horizon snapshot"
   done
-  { echo "transition=$FROM_VERSION->$TO_VERSION"; for target in $(migration_targets); do echo "$target rows=$(awk -F= -v k="${target}_rows" '$1==k{print $2}' "$E/migrate-stable-population.txt")"; done; echo "ir_gt_5m_restored=$(jsonq "$(migration_ir_preview_file)" preview.counts.gt_5m_restored)"; echo "ir_zero_to_5m_clamped=$(jsonq "$(migration_ir_preview_file)" preview.counts.zero_to_5m_clamped)"; } | emit "migrate-readback-$attempt.txt"
+  { echo "transition=$FROM_VERSION->$TO_VERSION"; for target in $(migration_targets); do echo "$target rows=$(awk -F= -v k="${target}_rows" '$1==k{print $2}' "$E/migrate-stable-population.txt")"; done; echo "ir_semantic_changed=$(awk -F= '$1=="ir_semantic_changed"{print $2}' "$E/migrate-stable-population.txt")"; echo "ir_restored_valid=$(awk -F= '$1=="ir_restored_valid"{print $2}' "$E/migrate-stable-population.txt")"; echo "ir_total_denominator=$(awk -F= '$1=="ir_total_denominator"{print $2}' "$E/migrate-stable-population.txt")"; } | emit "migrate-readback-$attempt.txt"
 }
 cmd_migrate_rollback() { # dry-run | apply <label> [max-batches]
   local mode=${1:?dry-run|apply} label=${2:-rollback} maxb=${3:-} target f spec rows updated skipped key expected actual before_out after_out incomplete=0 attempt=1

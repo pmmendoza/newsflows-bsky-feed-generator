@@ -1,10 +1,11 @@
 import { PublisherTimeClock } from '../db/schema'
 import { sql } from 'kysely'
+import { contentTimeSupportedSql } from '../util/content-time'
 
-export function applyPublisherTimeFilter(query: any, clock: PublisherTimeClock, cutoffIso: string) {
+export function applyPublisherTimeFilter(query: any, clock: PublisherTimeClock, cutoffIso: string, contractVersion: string | null = null) {
   if (clock === 'content_time_v1') {
     return query
-      .where('post.content_time_status', '=', 'source_valid')
+      .where(contentTimeSupportedSql('post', contractVersion))
       .where(sql<boolean>`${sql.ref('post.content_time_utc')}::timestamptz >= ${cutoffIso}::timestamptz`)
   }
   return query.where('post.indexedAt', '>=', cutoffIso)

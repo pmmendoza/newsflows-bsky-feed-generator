@@ -24,8 +24,12 @@ import { getRankerPriorityServingStatus } from '../algos/ranker-priority-helper'
 import { assessEngagementScienceEligibility } from '../util/engagement-time-contract'
 import {
   CONTENT_TIME_VALIDATOR_VERSION,
+  contentTimeProjectionMarkerSql,
+  contentTimeSupportedSql,
+  effectiveContentTimeSql,
   isSupportedContentTimeVersion,
   resolveActiveContentTimeContract,
+  semanticIncompatibleContentTimeSql,
 } from '../util/content-time'
 
 type EngagementExportType = 'like' | 'repost' | 'comment' | 'quote'
@@ -44,6 +48,7 @@ type EngagementExportEvent = {
   indexed_at: string
   content_time_status: string | null
   content_time_validator_version: string | null
+  content_time_projection: string | null
   comment_root_uri: string | null
   quote_subject_uri: string | null
   publisher_target_any: boolean
@@ -1341,20 +1346,30 @@ export default function registerMonitorEndpoints(server: Server, ctx: AppContext
             ? buildAtUriDidMembershipFilter(sql`p."rootUri"`, publisherDids, false)
             : sql<boolean>`true`
 
-      const engagementEventTime = contentTime ? sql`e.content_time_utc` : sql`e."createdAt"`
-      const postEventTime = contentTime ? sql`p.content_time_utc` : sql`p."createdAt"`
+      const engagementEventTime = contentTime ? effectiveContentTimeSql('e', contractVersion, true) : sql`e."createdAt"`
+      const postEventTime = contentTime ? effectiveContentTimeSql('p', contractVersion, false) : sql`p."createdAt"`
       const engagementWindowTime = validityCohort ? sql`e."indexedAt"` : engagementEventTime
       const postWindowTime = validityCohort ? sql`p."indexedAt"` : postEventTime
-      const engagementStatus = responseSource ? sql`'legacy_unknown'` : sql`e.content_time_status`
+      const engagementStatus = responseSource
+        ? sql`'legacy_unknown'`
+        : contentTime && contractVersion === 'newsflows-content-time/v3'
+          ? sql`CASE WHEN ${contentTimeSupportedSql('e', contractVersion, true)} THEN 'source_valid' ELSE e.content_time_status END`
+          : sql`e.content_time_status`
       const postStatus = responseSource ? sql`'legacy_unknown'` : sql`p.content_time_status`
       const engagementValidator = responseSource ? sql`NULL` : sql`e.content_time_validator_version`
       const postValidator = responseSource ? sql`NULL` : sql`p.content_time_validator_version`
+      const engagementProjection = responseSource ? sql`NULL` : contentTime ? contentTimeProjectionMarkerSql('e', contractVersion) : sql`NULL`
+      const postProjection = sql`NULL`
+      const engagementSemanticIncompatible = responseSource || !contentTime ? sql<boolean>`false` : semanticIncompatibleContentTimeSql('e', contractVersion, true)
+      const postSemanticIncompatible = responseSource || !contentTime ? sql<boolean>`false` : semanticIncompatibleContentTimeSql('p', contractVersion, false)
+      const engagementContractEligible = !contentTime ? sql<boolean>`true` : contentTimeSupportedSql('e', contractVersion, true)
+      const postContractEligible = !contentTime ? sql<boolean>`true` : contentTimeSupportedSql('p', contractVersion, false)
       const engagementEligible = !contentTime || validityCohort
         ? sql<boolean>`true`
-        : sql<boolean>`e.content_time_status = 'source_valid' AND e.content_time_validator_version = ${contractVersion}`
+        : contentTimeSupportedSql('e', contractVersion, true)
       const postEligible = !contentTime || validityCohort
         ? sql<boolean>`true`
-        : sql<boolean>`p.content_time_status = 'source_valid' AND p.content_time_validator_version = ${contractVersion}`
+        : contentTimeSupportedSql('p', contractVersion, false)
       const engagementWindowFilter = validityCohort || !contentTime
         ? sql<boolean>`${engagementWindowTime} >= ${since} AND ${engagementWindowTime} < ${until}`
         : sql<boolean>`(${engagementWindowTime})::timestamptz >= ${since}::timestamptz AND (${engagementWindowTime})::timestamptz < ${until}::timestamptz`
@@ -1380,6 +1395,9 @@ export default function registerMonitorEndpoints(server: Server, ctx: AppContext
             e."indexedAt" AS indexed_at,
             ${engagementStatus} AS content_time_status,
             ${engagementValidator} AS content_time_validator_version,
+            ${engagementProjection} AS content_time_projection,
+            ${engagementSemanticIncompatible} AS semantic_incompatible,
+            ${engagementContractEligible} AS contract_eligible,
             (${subscriberActorExpr(sql`e.author`)}) AS is_subscriber_actor
           FROM engagement e
           ${engagementJoin}
@@ -1403,6 +1421,9 @@ export default function registerMonitorEndpoints(server: Server, ctx: AppContext
             p."indexedAt" AS indexed_at,
             ${postStatus} AS content_time_status,
             ${postValidator} AS content_time_validator_version,
+            ${postProjection} AS content_time_projection,
+            ${postSemanticIncompatible} AS semantic_incompatible,
+            ${postContractEligible} AS contract_eligible,
             (${subscriberActorExpr(sql`p.author`)}) AS is_subscriber_actor
           FROM post p
           ${postJoin}
@@ -1426,6 +1447,9 @@ export default function registerMonitorEndpoints(server: Server, ctx: AppContext
             '' AS indexed_at,
             'legacy_unknown' AS content_time_status,
             NULL AS content_time_validator_version,
+            NULL AS content_time_projection,
+            false AS semantic_incompatible,
+            false AS contract_eligible,
             false AS is_subscriber_actor
           WHERE false
         `
@@ -1472,6 +1496,8 @@ export default function registerMonitorEndpoints(server: Server, ctx: AppContext
             b.indexed_at,
             b.content_time_status,
             b.content_time_validator_version,
+            b.content_time_projection,
+            b.semantic_incompatible,
             (${publisherTargetExpr}) AS is_publisher_target,
             b.is_subscriber_actor,
             CASE b.type
@@ -1507,7 +1533,9 @@ export default function registerMonitorEndpoints(server: Server, ctx: AppContext
             created_at,
             indexed_at,
             content_time_status,
-            content_time_validator_version
+            content_time_validator_version,
+            content_time_projection,
+            semantic_incompatible
           FROM scoped
           ORDER BY event_uri, created_at DESC, type_rank DESC
         )
@@ -1520,6 +1548,7 @@ export default function registerMonitorEndpoints(server: Server, ctx: AppContext
           d.indexed_at,
           d.content_time_status,
           d.content_time_validator_version,
+          d.content_time_projection,
           a.comment_root_uri,
           a.quote_subject_uri,
           COALESCE(a.publisher_target_any, false) AS publisher_target_any,
@@ -1552,6 +1581,8 @@ export default function registerMonitorEndpoints(server: Server, ctx: AppContext
         source_invalid: 0,
         legacy_unknown: 0,
         validator_version_mismatch: 0,
+        projected_v2_future: 0,
+        semantic_incompatible: 0,
       }
       if (!responseSource && feedClock) {
         const result = await sql<{
@@ -1560,17 +1591,19 @@ export default function registerMonitorEndpoints(server: Server, ctx: AppContext
           source_invalid: number | string
           legacy_unknown: number | string
           validator_version_mismatch: number | string
+          projected_v2_future: number | string
+          semantic_incompatible: number | string
         }>`
           WITH base AS (${validityBaseUnion}), candidates AS (
             SELECT DISTINCT ON (event_uri)
-              event_uri, content_time_status, content_time_validator_version
+              event_uri, content_time_status, content_time_validator_version,
+              content_time_projection, semantic_incompatible, contract_eligible
             FROM base
             ORDER BY event_uri
           )
           SELECT
             COUNT(*) FILTER (
-              WHERE content_time_status = 'source_valid'
-                AND content_time_validator_version = ${contractVersion}
+              WHERE contract_eligible
             ) AS numerator,
             COUNT(*) AS denominator,
             COUNT(*) FILTER (WHERE content_time_status = 'source_invalid') AS source_invalid,
@@ -1578,7 +1611,9 @@ export default function registerMonitorEndpoints(server: Server, ctx: AppContext
             COUNT(*) FILTER (
               WHERE content_time_status = 'source_valid'
                 AND content_time_validator_version IS DISTINCT FROM ${contractVersion}
-            ) AS validator_version_mismatch
+            ) AS validator_version_mismatch,
+            COUNT(*) FILTER (WHERE content_time_projection = 'v2_future_to_indexed_at') AS projected_v2_future,
+            COUNT(*) FILTER (WHERE semantic_incompatible) AS semantic_incompatible
           FROM candidates
         `.execute(db)
         const counts = result.rows[0]
@@ -1588,6 +1623,8 @@ export default function registerMonitorEndpoints(server: Server, ctx: AppContext
           source_invalid: normalizeCount(counts?.source_invalid),
           legacy_unknown: normalizeCount(counts?.legacy_unknown),
           validator_version_mismatch: normalizeCount(counts?.validator_version_mismatch),
+          projected_v2_future: normalizeCount(counts?.projected_v2_future),
+          semantic_incompatible: normalizeCount(counts?.semantic_incompatible),
         }
       }
       const minimumValidShare = typeof feedClock?.content_time_cutover_min_valid_share === 'number'
@@ -1609,9 +1646,10 @@ export default function registerMonitorEndpoints(server: Server, ctx: AppContext
         numerator: validity.numerator,
         denominator: validity.denominator,
         allowEmptyPopulation: scope === 'subscriber_on_publisher',
+        semanticIncompatible: validity.semantic_incompatible,
       })
 
-      const finalScienceEligible = resolverFailureReason === null && scienceEligible
+      const finalScienceEligible = resolverFailureReason === null && validity.semantic_incompatible === 0 && scienceEligible
 
       const response: any = {
         since,
@@ -1636,6 +1674,8 @@ export default function registerMonitorEndpoints(server: Server, ctx: AppContext
       }
       if (resolverFailureReason) {
         response.science_ineligible_reason = resolverFailureReason
+      } else if (validity.semantic_incompatible > 0) {
+        response.science_ineligible_reason = 'semantic_incompatible'
       }
       if (nextCursor) {
         response.next_cursor = nextCursor
@@ -1668,6 +1708,8 @@ export default function registerMonitorEndpoints(server: Server, ctx: AppContext
               b.indexed_at,
               b.content_time_status,
               b.content_time_validator_version,
+              b.content_time_projection,
+              b.semantic_incompatible,
               (${publisherTargetExpr}) AS is_publisher_target,
               b.is_subscriber_actor,
               CASE b.type
@@ -1703,7 +1745,9 @@ export default function registerMonitorEndpoints(server: Server, ctx: AppContext
               created_at,
               indexed_at,
               content_time_status,
-              content_time_validator_version
+              content_time_validator_version,
+              content_time_projection,
+              semantic_incompatible
             FROM scoped
             ORDER BY event_uri, created_at DESC, type_rank DESC
           )
@@ -1716,6 +1760,7 @@ export default function registerMonitorEndpoints(server: Server, ctx: AppContext
             d.indexed_at,
             d.content_time_status,
             d.content_time_validator_version,
+            d.content_time_projection,
             a.comment_root_uri,
             a.quote_subject_uri,
             COALESCE(a.publisher_target_any, false) AS publisher_target_any,

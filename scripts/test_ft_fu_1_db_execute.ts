@@ -187,7 +187,7 @@ async function main() {
       )
     `.execute(db)
 
-    // b. 0-5m skew (valid in v2, clamped in v3)
+    // b. +1m skew (valid in v2, clamped in v3)
     await sql`
       INSERT INTO public.post (
         uri, cid, "indexedAt", "createdAt", author, text, "rootUri", "rootCid",
@@ -195,14 +195,14 @@ async function main() {
         created_at_source_raw, content_time_utc, content_time_status,
         content_time_clamp_reason, content_time_validator_version
       ) VALUES (
-        ${uri(PUBLISHER_A, 'post-skew-3m')}, 'cid2', ${receipt}, '2026-08-12T12:03:00.000Z',
+        ${uri(PUBLISHER_A, 'post-skew-1m')}, 'cid2', ${receipt}, '2026-08-12T12:01:00.000Z',
         ${PUBLISHER_A}, 'test', '', '', '', '', '', '', '', '',
-        ${Buffer.from('2026-08-12T12:03:00.000Z', 'utf8')}, '2026-08-12T12:03:00.000Z', 'source_valid',
+        ${Buffer.from('2026-08-12T12:01:00.000Z', 'utf8')}, '2026-08-12T12:01:00.000Z', 'source_valid',
         null, ${CONTENT_TIME_VALIDATOR_VERSION_V2}
       )
     `.execute(db)
 
-    // c. >5m skew (invalid future_skew in v2, restored to clamped in v3)
+    // c. +20m skew (invalid future_skew in v2, restored to clamped in v3)
     await sql`
       INSERT INTO public.post (
         uri, cid, "indexedAt", "createdAt", author, text, "rootUri", "rootCid",
@@ -212,10 +212,29 @@ async function main() {
       ) VALUES (
         ${uri(PUBLISHER_A, 'post-skew-1h')}, 'cid3', ${receipt}, ${receipt},
         ${PUBLISHER_A}, 'test', '', '', '', '', '', '', '', '',
-        ${Buffer.from('2026-08-12T13:00:00.000Z', 'utf8')}, null, 'source_invalid',
+        ${Buffer.from('2026-08-12T12:20:00.000Z', 'utf8')}, null, 'source_invalid',
         'future_skew', ${CONTENT_TIME_VALIDATOR_VERSION_V2}
       )
     `.execute(db)
+
+    // Missing and unparseable values have identical v2/v3 semantics and stay v2.
+    for (const [rkey, raw, reason] of [
+      ['post-missing', Buffer.alloc(0), 'missing'],
+      ['post-unparseable', Buffer.from('not-a-time', 'utf8'), 'unparseable'],
+    ] as const) {
+      await sql`
+        INSERT INTO public.post (
+          uri, cid, "indexedAt", "createdAt", author, text, "rootUri", "rootCid",
+          link_uri, link_title, link_description, "linkUrl", "linkTitle", "linkDescription",
+          created_at_source_raw, content_time_utc, content_time_status,
+          content_time_clamp_reason, content_time_validator_version
+        ) VALUES (
+          ${uri(PUBLISHER_A, rkey)}, ${`cid-${rkey}`}, ${receipt}, ${receipt},
+          ${PUBLISHER_A}, 'test', '', '', '', '', '', '', '', '',
+          ${raw}, null, 'source_invalid', ${reason}, ${CONTENT_TIME_VALIDATOR_VERSION_V2}
+        )
+      `.execute(db)
+    }
 
     // Run forward post revalidation v2 -> v3
     const forwardPostResult = await runContentTimeRevalidation(db, {
@@ -232,10 +251,10 @@ async function main() {
       lockTimeoutMs: 5000,
       statementTimeoutMs: 30_000,
     })
-    assert.equal(forwardPostResult.updated, 3)
+    assert.equal(forwardPostResult.updated, 2)
     assert.equal(forwardPostResult.counts.zero_to_5m_clamped, 1)
     assert.equal(forwardPostResult.counts.gt_5m_restored, 1)
-    assert.equal(forwardPostResult.counts.v2_valid_to_v3_valid, 1)
+    assert.equal(forwardPostResult.counts.v2_valid_to_v3_valid, 0)
     assert.deepEqual(forwardPostResult.counts.by_invalid_reason, {}, 'clamped valid rows must not appear in invalid reasons')
 
     // A native v3 row at the exclusive cutoff is outside the migrated cohort.
@@ -268,10 +287,10 @@ async function main() {
       lockTimeoutMs: 5000,
       statementTimeoutMs: 30_000,
     })
-    assert.equal(reversePostResult.updated, 3)
+    assert.equal(reversePostResult.updated, 2)
     assert.equal(reversePostResult.counts.zero_to_5m_unclamped, 1)
     assert.equal(reversePostResult.counts.gt_5m_invalidated, 1)
-    assert.equal(reversePostResult.counts.v3_valid_to_v2_valid, 1)
+    assert.equal(reversePostResult.counts.v3_valid_to_v2_valid, 0)
     assert.equal(reversePostResult.counts.by_invalid_reason.future_skew, 1)
     const nativeVersion = (await sql<{ version: string }>`
       SELECT content_time_validator_version AS version
@@ -279,51 +298,34 @@ async function main() {
       WHERE uri = ${uri(PUBLISHER_A, 'native-v3-after-cutoff')}
     `.execute(db)).rows[0].version
     assert.equal(nativeVersion, CONTENT_TIME_VALIDATOR_VERSION_V3, 'rollback must leave native rows at/after the cutoff untouched')
-
-    // 4. Engagement forward (v2->v3) and reverse (v3->v2) revalidation
-    await sql`
-      INSERT INTO public.engagement (
-        uri, cid, "subjectUri", "subjectCid", type, "indexedAt", "createdAt", author,
-        created_at_source_raw, content_time_utc, content_time_status,
-        content_time_clamp_reason, content_time_validator_version
-      ) VALUES (
-        ${engagementUri('did:plc:user1', 'like-skew')}, 'cid3', ${uri(PUBLISHER_A, 'post-past')}, 'cid1', 1, ${receipt}, '2026-08-12T12:02:00.000Z', 'did:plc:user1',
-        ${Buffer.from('2026-08-12T12:02:00.000Z', 'utf8')}, '2026-08-12T12:02:00.000Z', 'source_valid',
-        null, ${CONTENT_TIME_VALIDATOR_VERSION_V2}
+    const compatibleVersions = await sql<{ version: string; rows: string }>`
+      SELECT content_time_validator_version AS version, count(*)::text AS rows
+      FROM public.post
+      WHERE uri IN (
+        ${uri(PUBLISHER_A, 'post-past')},
+        ${uri(PUBLISHER_A, 'post-missing')},
+        ${uri(PUBLISHER_A, 'post-unparseable')}
       )
+      GROUP BY content_time_validator_version
     `.execute(db)
+    assert.deepEqual(compatibleVersions.rows, [{ version: CONTENT_TIME_VALIDATOR_VERSION_V2, rows: '3' }], 'semantically unchanged rows retain v2 provenance')
 
-    const forwardEngResult = await runContentTimeRevalidation(db, {
-      table: 'engagement',
-      since,
-      fromVersion: CONTENT_TIME_VALIDATOR_VERSION_V2,
-      toVersion: CONTENT_TIME_VALIDATOR_VERSION_V3,
-      batchSize: 500,
-      packetSha256: PACKET_SHA,
-      maxDurationMs: 30_000,
-      pauseMs: 0,
-      lockTimeoutMs: 5000,
-      statementTimeoutMs: 30_000,
-    })
-    assert.equal(forwardEngResult.updated, 1)
-    assert.equal(forwardEngResult.counts.zero_to_5m_clamped, 1)
-    assert.equal(forwardEngResult.batches[0].cursor_author, '', 'engagement batch summary must omit author')
-    assert(!forwardEngResult.batches[0].cursor_uri.includes('at://'), 'engagement batch summary must hash cursor URI')
-
-    const reverseEngResult = await runContentTimeRevalidation(db, {
-      table: 'engagement',
-      since,
-      fromVersion: CONTENT_TIME_VALIDATOR_VERSION_V3,
-      toVersion: CONTENT_TIME_VALIDATOR_VERSION_V2,
-      batchSize: 500,
-      packetSha256: PACKET_SHA,
-      maxDurationMs: 30_000,
-      pauseMs: 0,
-      lockTimeoutMs: 5000,
-      statementTimeoutMs: 30_000,
-    })
-    assert.equal(reverseEngResult.updated, 1)
-    assert.equal(reverseEngResult.counts.zero_to_5m_unclamped, 1)
+    // Engagement history is projected at export time, never physically migrated.
+    await assert.rejects(
+      runContentTimeRevalidation(db, {
+        table: 'engagement',
+        since,
+        fromVersion: CONTENT_TIME_VALIDATOR_VERSION_V2,
+        toVersion: CONTENT_TIME_VALIDATOR_VERSION_V3,
+        batchSize: 500,
+        packetSha256: PACKET_SHA,
+        maxDurationMs: 30_000,
+        pauseMs: 0,
+        lockTimeoutMs: 5000,
+        statementTimeoutMs: 30_000,
+      }),
+      /post-only/,
+    )
 
     console.log('ft-fu-1 db execution tests passed')
   } finally {

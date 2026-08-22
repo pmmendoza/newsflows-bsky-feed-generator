@@ -44,6 +44,7 @@ export function publisherQueryEngagement(
   shortname = '',
   publisherTimeClock: PublisherTimeClock = 'receipt_time',
   referenceTimeIso = new Date().toISOString(),
+  contentTimeContractVersion: string | null = null,
 ) {
   const base = db
     .selectFrom('post')
@@ -53,7 +54,7 @@ export function publisherQueryEngagement(
     .selectAll('post')
     .where('author', '=', publisherDid)
   const filtered = applyPoliticianFilterIfEnabled(
-    applyPublisherTimeFilter(base, publisherTimeClock, timeLimit),
+    applyPublisherTimeFilter(base, publisherTimeClock, timeLimit, contentTimeContractVersion),
     shortname,
   )
   const timeColumn = publisherTimeClock === 'content_time_v1' ? 'content_time_utc' : 'indexedAt'

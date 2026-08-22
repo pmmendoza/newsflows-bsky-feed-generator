@@ -10,7 +10,7 @@ function check(condition: unknown, message: string): asserts condition {
 const reference = Date.parse('2026-08-14T12:00:00Z')
 const plan = deriveEngagementRefreshPlan([
   { rkey: 'receipt', publisher_did: 'did:r', publisher_post_max_age_days: 3, publisher_time_clock: 'receipt_time' },
-  { rkey: 'content', publisher_did: 'did:c', publisher_post_max_age_days: 10, publisher_time_clock: 'content_time_v1' },
+  { rkey: 'content', publisher_did: 'did:c', publisher_post_max_age_days: 10, publisher_time_clock: 'content_time_v1', content_time_contract_version: 'newsflows-content-time/v3' },
 ], reference)
 check(plan.receiptDays === 3, 'receipt scan must cover receipt-clock consumers only')
 check(plan.receiptCutoff === '2026-08-11T12:00:00.000Z', 'receipt cutoff must use receipt-clock catalog horizons')
@@ -18,6 +18,7 @@ check(plan.contentDays === 10, 'content scan must cover all content-clock consum
 check(plan.contentCutoff === '2026-08-04T12:00:00.000Z', 'content cutoff must use content time')
 check(plan.receiptPublisherRows.length === 1, 'receipt publishers must not leak into content scan')
 check(plan.contentPublisherRows.length === 1, 'content publishers must not leak into receipt publisher scan')
+check(plan.contentContractVersion === 'newsflows-content-time/v3', 'content refresh must bind the active compatibility contract')
 
 let failedClosed = false
 try {
@@ -89,6 +90,16 @@ const eligibleV3 = assessEngagementScienceEligibility({
   denominator: 100,
 })
 check(eligibleV3.scienceEligible && eligibleV3.observedValidShare === 0.8, 'v3 active contract with matching v3 version is science eligible')
+check(assessEngagementScienceEligibility({
+  ...activeContractV3,
+  contentTime: true, explicitBounds: true, contractVersion: 'newsflows-content-time/v3',
+  minimumValidShare: 1, numerator: 100, denominator: 100, semanticIncompatible: 0,
+}).scienceEligible, 'compatible mixed v2/v3 evidence remains eligible under the v3 contract')
+check(!assessEngagementScienceEligibility({
+  ...activeContractV3,
+  contentTime: true, explicitBounds: true, contractVersion: 'newsflows-content-time/v3',
+  minimumValidShare: 0.8, numerator: 99, denominator: 100, semanticIncompatible: 1,
+}).scienceEligible, 'one residual semantic-delta or unknown-version row must fail closed')
 
 check(!assessEngagementScienceEligibility({
   ...activeContractV3,
@@ -105,5 +116,7 @@ check(monitorSource.includes(".where('feed_id', '=', feedId)"), 'science export 
 check(monitorSource.includes('? [feedClock.publisher_did]'), 'feed-scoped export must use the selected publisher population')
 check(monitorSource.includes("content_time_status = 'source_valid'"), 'content-time science export must exclude invalid events')
 check(monitorSource.includes('denominator_clock'), 'science export must declare its bounded validity denominator')
+check(monitorSource.includes('v2_future_to_indexed_at'), 'v3 engagement export must expose its bounded v2 future projection')
+check(monitorSource.includes("science_ineligible_reason = 'semantic_incompatible'"), 'semantic incompatibility must be explicit evidence')
 
 console.log('engagement time contract tests passed')

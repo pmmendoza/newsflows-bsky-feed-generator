@@ -8,6 +8,8 @@ type Scenario = {
   contract: string
   numerator: number
   denominator: number
+  projected: number
+  semanticIncompatible: number
 }
 
 function check(condition: unknown, message: string): asserts condition {
@@ -19,6 +21,8 @@ async function main() {
     contract: 'newsflows-content-time/v2',
     numerator: 80,
     denominator: 100,
+    projected: 0,
+    semanticIncompatible: 0,
   }
   const queries: string[] = []
   const client = {
@@ -41,6 +45,8 @@ async function main() {
           source_invalid: scenario.denominator - scenario.numerator,
           legacy_unknown: 0,
           validator_version_mismatch: 0,
+          projected_v2_future: scenario.projected,
+          semantic_incompatible: scenario.semanticIncompatible,
         }] }
       }
       if (text.includes('SELECT DISTINCT publisher_did')) {
@@ -78,6 +84,16 @@ async function main() {
     payload = await response.json()
     check(response.ok && payload.science_eligible === true, 'v3 active contract must be science eligible')
     check(payload.content_time_contract_version === 'newsflows-content-time/v3', 'v3 contract version reflected in response')
+    scenario.projected = 2
+    response = await fetch(base + query, { headers })
+    payload = await response.json()
+    check(payload.science_eligible === true && payload.validity.projected_v2_future === 2, 'bounded v2 future engagement projection remains eligible and is counted')
+    scenario.projected = 0
+    scenario.semanticIncompatible = 1
+    response = await fetch(base + query, { headers })
+    payload = await response.json()
+    check(payload.science_eligible === false && payload.science_ineligible_reason === 'semantic_incompatible', 'residual affected or unknown-version evidence fails closed')
+    scenario.semanticIncompatible = 0
 
     invalidateActiveContentTimeContractCache()
     scenario.contract = 'unsupported/v2'

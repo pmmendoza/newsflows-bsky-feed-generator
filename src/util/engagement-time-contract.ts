@@ -9,6 +9,7 @@ export function assessEngagementScienceEligibility(input: {
   numerator: number
   denominator: number
   allowEmptyPopulation: boolean
+  semanticIncompatible?: number
 }) {
   const emptyPopulation = input.allowEmptyPopulation && input.denominator === 0 && input.numerator === 0
   const observedValidShare = input.denominator > 0 ? input.numerator / input.denominator : null
@@ -26,6 +27,7 @@ export function assessEngagementScienceEligibility(input: {
       && input.explicitBounds
       && isSupported
       && input.contractVersion === input.expectedContractVersion
+      && (input.semanticIncompatible ?? 0) === 0
       && Number.isFinite(input.minimumValidShare)
       && input.minimumValidShare > 0
       && validPopulation,
