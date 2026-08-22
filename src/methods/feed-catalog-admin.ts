@@ -427,10 +427,14 @@ export function operatorStatus(row: Pick<FeedCatalog, 'enabled' | 'access_policy
 }
 
 export function feedCatalogItemPayload(row: FeedCatalog) {
-  const servingWindow = resolvePublisherServingWindow(
-    row.publisher_post_max_age_days,
-    row.publisher_post_max_age_source,
-  )
+  const servingWindow = !row.enabled
+    && row.publisher_post_max_age_days == null
+    && row.publisher_post_max_age_source == null
+    ? null
+    : resolvePublisherServingWindow(
+      row.publisher_post_max_age_days,
+      row.publisher_post_max_age_source,
+    )
   return {
     feed_id: row.feed_id,
     rkey: row.rkey,
@@ -456,7 +460,7 @@ export function feedCatalogItemPayload(row: FeedCatalog) {
     content_time_cutover_min_valid_share: row.content_time_cutover_min_valid_share ?? null,
     content_time_contract_version: row.content_time_contract_version ?? null,
     catalog_revision: Number(row.catalog_revision ?? 0),
-    publisher_serving_window: {
+    publisher_serving_window: servingWindow == null ? null : {
       effective_hours: servingWindow.effectiveHours,
       effective_days: servingWindow.effectiveDays,
       effective_source: servingWindow.source,

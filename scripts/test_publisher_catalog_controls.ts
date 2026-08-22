@@ -2,6 +2,7 @@ import {
   buildFeedCatalogApplyResult,
   buildFeedCatalogDryRun,
   currentValueMismatches,
+  feedCatalogListPayload,
   feedCatalogShowPayload,
   validateUpdate,
 } from '../src/methods/feed-catalog-admin'
@@ -53,6 +54,7 @@ const after = { ...current, ...parsed.row.patch }
 const applied = buildFeedCatalogApplyResult(current, after, dryRun, true)
 check(applied.readback.publisher_post_max_age_days === 10, 'apply readback must expose value')
 check(applied.readback.publisher_post_max_age_source === 'study_default', 'apply readback must expose provenance')
+check(applied.readback.publisher_serving_window !== null, 'enabled readback must expose its publisher window')
 check(!applied.readback.publisher_serving_window.compatibility_fallback_active, 'catalog value must disable fallback')
 const rankerCompatibility = feedCatalogShowPayload({
   ...current,
@@ -94,5 +96,13 @@ try {
   missingWindowFailedClosed = true
 }
 check(missingWindowFailedClosed, 'readback must fail closed without a catalog publisher window')
+
+const disabledWithoutWindow = feedCatalogListPayload([{
+  ...current,
+  enabled: false,
+  publisher_post_max_age_days: null,
+  publisher_post_max_age_source: null,
+}])
+check(disabledWithoutWindow.feeds[0].publisher_serving_window === null, 'disabled list readback must permit a null publisher window')
 
 console.log('publisher catalog control tests passed')
