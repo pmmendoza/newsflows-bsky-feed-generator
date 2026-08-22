@@ -1594,6 +1594,8 @@ export default function registerMonitorEndpoints(server: Server, ctx: AppContext
         legacy_unknown: 0,
         validator_version_mismatch: 0,
         projected_v2_future: 0,
+        projected_v3_to_v2_valid: 0,
+        projected_v3_to_v2_invalid: 0,
         semantic_incompatible: 0,
       }
       if (!responseSource && feedClock) {
@@ -1604,6 +1606,8 @@ export default function registerMonitorEndpoints(server: Server, ctx: AppContext
           legacy_unknown: number | string
           validator_version_mismatch: number | string
           projected_v2_future: number | string
+          projected_v3_to_v2_valid: number | string
+          projected_v3_to_v2_invalid: number | string
           semantic_incompatible: number | string
         }>`
           WITH base AS (${validityBaseUnion}), candidates AS (
@@ -1625,6 +1629,8 @@ export default function registerMonitorEndpoints(server: Server, ctx: AppContext
                 AND content_time_validator_version IS DISTINCT FROM ${contractVersion}
             ) AS validator_version_mismatch,
             COUNT(*) FILTER (WHERE content_time_projection = 'v2_future_to_indexed_at') AS projected_v2_future,
+            COUNT(*) FILTER (WHERE content_time_projection = 'v3_to_v2_source_valid') AS projected_v3_to_v2_valid,
+            COUNT(*) FILTER (WHERE content_time_projection = 'v3_to_v2_source_invalid') AS projected_v3_to_v2_invalid,
             COUNT(*) FILTER (WHERE semantic_incompatible) AS semantic_incompatible
           FROM candidates
         `.execute(db)
@@ -1636,6 +1642,8 @@ export default function registerMonitorEndpoints(server: Server, ctx: AppContext
           legacy_unknown: normalizeCount(counts?.legacy_unknown),
           validator_version_mismatch: normalizeCount(counts?.validator_version_mismatch),
           projected_v2_future: normalizeCount(counts?.projected_v2_future),
+          projected_v3_to_v2_valid: normalizeCount(counts?.projected_v3_to_v2_valid),
+          projected_v3_to_v2_invalid: normalizeCount(counts?.projected_v3_to_v2_invalid),
           semantic_incompatible: normalizeCount(counts?.semantic_incompatible),
         }
       }

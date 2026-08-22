@@ -28,6 +28,34 @@ function contentTimeRef(alias: string, column: string) {
   return sql.ref(`${alias}.${column}`)
 }
 
+// Validator-produced v3 provenance proves which raw values are parseable; the
+// reverse projection then reapplies v2's exact five-minute receipt-time bound.
+function v3ProjectableToV2Sql(alias: string) {
+  const status = contentTimeRef(alias, 'content_time_status')
+  const reason = contentTimeRef(alias, 'content_time_clamp_reason')
+  const version = contentTimeRef(alias, 'content_time_validator_version')
+  const raw = contentTimeRef(alias, 'created_at_source_raw')
+  const rawText = sql`convert_from(${raw}, 'UTF8')`
+  return sql<boolean>`${version} = ${CONTENT_TIME_VALIDATOR_VERSION_V3}
+    AND ${raw} IS NOT NULL AND (
+      (${status} = 'source_valid' AND (${reason} IS NULL OR ${reason} = 'future_skew_clamped')
+        AND ${rawText} ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]+)?([Zz]|[+-][0-9]{2}:[0-9]{2})$')
+      OR (${status} = 'source_invalid' AND ${reason} IN ('missing', 'unparseable'))
+    )`
+}
+
+function v3ProjectedToV2ValidSql(alias: string) {
+  const status = contentTimeRef(alias, 'content_time_status')
+  const rawText = sql`convert_from(${contentTimeRef(alias, 'created_at_source_raw')}, 'UTF8')`
+  const indexedAt = contentTimeRef(alias, 'indexedAt')
+  return sql<boolean>`CASE
+    WHEN (${v3ProjectableToV2Sql(alias)}) AND ${status} = 'source_valid'
+      THEN (${rawText})::timestamptz <= (${indexedAt})::timestamptz
+        + ${CONTENT_TIME_POLICY_V2.maxFutureSkewMs} * interval '1 millisecond'
+    ELSE false
+  END`
+}
+
 export function isV2FutureSemanticDeltaSql(alias: string) {
   const status = contentTimeRef(alias, 'content_time_status')
   const reason = contentTimeRef(alias, 'content_time_clamp_reason')
@@ -55,14 +83,17 @@ export function revalidationSemanticDeltaSql(alias: string, fromVersion: string,
 export function contentTimeSupportedSql(
   alias: string,
   contractVersion: string | null,
-  projectV2Future = false,
+  projectVersionCompatibility = false,
 ) {
   const status = contentTimeRef(alias, 'content_time_status')
   const version = contentTimeRef(alias, 'content_time_validator_version')
   const contentTime = contentTimeRef(alias, 'content_time_utc')
   const indexedAt = contentTimeRef(alias, 'indexedAt')
   if (contractVersion === CONTENT_TIME_VALIDATOR_VERSION_V2) {
-    return sql<boolean>`${status} = 'source_valid' AND ${version} = ${CONTENT_TIME_VALIDATOR_VERSION_V2}`
+    const storedV2 = sql<boolean>`${status} = 'source_valid' AND ${version} = ${CONTENT_TIME_VALIDATOR_VERSION_V2}`
+    return projectVersionCompatibility
+      ? sql<boolean>`(${storedV2}) OR (${v3ProjectedToV2ValidSql(alias)})`
+      : storedV2
   }
   if (contractVersion === CONTENT_TIME_VALIDATOR_VERSION_V3) {
     const storedCompatible = sql<boolean>`${status} = 'source_valid' AND (
@@ -70,31 +101,53 @@ export function contentTimeSupportedSql(
       OR (${version} = ${CONTENT_TIME_VALIDATOR_VERSION_V2}
         AND ${contentTime} <= ${indexedAt})
     )`
-    return projectV2Future
+    return projectVersionCompatibility
       ? sql<boolean>`(${storedCompatible}) OR (${isV2FutureSemanticDeltaSql(alias)})`
       : storedCompatible
   }
   return sql<boolean>`false`
 }
 
-export function effectiveContentTimeSql(alias: string, contractVersion: string | null, projectV2Future = false) {
-  if (contractVersion === CONTENT_TIME_VALIDATOR_VERSION_V3 && projectV2Future) {
+export function effectiveContentTimeSql(alias: string, contractVersion: string | null, projectVersionCompatibility = false) {
+  if (contractVersion === CONTENT_TIME_VALIDATOR_VERSION_V2 && projectVersionCompatibility) {
+    const rawText = sql`convert_from(${contentTimeRef(alias, 'created_at_source_raw')}, 'UTF8')`
+    return sql`CASE
+      WHEN ${v3ProjectedToV2ValidSql(alias)}
+        THEN to_char((${rawText})::timestamptz AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"')
+      ELSE ${contentTimeRef(alias, 'content_time_utc')}
+    END`
+  }
+  if (contractVersion === CONTENT_TIME_VALIDATOR_VERSION_V3 && projectVersionCompatibility) {
     return sql`CASE WHEN ${isV2FutureSemanticDeltaSql(alias)} THEN ${contentTimeRef(alias, 'indexedAt')} ELSE ${contentTimeRef(alias, 'content_time_utc')} END`
   }
   return sql`${contentTimeRef(alias, 'content_time_utc')}`
 }
 
 export function contentTimeProjectionMarkerSql(alias: string, contractVersion: string | null) {
+  if (contractVersion === CONTENT_TIME_VALIDATOR_VERSION_V2) {
+    const version = contentTimeRef(alias, 'content_time_validator_version')
+    return sql`CASE
+      WHEN ${v3ProjectedToV2ValidSql(alias)} THEN 'v3_to_v2_source_valid'
+      WHEN ${v3ProjectableToV2Sql(alias)} THEN 'v3_to_v2_source_invalid'
+      WHEN ${version} = ${CONTENT_TIME_VALIDATOR_VERSION_V3} THEN 'v3_to_v2_incompatible'
+      ELSE NULL
+    END`
+  }
   return contractVersion === CONTENT_TIME_VALIDATOR_VERSION_V3
     ? sql`CASE WHEN ${isV2FutureSemanticDeltaSql(alias)} THEN 'v2_future_to_indexed_at' ELSE NULL END`
     : sql`NULL`
 }
 
-export function semanticIncompatibleContentTimeSql(alias: string, contractVersion: string | null, projectV2Future = false) {
+export function semanticIncompatibleContentTimeSql(alias: string, contractVersion: string | null, projectVersionCompatibility = false) {
   const version = contentTimeRef(alias, 'content_time_validator_version')
-  if (contractVersion !== CONTENT_TIME_VALIDATOR_VERSION_V3) return sql<boolean>`false`
   const unknownVersion = sql<boolean>`${version} IS NULL OR ${version} NOT IN (${CONTENT_TIME_VALIDATOR_VERSION_V2}, ${CONTENT_TIME_VALIDATOR_VERSION_V3})`
-  return projectV2Future
+  if (contractVersion === CONTENT_TIME_VALIDATOR_VERSION_V2) {
+    return projectVersionCompatibility
+      ? sql<boolean>`(${unknownVersion}) OR (${version} = ${CONTENT_TIME_VALIDATOR_VERSION_V3} AND NOT (${v3ProjectableToV2Sql(alias)}))`
+      : sql<boolean>`(${unknownVersion}) OR (${version} = ${CONTENT_TIME_VALIDATOR_VERSION_V3})`
+  }
+  if (contractVersion !== CONTENT_TIME_VALIDATOR_VERSION_V3) return sql<boolean>`true`
+  return projectVersionCompatibility
     ? unknownVersion
     : sql<boolean>`(${unknownVersion}) OR (${isV2FutureSemanticDeltaSql(alias)})`
 }

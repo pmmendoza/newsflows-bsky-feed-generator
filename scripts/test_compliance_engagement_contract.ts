@@ -9,6 +9,8 @@ type Scenario = {
   numerator: number
   denominator: number
   projected: number
+  projectedV3Valid: number
+  projectedV3Invalid: number
   semanticIncompatible: number
 }
 
@@ -22,6 +24,8 @@ async function main() {
     numerator: 80,
     denominator: 100,
     projected: 0,
+    projectedV3Valid: 2,
+    projectedV3Invalid: 1,
     semanticIncompatible: 0,
   }
   const queries: string[] = []
@@ -46,6 +50,8 @@ async function main() {
           legacy_unknown: 0,
           validator_version_mismatch: 0,
           projected_v2_future: scenario.projected,
+          projected_v3_to_v2_valid: scenario.projectedV3Valid,
+          projected_v3_to_v2_invalid: scenario.projectedV3Invalid,
           semantic_incompatible: scenario.semanticIncompatible,
         }] }
       }
@@ -76,6 +82,8 @@ async function main() {
     check(response.ok && payload.science_eligible === true, 'valid active contract must be science eligible')
     check(payload.time_clock === 'content_time_v1', 'response must use canonical clock enum')
     check(payload.validity.numerator === 80 && payload.validity.denominator === 100, 'validity counts must be explicit')
+    check(payload.validity.projected_v3_to_v2_valid === 2 && payload.validity.projected_v3_to_v2_invalid === 1, 'v2 rollback projection evidence must be explicit and raw-free')
+    check(!JSON.stringify(payload).includes('created_at_source_raw'), 'raw provenance must never leave the export')
 
     const { invalidateActiveContentTimeContractCache } = await import('../src/util/content-time')
     invalidateActiveContentTimeContractCache()
@@ -130,7 +138,9 @@ async function main() {
     check(v3EventQuery !== undefined && v3EventQuery.includes('OFFSET 0'), 'v3 publisher comment query must narrow by publisher before contract filtering')
     const validityQuery = queries.find((text) => text.includes('FROM candidates'))
     check(validityQuery !== undefined && validityQuery.includes('e."indexedAt"') && validityQuery.includes('p."indexedAt"'), 'validity denominator must use bounded receipt time')
-    check(!validityQuery.includes('"indexedAt")::timestamptz'), 'validity receipt-time bounds must not cast indexed columns')
+    check(!validityQuery.includes('e."indexedAt")::timestamptz >=') && !validityQuery.includes('p."indexedAt")::timestamptz >='), 'validity receipt-time bounds must not cast indexed columns')
+    check(validityQuery.includes('v3_to_v2_source_valid') && validityQuery.includes('v3_to_v2_source_invalid'), 'v2 validity SQL must report both projection outcomes')
+    check(validityQuery.includes('created_at_source_raw') && validityQuery.includes("interval '1 millisecond'"), 'v2 projection must recompute the policy-bound future-skew limit from stored raw provenance and receipt time')
     const receiptQuery = queries.find((text) => text.includes('e."createdAt" AS created_at'))
     check(receiptQuery !== undefined && receiptQuery.includes('p."createdAt" AS created_at'), 'transitional export must query receipt time')
     check(!receiptQuery.includes('"createdAt")::timestamptz'), 'receipt-time bounds must not cast indexed columns')
