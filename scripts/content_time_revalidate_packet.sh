@@ -143,11 +143,11 @@ emit() {  # emit <name>  (stdin -> $E/<name>, root:newsflows 0640, never overwri
 seal_evidence() { ( cd "$E" && sudo -n sh -c 'find . -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS && chown root:newsflows SHA256SUMS && chmod 640 SHA256SUMS' ); }
 psql_ro() {
   "${DOCKER[@]}" exec -i "$DB_CONTAINER" psql -U "$PSQL_USER" -d "$PSQL_DB" -X -q -A -F '|' -v ON_ERROR_STOP=1 \
-    -c "SET default_transaction_read_only = on; SET statement_timeout = '120s';" "$@"
+    -c "SET default_transaction_read_only = on; SET statement_timeout = '600s';" "$@"
 }
 psql_copy() {
   "${DOCKER[@]}" exec -i "$DB_CONTAINER" psql -U "$PSQL_USER" -d "$PSQL_DB" -X -q -v ON_ERROR_STOP=1 \
-    -c "SET default_transaction_read_only = on; SET statement_timeout = '120s';" -c "\\copy ($1) TO STDOUT WITH (FORMAT text)"
+    -c "SET default_transaction_read_only = on; SET statement_timeout = '600s';" -c "\\copy ($1) TO STDOUT WITH (FORMAT text)"
 }
 group_dids() { case "$1" in main) echo "$MAIN_DIDS";; be) echo "$BE_DID";; *) die "group must be main|be";; esac; }
 group_horizon() { case "$1" in main) echo "$HORIZON_MAIN_DAYS";; be) echo "$HORIZON_BE_DAYS";; esac; }

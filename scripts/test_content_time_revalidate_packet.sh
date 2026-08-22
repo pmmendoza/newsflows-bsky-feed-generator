@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+grep -Fq "statement_timeout = '600s'" "$(dirname "${BASH_SOURCE[0]}")/content_time_revalidate_packet.sh"
 
 packet="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/content_time_revalidate_packet.sh"
 bash -n "$packet"
