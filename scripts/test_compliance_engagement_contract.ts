@@ -84,10 +84,13 @@ async function main() {
     check(payload.validity.numerator === 80 && payload.validity.denominator === 100, 'validity counts must be explicit')
     check(payload.validity.projected_v3_to_v2_valid === 2 && payload.validity.projected_v3_to_v2_invalid === 1, 'v2 rollback projection evidence must be explicit and raw-free')
     check(!JSON.stringify(payload).includes('created_at_source_raw'), 'raw provenance must never leave the export')
+    const v2EventQuery = queries.find((text) => text.includes('p0.* FROM post p0'))
+    check(v2EventQuery !== undefined && v2EventQuery.includes('OFFSET 0'), 'v2 publisher comment query must narrow by publisher before contract filtering')
 
     const { invalidateActiveContentTimeContractCache } = await import('../src/util/content-time')
     invalidateActiveContentTimeContractCache()
     scenario.contract = 'newsflows-content-time/v3'
+    const v3QueryStart = queries.length
     response = await fetch(base + query, { headers })
     payload = await response.json()
     check(response.ok && payload.science_eligible === true, 'v3 active contract must be science eligible')
@@ -134,7 +137,7 @@ async function main() {
     check(!Object.prototype.hasOwnProperty.call(payload, 'publisher_time_transition_expires_at'), 'response must not advertise retired expiry authority')
 
     check(queries.some((text) => text.includes("content_time_status = 'source_valid'") && text.includes('content_time_utc')), 'event SQL must enforce valid content time')
-    const v3EventQuery = queries.find((text) => text.includes('p0.* FROM post p0'))
+    const v3EventQuery = queries.slice(v3QueryStart).find((text) => text.includes('p0.* FROM post p0'))
     check(v3EventQuery !== undefined && v3EventQuery.includes('OFFSET 0'), 'v3 publisher comment query must narrow by publisher before contract filtering')
     const validityQuery = queries.find((text) => text.includes('FROM candidates'))
     check(validityQuery !== undefined && validityQuery.includes('e."indexedAt"') && validityQuery.includes('p."indexedAt"'), 'validity denominator must use bounded receipt time')

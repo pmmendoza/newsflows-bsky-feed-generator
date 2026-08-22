@@ -1346,7 +1346,7 @@ export default function registerMonitorEndpoints(server: Server, ctx: AppContext
             ? buildAtUriDidMembershipFilter(sql`p."rootUri"`, publisherDids, false)
             : sql<boolean>`true`
       const postSource =
-        !validityCohort && contentTime && contractVersion === 'newsflows-content-time/v3' && targetMode === 'publisher'
+        !validityCohort && contentTime && isSupportedContentTimeVersion(contractVersion) && targetMode === 'publisher'
           ? sql`(
               -- OFFSET 0 is an intentional planner barrier: narrow by the
               -- publisher-root index before applying the v2/v3 contract filter.
