@@ -183,8 +183,8 @@ forward_to_completion() {
   done
   die 'forward revalidation remained incomplete after five resumable invocations'
 }
-catalog_sync_preview() { bskyops_env "$BSKYOPS" ecosystem catalog-sync-packet --source-root "$1" --deployed-root "$DEPLOYED_CATALOG_ROOT" --json; }
-catalog_sync_apply() { bskyops_env "$BSKYOPS" ecosystem catalog-sync-apply --source-root "$1" --deployed-root "$DEPLOYED_CATALOG_ROOT" --confirm-live-host-catalog-sync --json; }
+catalog_sync_preview() { bskyops_env "$BSKYOPS" ecosystem catalog-sync-packet --source-root "$1/config/newsflows/catalogs" --deployed-root "$DEPLOYED_CATALOG_ROOT" --json; }
+catalog_sync_apply() { bskyops_env "$BSKYOPS" ecosystem catalog-sync-apply --source-root "$1/config/newsflows/catalogs" --deployed-root "$DEPLOYED_CATALOG_ROOT" --confirm-live-host-catalog-sync --json; }
 gate_catalog_sync() {
   node -e 'const j=JSON.parse(require("fs").readFileSync(process.argv[1]));if(!["ready-for-apply","already-converged","applied"].includes(j.status))throw Error(`catalog sync status ${j.status}`);const bad=(j.actions||[]).filter(a=>a.filename!=="publishers.yml"&&a.action!=="no-op");if(bad.length)throw Error(`catalog sync escaped publishers.yml: ${JSON.stringify(bad)}`)' "$1"
 }

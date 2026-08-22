@@ -8,6 +8,7 @@ must 'RKEYS=newsflow-nl-2,newsflow-fr-2,newsflow-cz-2,newsflow-ir-2,newsflow-be-
 must "fields.length!==1||fields[0]!=='content_time_contract_version'"
 must 'check(j.atomic_change_set.request_body,from,to);check(j.atomic_change_set.rollback_request_body,to,from)'
 must 'catalog_sync_apply "$SOURCE_ROOT"'
+must '--source-root "$1/config/newsflows/catalogs"'
 must 'post_bulk "$E/feedgen-forward.json" 03-feedgen-forward-apply'
 must 'revalidate_runner migrate-prepare'
 must 'revalidate_runner migrate-freeze'
