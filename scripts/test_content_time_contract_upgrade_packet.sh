@@ -33,6 +33,8 @@ must "j.science_eligible!==true||v.semantic_incompatible!==0"
 must 'response_sha256:crypto.createHash'
 ! grep -Fq -- 'emit "$name.json" <"$response"' "$packet"
 must 'forward_to_completion'
+must "grep -Fxq 'status=complete'"
+must 'stable_marker_sha256=$stable_sha'
 must '"$REVALIDATE" "$@"'
 must 'EXPECTED_REVALIDATE_RUNNER_SHA'
 must 'EXPECTED_SHA=$PACKET_SOURCE_SHA'
@@ -99,7 +101,10 @@ label=$2
 case "$1" in
   migrate-apply)
     echo "$label" >>"$E/coordinator-labels.txt"
-    printf '{"revalidation":{"complete":true}}\n' >"$E/migrate-post-apply-$label.json";;
+    printf '{"revalidation":{"complete":true,"skipped_cas":0}}\n' >"$E/migrate-post-apply-$label.json";;
+  migrate-readback)
+    echo 'readback' >>"$E/coordinator-labels.txt"
+    printf 'status=complete\ntransition=newsflows-content-time/v2->newsflows-content-time/v3\nstable_marker_sha256=%s\n' "$(sha256sum "$E/migrate-stable-population.txt" | cut -d' ' -f1)" >"$E/migrate-readback-1.txt";;
   migrate-native-tail-rollback)
     echo "$label" >>"$E/native-coordinator-labels.txt"
     if [[ $label == native-1 ]]; then printf '{}\n' >"$E/native-post-apply-$label.json"; exit 3; fi
@@ -113,8 +118,9 @@ git -C "$tmp/resume-tree" init -q
 git -C "$tmp/resume-tree" add .
 git -C "$tmp/resume-tree" -c user.name=test -c user.email=test@example.invalid commit -qm fixture
 resume_tree_sha=$(git -C "$tmp/resume-tree" rev-parse HEAD)
-printf '{"revalidation":{"complete":false}}\n' >"$tmp/resume-evidence/migrate-post-apply-forward-1.json"
+printf '{"revalidation":{"complete":false,"skipped_cas":0}}\n' >"$tmp/resume-evidence/migrate-post-apply-forward-1.json"
 printf '{}\n' >"$tmp/resume-evidence/migrate-post-preview-before-forward-1.json"
+printf 'fixture=resume\n' >"$tmp/resume-evidence/migrate-stable-population.txt"
 hex64=1111111111111111111111111111111111111111111111111111111111111111
 PATH="$tmp/runtime-mock:$PATH" FTFU1_TEST_MODE=1 E="$tmp/resume-evidence" \
   SOURCE_ROOT="$tmp/packet-tree" SOURCE_SHA="$packet_tree_sha" SOURCE_CATALOG_SHA="$hex64" \
@@ -126,7 +132,86 @@ PATH="$tmp/runtime-mock:$PATH" FTFU1_TEST_MODE=1 E="$tmp/resume-evidence" \
   SINCE_BE=2026-08-11T00:00:00.000Z SINCE_ENGAGEMENT=2026-08-11T00:00:00.000Z \
   bash "$packet" test-forward-resume
 grep -Fxq 'forward-2' "$tmp/resume-evidence/coordinator-labels.txt"
+grep -Fxq 'readback' "$tmp/resume-evidence/coordinator-labels.txt"
 [[ -s "$tmp/resume-evidence/migrate-post-apply-forward-2.json" ]]
+[[ -s "$tmp/resume-evidence/migrate-readback-1.txt" ]]
+
+# A CAS-conflict receipt is terminal for this evidence root: no forward-2.
+mkdir -p "$tmp/cas-terminal-evidence"
+printf '{"revalidation":{"complete":true,"skipped_cas":1}}\n' >"$tmp/cas-terminal-evidence/migrate-post-apply-forward-1.json"
+printf 'fixture=cas-terminal\n' >"$tmp/cas-terminal-evidence/migrate-stable-population.txt"
+printf 'status=complete\ntransition=newsflows-content-time/v2->newsflows-content-time/v3\nstable_marker_sha256=%s\n' "$(sha256sum "$tmp/cas-terminal-evidence/migrate-stable-population.txt" | cut -d' ' -f1)" >"$tmp/cas-terminal-evidence/migrate-readback-stale.txt"
+set +e
+PATH="$tmp/runtime-mock:$PATH" FTFU1_TEST_MODE=1 E="$tmp/cas-terminal-evidence" \
+  SOURCE_ROOT="$tmp/packet-tree" SOURCE_SHA="$packet_tree_sha" SOURCE_CATALOG_SHA="$hex64" \
+  ROLLBACK_SOURCE_ROOT="$tmp/packet-tree" ROLLBACK_SOURCE_SHA="$packet_tree_sha" ROLLBACK_CATALOG_SHA="$hex64" \
+  TREE="$tmp/resume-tree" PACKET_SOURCE_SHA="$resume_tree_sha" FEEDGEN_SHA="$runtime_sha" \
+  EXPECTED_DIST_SHA="$hex64" EXPECTED_CT_SHA="$hex64" EXPECTED_IMAGE_CT_SHA="$hex64" EXPECTED_IMAGE=fixture \
+  EXPECTED_TOOL_REFS=x EXPECTED_RUNNER_SHA="$hex64" EXPECTED_REVALIDATE_RUNNER_SHA="$hex64" BSR_EFFECTIVE_CONFIG_JSON=x \
+  PACKET_PATH="$packet" PACKET_SHA="$hex64" SINCE_MAIN=2026-08-18T00:00:00.000Z \
+  SINCE_BE=2026-08-11T00:00:00.000Z SINCE_ENGAGEMENT=2026-08-11T00:00:00.000Z \
+  bash "$packet" test-forward-resume >/dev/null 2>&1
+cas_terminal_rc=$?
+set -e
+[[ $cas_terminal_rc == 2 && ! -e "$tmp/cas-terminal-evidence/migrate-post-apply-forward-2.json" && ! -e "$tmp/cas-terminal-evidence/migrate-readback-1.txt" ]]
+
+# Bare complete=true in prior apply receipt without readback marker triggers readback rather than returning success immediately:
+mkdir -p "$tmp/bare-complete-evidence"
+printf '{"revalidation":{"complete":true,"skipped_cas":0}}\n' >"$tmp/bare-complete-evidence/migrate-post-apply-forward-1.json"
+printf 'fixture=bare-complete\n' >"$tmp/bare-complete-evidence/migrate-stable-population.txt"
+PATH="$tmp/runtime-mock:$PATH" FTFU1_TEST_MODE=1 E="$tmp/bare-complete-evidence" \
+  SOURCE_ROOT="$tmp/packet-tree" SOURCE_SHA="$packet_tree_sha" SOURCE_CATALOG_SHA="$hex64" \
+  ROLLBACK_SOURCE_ROOT="$tmp/packet-tree" ROLLBACK_SOURCE_SHA="$packet_tree_sha" ROLLBACK_CATALOG_SHA="$hex64" \
+  TREE="$tmp/resume-tree" PACKET_SOURCE_SHA="$resume_tree_sha" FEEDGEN_SHA="$runtime_sha" \
+  EXPECTED_DIST_SHA="$hex64" EXPECTED_CT_SHA="$hex64" EXPECTED_IMAGE_CT_SHA="$hex64" EXPECTED_IMAGE=fixture \
+  EXPECTED_TOOL_REFS=x EXPECTED_RUNNER_SHA="$hex64" EXPECTED_REVALIDATE_RUNNER_SHA="$hex64" BSR_EFFECTIVE_CONFIG_JSON=x \
+  PACKET_PATH="$packet" PACKET_SHA="$hex64" SINCE_MAIN=2026-08-18T00:00:00.000Z \
+  SINCE_BE=2026-08-11T00:00:00.000Z SINCE_ENGAGEMENT=2026-08-11T00:00:00.000Z \
+  bash "$packet" test-forward-resume
+grep -Fxq 'readback' "$tmp/bare-complete-evidence/coordinator-labels.txt"
+[[ -s "$tmp/bare-complete-evidence/migrate-readback-1.txt" ]]
+
+# Empty, malformed, wrong-hash, and symlink markers cannot bypass failed readback.
+mkdir -p "$tmp/readback-fail-tree/scripts" "$tmp/readback-fail-tree/dist/tools" "$tmp/readback-fail-tree/dist/util"
+cat >"$tmp/readback-fail-tree/scripts/content_time_revalidate_packet.sh" <<'SH'
+#!/usr/bin/env bash
+case "$1" in
+  migrate-readback) exit 2;;
+  *) exit 9;;
+esac
+SH
+chmod +x "$tmp/readback-fail-tree/scripts/content_time_revalidate_packet.sh"
+touch "$tmp/readback-fail-tree/dist/tools/backfill-publisher-posts.js" "$tmp/readback-fail-tree/dist/util/content-time.js"
+git -C "$tmp/readback-fail-tree" init -q; git -C "$tmp/readback-fail-tree" add .
+git -C "$tmp/readback-fail-tree" -c user.name=test -c user.email=test@example.invalid commit -qm fixture
+fail_tree_sha=$(git -C "$tmp/readback-fail-tree" rev-parse HEAD)
+for shape in empty malformed wrong-hash symlink; do
+  case_e="$tmp/readback-fail-$shape-evidence"; mkdir -p "$case_e"
+  printf 'fixture=%s\n' "$shape" >"$case_e/migrate-stable-population.txt"
+  printf '{"revalidation":{"complete":true,"skipped_cas":0}}\n' >"$case_e/migrate-post-apply-forward-1.json"
+  case "$shape" in
+    empty) : >"$case_e/migrate-readback-invalid.txt";;
+    malformed) printf 'status=complete\ntransition=wrong\n' >"$case_e/migrate-readback-invalid.txt";;
+    wrong-hash) printf 'status=complete\ntransition=newsflows-content-time/v2->newsflows-content-time/v3\nstable_marker_sha256=%064d\n' 0 >"$case_e/migrate-readback-invalid.txt";;
+    symlink)
+      printf 'status=complete\ntransition=newsflows-content-time/v2->newsflows-content-time/v3\nstable_marker_sha256=%s\n' "$(sha256sum "$case_e/migrate-stable-population.txt" | cut -d' ' -f1)" >"$case_e/valid-marker-target.txt"
+      ln -s valid-marker-target.txt "$case_e/migrate-readback-invalid.txt";;
+  esac
+  set +e
+  PATH="$tmp/runtime-mock:$PATH" FTFU1_TEST_MODE=1 E="$case_e" \
+    SOURCE_ROOT="$tmp/packet-tree" SOURCE_SHA="$packet_tree_sha" SOURCE_CATALOG_SHA="$hex64" \
+    ROLLBACK_SOURCE_ROOT="$tmp/packet-tree" ROLLBACK_SOURCE_SHA="$packet_tree_sha" ROLLBACK_CATALOG_SHA="$hex64" \
+    TREE="$tmp/readback-fail-tree" PACKET_SOURCE_SHA="$fail_tree_sha" FEEDGEN_SHA="$runtime_sha" \
+    EXPECTED_DIST_SHA="$hex64" EXPECTED_CT_SHA="$hex64" EXPECTED_IMAGE_CT_SHA="$hex64" EXPECTED_IMAGE=fixture \
+    EXPECTED_TOOL_REFS=x EXPECTED_RUNNER_SHA="$hex64" EXPECTED_REVALIDATE_RUNNER_SHA="$hex64" BSR_EFFECTIVE_CONFIG_JSON=x \
+    PACKET_PATH="$packet" PACKET_SHA="$hex64" SINCE_MAIN=2026-08-18T00:00:00.000Z \
+    SINCE_BE=2026-08-11T00:00:00.000Z SINCE_ENGAGEMENT=2026-08-11T00:00:00.000Z \
+    bash "$packet" test-forward-resume >/dev/null 2>&1
+  fail_rc=$?
+  set -e
+  [[ $fail_rc == 2 ]]
+done
+
 PATH="$tmp/runtime-mock:$PATH" FTFU1_TEST_MODE=1 E="$tmp/resume-evidence" \
   SOURCE_ROOT="$tmp/packet-tree" SOURCE_SHA="$packet_tree_sha" SOURCE_CATALOG_SHA="$hex64" \
   ROLLBACK_SOURCE_ROOT="$tmp/packet-tree" ROLLBACK_SOURCE_SHA="$packet_tree_sha" ROLLBACK_CATALOG_SHA="$hex64" \
@@ -138,6 +223,24 @@ PATH="$tmp/runtime-mock:$PATH" FTFU1_TEST_MODE=1 E="$tmp/resume-evidence" \
   bash "$packet" test-native-tail-resume
 grep -Fxq 'native-1' "$tmp/resume-evidence/native-coordinator-labels.txt"
 grep -Fxq 'native-2' "$tmp/resume-evidence/native-coordinator-labels.txt"
+
+mkdir -p "$tmp/native-cas-terminal-evidence"
+printf '{"revalidation":{"complete":true,"skipped_cas":1}}\n' >"$tmp/native-cas-terminal-evidence/native-post-apply-native-1.json"
+printf 'complete=true\n' >"$tmp/native-cas-terminal-evidence/native-tail-readback.txt"
+set +e
+PATH="$tmp/runtime-mock:$PATH" FTFU1_TEST_MODE=1 E="$tmp/native-cas-terminal-evidence" \
+  SOURCE_ROOT="$tmp/packet-tree" SOURCE_SHA="$packet_tree_sha" SOURCE_CATALOG_SHA="$hex64" \
+  ROLLBACK_SOURCE_ROOT="$tmp/packet-tree" ROLLBACK_SOURCE_SHA="$packet_tree_sha" ROLLBACK_CATALOG_SHA="$hex64" \
+  TREE="$tmp/resume-tree" PACKET_SOURCE_SHA="$resume_tree_sha" FEEDGEN_SHA="$runtime_sha" \
+  EXPECTED_DIST_SHA="$hex64" EXPECTED_CT_SHA="$hex64" EXPECTED_IMAGE_CT_SHA="$hex64" EXPECTED_IMAGE=fixture \
+  EXPECTED_TOOL_REFS=x EXPECTED_RUNNER_SHA="$hex64" EXPECTED_REVALIDATE_RUNNER_SHA="$hex64" BSR_EFFECTIVE_CONFIG_JSON=x \
+  PACKET_PATH="$packet" PACKET_SHA="$hex64" SINCE_MAIN=2026-08-18T00:00:00.000Z \
+  SINCE_BE=2026-08-11T00:00:00.000Z SINCE_ENGAGEMENT=2026-08-11T00:00:00.000Z \
+  bash "$packet" test-native-tail-resume >/dev/null 2>&1
+native_cas_terminal_rc=$?
+set -e
+[[ $native_cas_terminal_rc == 2 && ! -e "$tmp/native-cas-terminal-evidence/native-post-apply-native-2.json" ]]
+grep -Fxq 'complete=true' "$tmp/native-cas-terminal-evidence/native-tail-readback.txt"
 (
   export CONTENT_TIME_PACKET_SOURCE_ONLY=1 E="$tmp/library-evidence" TREE="$tmp/library-tree" EXPECTED_SHA=x \
     EXPECTED_DIST_SHA256=x EXPECTED_CT_SHA256=x EXPECTED_IMAGE_CT_SHA256=x EXPECTED_TOOL_REFS=x \
@@ -258,7 +361,64 @@ case "$1" in
   stop|start) echo "$1 $2" >>"$MOCK_LOG";;
 esac
 SH
-chmod +x "$mock/sudo" "$mock/systemctl"
+cat >"$mock/docker" <<'SH'
+#!/usr/bin/env bash
+case "$1" in
+  inspect) echo fixture-image;;
+  image) echo "$REVALIDATE_RUNTIME_SHA";;
+  exec) echo newsflows-content-time/v3;;
+  *) exit 9;;
+esac
+SH
+cat >"$mock/node" <<'SH'
+#!/usr/bin/env bash
+for arg in "$@"; do [[ $arg == /opt/newsflows/tools/uv/* ]] && { echo test-tool-ref; exit; }; done
+exec "$REAL_NODE" "$@"
+SH
+chmod +x "$mock/sudo" "$mock/systemctl" "$mock/docker" "$mock/node"
+
+# The production revalidate path fences active timers before forward readback;
+# an invalid marker plus failed readback cannot restore them.
+mkdir -p "$tmp/revalidate-source/config/newsflows/catalogs" "$tmp/revalidate-tree/scripts" "$tmp/revalidate-tree/dist/tools" "$tmp/revalidate-tree/dist/util" "$tmp/revalidate-evidence"
+printf 'fixture: true\n' >"$tmp/revalidate-source/config/newsflows/catalogs/publishers.yml"
+git -C "$tmp/revalidate-source" init -q; git -C "$tmp/revalidate-source" add .
+git -C "$tmp/revalidate-source" -c user.name=test -c user.email=test@example.invalid commit -qm fixture
+cat >"$tmp/revalidate-tree/scripts/content_time_revalidate_packet.sh" <<'SH'
+#!/usr/bin/env bash
+case "$1" in migrate-stable-check) exit 0;; migrate-readback) exit 2;; *) exit 9;; esac
+SH
+chmod +x "$tmp/revalidate-tree/scripts/content_time_revalidate_packet.sh"
+touch "$tmp/revalidate-tree/dist/tools/backfill-publisher-posts.js" "$tmp/revalidate-tree/dist/util/content-time.js"
+git -C "$tmp/revalidate-tree" init -q; git -C "$tmp/revalidate-tree" add .
+git -C "$tmp/revalidate-tree" -c user.name=test -c user.email=test@example.invalid commit -qm fixture
+printf 'fixture=revalidate\n' >"$tmp/revalidate-evidence/migrate-stable-population.txt"
+printf '{"revalidation":{"complete":true,"skipped_cas":0}}\n' >"$tmp/revalidate-evidence/migrate-post-apply-forward-1.json"
+printf 'status=complete\ntransition=newsflows-content-time/v2->newsflows-content-time/v3\nstable_marker_sha256=%064d\n' 0 >"$tmp/revalidate-evidence/migrate-readback-invalid.txt"
+revalidate_source_sha=$(git -C "$tmp/revalidate-source" rev-parse HEAD)
+revalidate_tree_sha=$(git -C "$tmp/revalidate-tree" rev-parse HEAD)
+revalidate_catalog_sha=$(sha256sum "$tmp/revalidate-source/config/newsflows/catalogs/publishers.yml" | cut -d' ' -f1)
+revalidate_runtime_sha=3333333333333333333333333333333333333333
+revalidate_packet_sha=$(sha256sum "$packet" | cut -d' ' -f1)
+real_node=$(command -v node)
+set +e
+PATH="$mock:$PATH" REAL_NODE="$real_node" REVALIDATE_RUNTIME_SHA="$revalidate_runtime_sha" MOCK_LOG="$tmp/revalidate-timers.log" FTFU1_TEST_MODE=1 E="$tmp/revalidate-evidence" \
+  SOURCE_ROOT="$tmp/revalidate-source" SOURCE_SHA="$revalidate_source_sha" SOURCE_CATALOG_SHA="$revalidate_catalog_sha" \
+  ROLLBACK_SOURCE_ROOT="$tmp/revalidate-source" ROLLBACK_SOURCE_SHA="$revalidate_source_sha" ROLLBACK_CATALOG_SHA="$revalidate_catalog_sha" \
+  TREE="$tmp/revalidate-tree" PACKET_SOURCE_SHA="$revalidate_tree_sha" FEEDGEN_SHA="$revalidate_runtime_sha" \
+  EXPECTED_DIST_SHA="$(sha256sum "$tmp/revalidate-tree/dist/tools/backfill-publisher-posts.js" | cut -d' ' -f1)" \
+  EXPECTED_CT_SHA="$(sha256sum "$tmp/revalidate-tree/dist/util/content-time.js" | cut -d' ' -f1)" EXPECTED_IMAGE_CT_SHA="$hex64" EXPECTED_IMAGE=fixture-image \
+  EXPECTED_TOOL_REFS='bsky-ops=test-tool-ref,blueskyranker=test-tool-ref,newsflows-bskyhealth=test-tool-ref' EXPECTED_RUNNER_SHA="$revalidate_packet_sha" \
+  EXPECTED_REVALIDATE_RUNNER_SHA="$(sha256sum "$tmp/revalidate-tree/scripts/content_time_revalidate_packet.sh" | cut -d' ' -f1)" BSR_EFFECTIVE_CONFIG_JSON=x \
+  PACKET_PATH="$packet" PACKET_SHA="$revalidate_packet_sha" SINCE_MAIN=2026-08-18T00:00:00.000Z \
+  SINCE_BE=2026-08-11T00:00:00.000Z SINCE_ENGAGEMENT=2026-08-11T00:00:00.000Z \
+  TIMER_UNITS=one.timer,two.timer SERVICE_UNITS=one.service,two.service bash "$packet" revalidate >/dev/null 2>&1
+revalidate_rc=$?
+set -e
+[[ $revalidate_rc == 2 ]]
+grep -Fxq 'stop one.timer' "$tmp/revalidate-timers.log"
+grep -Fxq 'stop two.timer' "$tmp/revalidate-timers.log"
+if grep -Eq '^start (one|two)\.timer$' "$tmp/revalidate-timers.log"; then exit 1; fi
+
 export MOCK_LOG=$tmp/systemctl.log
 set +e
 PATH="$mock:$PATH" FTFU1_TEST_MODE=1 E="$tmp/evidence" TIMER_UNITS=one.timer,two.timer SERVICE_UNITS=one.service,two.service bash "$packet" test-timer-restore >/dev/null 2>&1

@@ -223,21 +223,56 @@ revalidate_runner() {
 migration_complete() {
   local label=$1 target=post
   [[ -f "$E/migrate-$target-apply-$label.json" ]] || return 1
-  [[ $(node -e 'console.log(JSON.parse(require("fs").readFileSync(process.argv[1])).revalidation.complete)' "$E/migrate-$target-apply-$label.json") == true ]] || return 1
+  [[ $(node -e 'const r=JSON.parse(require("fs").readFileSync(process.argv[1])).revalidation;console.log(r.complete===true&&r.skipped_cas===0)' "$E/migrate-$target-apply-$label.json") == true ]] || return 1
+}
+apply_receipts_have_cas() { # <filename prefix>
+  local prefix=$1 receipt skipped
+  for receipt in "$E"/"$prefix"-apply-*.json; do
+    [[ -f "$receipt" ]] || continue
+    skipped=$(node -e 'console.log(JSON.parse(require("fs").readFileSync(process.argv[1])).revalidation.skipped_cas)' "$receipt" 2>/dev/null || true)
+    [[ "$skipped" =~ ^[0-9]+$ ]] || return 0
+    (( skipped > 0 )) && return 0
+  done
+  return 1
+}
+forward_readback_complete() {
+  local marker stable_sha
+  [[ -f "$E/migrate-stable-population.txt" && ! -L "$E/migrate-stable-population.txt" ]] || return 1
+  stable_sha=$(sha "$E/migrate-stable-population.txt")
+  for marker in "$E"/migrate-readback-*.txt; do
+    [[ -f "$marker" && ! -L "$marker" ]] || continue
+    [[ $(grep -c '^status=' "$marker") == 1 && $(grep -c '^transition=' "$marker") == 1 && $(grep -c '^stable_marker_sha256=' "$marker") == 1 ]] || continue
+    grep -Fxq 'status=complete' "$marker" && grep -Fxq "transition=$V2->$V3" "$marker" && grep -Fxq "stable_marker_sha256=$stable_sha" "$marker" && return 0
+  done
+  return 1
 }
 forward_label_used() { [[ -n $(find "$E" -maxdepth 1 -type f -name "*forward-$1*" -print -quit) ]]; }
 forward_to_completion() {
-  local attempt label
-  for attempt in 1 2 3 4 5; do migration_complete "forward-$attempt" && return 0; done
+  local attempt label rc
+  apply_receipts_have_cas migrate-post && die 'forward evidence root contains a CAS-conflict receipt; start a fresh evidence root'
+  forward_readback_complete && return 0
+  for attempt in 1 2 3 4 5; do
+    if migration_complete "forward-$attempt"; then
+      revalidate_runner migrate-readback
+      forward_readback_complete && return 0
+      die 'forward migration marked complete in apply receipt but readback marker missing'
+    fi
+  done
   for attempt in 1 2 3 4 5; do
     forward_label_used "$attempt" && continue
-    label="forward-$attempt"; revalidate_runner migrate-apply "$label"
-    migration_complete "$label" && return 0
+    label="forward-$attempt"
+    if revalidate_runner migrate-apply "$label"; then :; else rc=$?; [[ $rc == 3 ]] && continue; return "$rc"; fi
+    if migration_complete "$label" || [[ ! -f "$E/migrate-post-apply-$label.json" ]]; then
+      revalidate_runner migrate-readback
+      forward_readback_complete && return 0
+      die 'forward migration finished but readback marker missing'
+    fi
   done
   die 'forward revalidation remained incomplete after five resumable invocations'
 }
 native_tail_to_completion() {
   local attempt label rc
+  apply_receipts_have_cas native-post && die 'native-tail evidence root contains a CAS-conflict receipt; start a fresh evidence root'
   [[ -f $E/native-tail-readback.txt ]] && return 0
   for attempt in 1 2 3 4 5; do
     label="native-$attempt"

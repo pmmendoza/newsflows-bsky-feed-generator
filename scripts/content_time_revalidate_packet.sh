@@ -581,6 +581,20 @@ assert_from_before_cutoff() { # <target> <cutoff>
   rows=$(psql_ro -t -c "SELECT count(*) FROM public.$table WHERE $predicate AND \"indexedAt\">='$since' AND \"indexedAt\">='$cutoff';")
   [[ "$rows" == 0 ]] || die "$target gained $rows in-horizon $FROM_VERSION semantic-delta rows at/after exclusive cutoff"
 }
+activation_floor() {
+  local floor; floor=$(awk -F= '$1=="activation_floor"{print $2}' "$E/activation-floor.txt" 2>/dev/null || true)
+  [[ "$floor" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{3}Z$ ]] || die 'activation floor receipt is missing or malformed'
+  echo "$floor"
+}
+assert_no_late_v2_rows() { # <target>
+  local target=$1 table floor rows
+  assert_active_catalog_version "$TO_VERSION"
+  table=$(migration_target_table "$target")
+  floor=$(activation_floor)
+  rows=$(psql_ro -t -c "SELECT count(*) FROM public.$table WHERE content_time_validator_version='$FROM_VERSION' AND \"indexedAt\">='$floor';")
+  [[ "$rows" =~ ^[0-9]+$ ]] || die "$target late $FROM_VERSION query failed"
+  [[ "$rows" == 0 ]] || die "$target has $rows $FROM_VERSION rows at/after activation floor $floor"
+}
 migration_scope_sql() { # <target> [exclusive cutoff]
   local target=$1 cutoff=${2:-} table since upper=""
   table=$(migration_target_table "$target"); since=$(migration_target_since "$target")
@@ -634,21 +648,29 @@ assert_stable_population_bound() {
   expected=$(awk -F= '$1=="ir_prereg_sha256"{print $2}' "$E/migrate-stable-population.txt"); actual=$(migration_cells "$f" | sha256sum | cut -d' ' -f1); [[ -n "$expected" && "$actual" == "$expected" ]] || die 'IR stable prereg hash differs'
 }
 gate_migration_preview() { # <file> <spec> <label> [from] [to]
-  local file=$1 spec=$2 label=$3 from=${4:-$FROM_VERSION} to=${5:-$TO_VERSION} outcomes key expected actual sum=0 scanned
+  local file=$1 spec=$2 label=$3 from=${4:-$FROM_VERSION} to=${5:-$TO_VERSION} outcomes key expected actual sum=0 scanned aux1 aux2
   [[ "$(jsonq "$file" preview.truncated)" == false ]] || die "$label preview truncated; raise the reviewed MIGRATION_MAX_PREVIEW_ROWS and rerun"
+  scanned=$(jsonq "$file" preview.scanned)
+  [[ "$scanned" =~ ^[0-9]+$ ]] || die "$label preview has missing/malformed preview.scanned"
   outcomes=$(migration_outcomes "$from" "$to")
   for key in $outcomes; do
-    expected=$(prereg_spec_value "$spec" "$key"); actual=$(jsonq "$file" "preview.counts.$key"); [[ "$actual" =~ ^[0-9]+$ ]] || actual=0
+    expected=$(prereg_spec_value "$spec" "$key"); actual=$(jsonq "$file" "preview.counts.$key")
+    [[ "$actual" =~ ^[0-9]+$ ]] || die "$label preview has missing/malformed preview.counts.$key"
     [[ "$expected" == "$actual" ]] || die "$label/$key: preregistered=$expected observed=$actual"
     sum=$((sum + actual))
   done
-  node -e 'const j=JSON.parse(require("fs").readFileSync(process.argv[1]));const allowed=new Set(process.argv[2].split(" "));for(const [k,v] of Object.entries(j.preview.counts)){if(k.startsWith("by_")||allowed.has(k))continue;if(Number(v)!==0){console.error(`${k}=${v}`);process.exit(2)}}' "$file" "$outcomes" || die "$label returned a non-zero outcome outside transition $FROM_VERSION->$TO_VERSION"
-  scanned=$(jsonq "$file" preview.scanned)
+  node -e 'const j=JSON.parse(require("fs").readFileSync(process.argv[1]));const allowed=new Set(process.argv[2].split(" "));for(const [k,v] of Object.entries(j.preview.counts||{})){if(k.startsWith("by_")||allowed.has(k))continue;if(Number(v)!==0){console.error(`${k}=${v}`);process.exit(2)}}' "$file" "$outcomes" || die "$label returned a non-zero outcome outside transition $FROM_VERSION->$TO_VERSION"
   # Auxiliary category keys partition primary outcomes, so the primary outcome
   # denominator excludes them.
   case "$from->$to" in
-    "$V2->$V3") sum=$((sum - $(jsonq "$file" preview.counts.gt_5m_restored) - $(jsonq "$file" preview.counts.zero_to_5m_clamped) ));;
-    "$V3->$V2") sum=$((sum - $(jsonq "$file" preview.counts.gt_5m_invalidated) - $(jsonq "$file" preview.counts.zero_to_5m_unclamped) ));;
+    "$V2->$V3")
+      aux1=$(jsonq "$file" preview.counts.gt_5m_restored); aux2=$(jsonq "$file" preview.counts.zero_to_5m_clamped)
+      [[ "$aux1" =~ ^[0-9]+$ && "$aux2" =~ ^[0-9]+$ ]] || die "$label preview has missing/malformed auxiliary counts"
+      sum=$((sum - aux1 - aux2));;
+    "$V3->$V2")
+      aux1=$(jsonq "$file" preview.counts.gt_5m_invalidated); aux2=$(jsonq "$file" preview.counts.zero_to_5m_unclamped)
+      [[ "$aux1" =~ ^[0-9]+$ && "$aux2" =~ ^[0-9]+$ ]] || die "$label preview has missing/malformed auxiliary counts"
+      sum=$((sum - aux1 - aux2));;
   esac
   [[ "$scanned" == "$sum" ]] || die "$label denominator mismatch: scanned=$scanned primary_outcomes=$sum"
 }
@@ -664,8 +686,12 @@ migration_preview_one() { # <artifact> <target> <from> <to> [actor override] [si
   echo "$E/$out.json"
 }
 migration_cells() { # <preview-json> [from] [to]
-  local file=$1 from=${2:-$FROM_VERSION} to=${3:-$TO_VERSION} key cells=""
-  for key in $(migration_outcomes "$from" "$to"); do cells+="$key=$(jsonq "$file" "preview.counts.$key"),"; done
+  local file=$1 from=${2:-$FROM_VERSION} to=${3:-$TO_VERSION} key val cells=""
+  for key in $(migration_outcomes "$from" "$to"); do
+    val=$(jsonq "$file" "preview.counts.$key")
+    [[ "$val" =~ ^[0-9]+$ ]] || die "$(basename "$file") has missing/malformed preview.counts.$key"
+    cells+="$key=$val,"
+  done
   echo "${cells%,}"
 }
 cmd_migrate_prereg() {
@@ -779,7 +805,9 @@ migration_applied_value() { # <target> <json path>
   local target=$1 path=$2 f sum=0 value
   for f in "$E"/migrate-"$target"-apply-*.json; do
     [[ -e "$f" ]] || continue
-    value=$(jsonq "$f" "$path"); [[ "$value" =~ ^[0-9]+$ ]] || value=0; sum=$((sum+value))
+    value=$(jsonq "$f" "$path")
+    [[ "$value" =~ ^[0-9]+$ ]] || die "$target forward apply receipt $(basename "$f") has missing/malformed $path"
+    sum=$((sum+value))
   done
   echo "$sum"
 }
@@ -791,22 +819,65 @@ migration_receipt_value() { # <prefix> <target> <json path>
   done
   echo "$sum"
 }
+assert_no_cas_conflicts() { # <prefix> <target>
+  local prefix=$1 target=$2 f skipped
+  for f in "$E"/"$prefix"-"$target"-apply-*.json; do
+    [[ -e "$f" ]] || continue
+    skipped=$(jsonq "$f" revalidation.skipped_cas)
+    [[ "$skipped" =~ ^[0-9]+$ ]] || die "$target $(basename "$f") has missing/malformed revalidation.skipped_cas"
+    (( skipped == 0 )) || die "$target $(basename "$f") recorded skipped_cas=$skipped; start a fresh evidence root"
+  done
+}
+migration_converged_value() { # <prefix> <target> <field>  OR  <target> <field>
+  local prefix=migrate target field
+  if [[ $# -ge 3 ]]; then prefix=$1; target=$2; field=$3; else target=$1; field=$2; fi
+  local f value sum=0
+  for f in "$E"/"$prefix"-"$target"-convergence-*.txt; do
+    [[ -e "$f" ]] || continue
+    value=$(awk -F= -v k="$field" '$1==k{print $2}' "$f")
+    [[ "$value" =~ ^[0-9]+$ ]] || die "$target $prefix convergence receipt has malformed $field"
+    sum=$((sum+value))
+  done
+  echo "$sum"
+}
 migration_remaining_spec() {
-  local target=$1 full key total applied cells=""
+  local target=$1 full key total applied converged cells=""
   full=$(migration_prereg_spec "$target")
   for key in $(migration_outcomes "$FROM_VERSION" "$TO_VERSION"); do
     total=$(prereg_spec_value "$full" "$key"); applied=$(migration_applied_value "$target" "revalidation.counts.$key")
-    (( applied <= total )) || die "$target prior receipts exceed preregistered $key"
-    cells+="$key=$((total-applied)),"
+    converged=$(migration_converged_value migrate "$target" "${key}_producer_converged")
+    (( applied + converged <= total )) || die "$target prior receipts exceed preregistered $key"
+    cells+="$key=$((total-applied-converged)),"
   done
   echo "${cells%,}"
 }
 migration_remaining_rows() {
-  local target=$1 total applied
+  local target=$1 total applied converged
   total=$(awk -F= -v k="${target}_rows" '$1==k{print $2}' "$E/migrate-stable-population.txt"); applied=$(migration_applied_value "$target" revalidation.updated)
-  [[ "$total" =~ ^[0-9]+$ ]] || die "$target stable denominator missing"
-  (( applied <= total )) || die "$target prior receipts exceed stable denominator"
-  echo $((total-applied))
+  converged=$(migration_converged_value migrate "$target" producer_converged_rows)
+  [[ "$total" =~ ^[0-9]+$ ]] || die "$target stable denominator missing or malformed"
+  (( applied + converged <= total )) || die "$target prior receipts exceed stable denominator"
+  echo $((total-applied-converged))
+}
+forward_convergence_receipt() { # <target> <expected spec> <observed spec> <expected rows> <observed rows>
+  local target=$1 expected_spec=$2 observed_spec=$3 expected_rows=$4 observed_rows=$5 key expected observed delta sum=0 auxiliary=0 row_delta receipt
+  [[ "$expected_rows" =~ ^[0-9]+$ && "$observed_rows" =~ ^[0-9]+$ ]] || die "$target forward convergence rows missing or malformed"
+  (( observed_rows <= expected_rows )) || die "$target forward population increased after v3 catalog activation"
+  row_delta=$((expected_rows-observed_rows)); receipt="producer_converged_rows=$row_delta"$'\n'
+  for key in $(migration_outcomes "$FROM_VERSION" "$TO_VERSION"); do
+    expected=$(prereg_spec_value "$expected_spec" "$key"); observed=$(prereg_spec_value "$observed_spec" "$key")
+    [[ "$expected" =~ ^[0-9]+$ && "$observed" =~ ^[0-9]+$ ]] || die "$target forward $key missing or malformed"
+    (( observed <= expected )) || die "$target forward $key increased after v3 catalog activation"
+    delta=$((expected-observed)); sum=$((sum+delta)); receipt+="${key}_producer_converged=$delta"$'\n'
+    [[ $key == gt_5m_restored || $key == zero_to_5m_clamped ]] && auxiliary=$((auxiliary+delta))
+  done
+  (( sum - auxiliary == row_delta )) || die "$target forward convergence primary cells do not sum to row delta"
+  printf '%s' "$receipt"
+}
+emit_forward_convergence() { # <target> <label> <expected spec> <observed spec> <expected rows> <observed rows>
+  local target=$1 label=$2 receipt
+  receipt=$(forward_convergence_receipt "$target" "$3" "$4" "$5" "$6") || return $?
+  printf '%s\n' "$receipt" | emit "migrate-$target-convergence-$label.txt"
 }
 rollback_remaining_spec() {
   local target=$1 full key total applied cells=""
@@ -880,11 +951,6 @@ cmd_migrate_normalize_overlap() { # <unique label> [max-batches]
   done
   { echo "normalized_rows=$rows"; echo 'bounded_v3_future_skew_clamped_residual=0'; echo 'skipped_cas=0'; } | emit migrate-normalize-overlap-readback.txt
 }
-activation_floor() {
-  local floor; floor=$(awk -F= '$1=="activation_floor"{print $2}' "$E/activation-floor.txt" 2>/dev/null || true)
-  [[ "$floor" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{3}Z$ ]] || die 'activation floor receipt is missing or malformed'
-  echo "$floor"
-}
 native_tail_targets() { echo 'post'; }
 native_tail_preview() { # <artifact> <target>
   local out=$1 target=$2 floor rc
@@ -894,16 +960,7 @@ native_tail_preview() { # <artifact> <target>
   echo "$E/$out.json"
 }
 native_tail_spec() { migration_cells "$E/native-tail-$1-preview.json" "$TO_VERSION" "$FROM_VERSION"; }
-native_tail_converged_value() { # <target> <field>
-  local target=$1 field=$2 f value sum=0
-  for f in "$E"/native-tail-"$target"-convergence-*.txt; do
-    [[ -e "$f" ]] || continue
-    value=$(awk -F= -v k="$field" '$1==k{print $2}' "$f")
-    [[ "$value" =~ ^[0-9]+$ ]] || die "$target native-tail convergence receipt has malformed $field"
-    sum=$((sum+value))
-  done
-  echo "$sum"
-}
+native_tail_converged_value() { migration_converged_value native-tail "$1" "$2"; }
 native_tail_remaining_spec() {
   local target=$1 key total applied converged cells=""
   for key in $(migration_outcomes "$TO_VERSION" "$FROM_VERSION"); do
@@ -922,8 +979,8 @@ native_tail_remaining_rows() {
   (( applied + converged <= total )) || die "$target native-tail receipts exceed bound denominator"
   echo $((total-applied-converged))
 }
-emit_native_tail_convergence() { # <target> <label> <expected spec> <observed spec> <expected rows> <observed rows>
-  local target=$1 label=$2 expected_spec=$3 observed_spec=$4 expected_rows=$5 observed_rows=$6 key expected observed delta sum=0 auxiliary=0 row_delta receipt
+native_tail_convergence_receipt() { # <target> <expected spec> <observed spec> <expected rows> <observed rows>
+  local target=$1 expected_spec=$2 observed_spec=$3 expected_rows=$4 observed_rows=$5 key expected observed delta sum=0 auxiliary=0 row_delta receipt
   (( observed_rows <= expected_rows )) || die "$target native-tail population increased after v2 drain"
   row_delta=$((expected_rows-observed_rows)); receipt="producer_converged_rows=$row_delta"$'\n'
   for key in $(migration_outcomes "$TO_VERSION" "$FROM_VERSION"); do
@@ -933,7 +990,12 @@ emit_native_tail_convergence() { # <target> <label> <expected spec> <observed sp
     [[ $key == gt_5m_invalidated || $key == zero_to_5m_unclamped ]] && auxiliary=$((auxiliary+delta))
   done
   (( sum - auxiliary == row_delta )) || die "$target native-tail convergence primary cells do not sum to row delta"
-  printf '%s' "$receipt" | emit "native-tail-$target-convergence-$label.txt"
+  printf '%s' "$receipt"
+}
+emit_native_tail_convergence() { # <target> <label> <expected spec> <observed spec> <expected rows> <observed rows>
+  local target=$1 label=$2 receipt
+  receipt=$(native_tail_convergence_receipt "$target" "$3" "$4" "$5" "$6") || return $?
+  printf '%s\n' "$receipt" | emit "native-tail-$target-convergence-$label.txt"
 }
 emit_native_tail_plans() {
   local floor=$1 target table order
@@ -972,7 +1034,7 @@ cmd_migrate_native_tail_recovery_bind() {
   emit_native_tail_plans "$floor"
 }
 cmd_migrate_native_tail_rollback() { # <unique label> [max-batches]
-  local label=${1:?label} maxb=${2:-} floor target f rows observed_rows updated converged skipped key expected actual expected_spec observed_spec zero_spec
+  local label=${1:?label} maxb=${2:-} floor target f rows observed_rows updated converged skipped key expected actual expected_spec observed_spec candidate candidate_rows candidate_cell
   [[ "$label" =~ ^[a-zA-Z0-9][a-zA-Z0-9._-]*$ ]] || die 'native-tail label is unsafe'
   validate_migration_inputs; assert_tree; assert_active_catalog_version "$FROM_VERSION"; floor=$(activation_floor)
   if [[ ! -e "$E/native-tail-stable.txt" ]]; then
@@ -987,6 +1049,7 @@ cmd_migrate_native_tail_rollback() { # <unique label> [max-batches]
   grep -Fxq "activation_floor=$floor" "$E/native-tail-stable.txt" || die 'native-tail floor binding differs'
   grep -Fxq "drain_seconds=$MIGRATION_DRAIN_SECONDS" "$E/native-tail-stable.txt" || die 'native-tail drain binding differs'
   for target in $(native_tail_targets); do
+    assert_no_cas_conflicts native "$target"
     [[ $(awk -F= -v k="${target}_preview_sha256" '$1==k{print $2}' "$E/native-tail-stable.txt") == "$(sha256sum "$E/native-tail-$target-preview.json" | cut -d' ' -f1)" ]] || die "$target native-tail preview hash differs"
     rows=$(native_tail_remaining_rows "$target"); expected_spec=$(native_tail_remaining_spec "$target")
     f=$(native_tail_preview "native-tail-$target-preview-before-$label" "$target")
@@ -1000,72 +1063,114 @@ cmd_migrate_native_tail_rollback() { # <unique label> [max-batches]
     if (( rows > 0 )); then
       MIGRATION_NATIVE_V3_TAIL=1 MIGRATION_SINCE_OVERRIDE="$floor" migration_apply_one "$target" "$label" "$TO_VERSION" "$FROM_VERSION" native "$maxb"
       [[ $(jsonq "$E/native-$target-apply-$label.json" revalidation.complete) == true ]] || return 3
+      assert_no_cas_conflicts native "$target"
     fi
   done
   for target in $(native_tail_targets); do
     f=$(native_tail_preview "native-tail-$target-preview-after-$label" "$target")
-    [[ $(jsonq "$f" preview.truncated) == false && $(jsonq "$f" preview.scanned) == 0 ]] || die "$target native-tail rollback is incomplete"
-    rows=$(native_tail_remaining_rows "$target"); expected_spec=$(native_tail_remaining_spec "$target")
-    if (( rows > 0 )); then
-      zero_spec=""; for key in $(migration_outcomes "$TO_VERSION" "$FROM_VERSION"); do zero_spec+="$key=0,"; done; zero_spec=${zero_spec%,}
-      assert_active_catalog_version "$FROM_VERSION"
-      emit_native_tail_convergence "$target" "$label-postapply" "$expected_spec" "$zero_spec" "$rows" 0
-    fi
-    rows=$(awk -F= -v k="${target}_rows" '$1==k{print $2}' "$E/native-tail-stable.txt"); updated=$(migration_receipt_value native "$target" revalidation.updated); converged=$(native_tail_converged_value "$target" producer_converged_rows); [[ $((updated+converged)) == "$rows" ]] || die "$target native-tail updated=$updated + producer_converged=$converged but bound=$rows"
+    observed_rows=$(jsonq "$f" preview.scanned); observed_spec=$(migration_cells "$f" "$TO_VERSION" "$FROM_VERSION")
+    gate_migration_preview "$f" "$observed_spec" "$target native-tail final observed population" "$TO_VERSION" "$FROM_VERSION"
+    [[ "$observed_rows" == 0 ]] || die "$target native-tail rollback is incomplete"
+    expected_spec=$(native_tail_remaining_spec "$target")
+    candidate=$(native_tail_convergence_receipt "$target" "$expected_spec" "$observed_spec" "$(native_tail_remaining_rows "$target")" "$observed_rows") || return $?
+    candidate_rows=$(awk -F= '$1=="producer_converged_rows"{print $2}' <<<"$candidate")
+    rows=$(awk -F= -v k="${target}_rows" '$1==k{print $2}' "$E/native-tail-stable.txt"); updated=$(migration_receipt_value native "$target" revalidation.updated); converged=$(native_tail_converged_value "$target" producer_converged_rows); [[ $((updated+converged+candidate_rows)) == "$rows" ]] || die "$target native-tail updated=$updated + producer_converged=$converged + pending_converged=$candidate_rows but bound=$rows"
     skipped=$(migration_receipt_value native "$target" revalidation.skipped_cas); [[ "$skipped" == 0 ]] || die "$target native-tail skipped_cas=$skipped"
-    for key in $(migration_outcomes "$TO_VERSION" "$FROM_VERSION"); do expected=$(prereg_spec_value "$(native_tail_spec "$target")" "$key"); actual=$(migration_receipt_value native "$target" "revalidation.counts.$key"); converged=$(native_tail_converged_value "$target" "${key}_producer_converged"); [[ $((actual+converged)) == "$expected" ]] || die "$target native-tail $key updated=$actual + producer_converged=$converged but bound=$expected"; done
+    for key in $(migration_outcomes "$TO_VERSION" "$FROM_VERSION"); do expected=$(prereg_spec_value "$(native_tail_spec "$target")" "$key"); actual=$(migration_receipt_value native "$target" "revalidation.counts.$key"); converged=$(native_tail_converged_value "$target" "${key}_producer_converged"); candidate_cell=$(awk -F= -v k="${key}_producer_converged" '$1==k{print $2}' <<<"$candidate"); [[ $((actual+converged+candidate_cell)) == "$expected" ]] || die "$target native-tail $key updated=$actual + producer_converged=$converged + pending_converged=$candidate_cell but bound=$expected"; done
+    assert_active_catalog_version "$FROM_VERSION"
+    if grep -Eq '=[1-9][0-9]*$' <<<"$candidate"; then printf '%s\n' "$candidate" | emit "native-tail-$target-convergence-$label-postapply.txt"; fi
   done
   { echo "activation_floor=$floor"; for target in $(native_tail_targets); do echo "$target updated_rows=$(migration_receipt_value native "$target" revalidation.updated) producer_converged_rows=$(native_tail_converged_value "$target" producer_converged_rows) bound_rows=$(awk -F= -v k="${target}_rows" '$1==k{print $2}' "$E/native-tail-stable.txt") residual=0 skipped_cas=0"; done; echo 'historical_v3_before_floor_out_of_scope=true'; } | emit native-tail-readback.txt
 }
 cmd_migrate_apply() {
   local label=${1:?label} maxb=${2:-} target f rows spec cutoff attempt=1
+  local expected_rows expected_spec observed_rows observed_spec
+  [[ "$label" =~ ^[a-zA-Z0-9][a-zA-Z0-9._-]*$ ]] || die 'forward migration label is unsafe'
   assert_tree; assert_active_catalog_version "$TO_VERSION"; assert_stable_population_bound
   if [[ ! -f "$E/migrate-apply-authorized.txt" ]]; then
     while [[ -e "$E/migrate-authorize-post-$attempt.json" ]]; do attempt=$((attempt+1)); done
     for target in $(migration_targets); do
+      assert_no_late_v2_rows "$target"
       cutoff=$(migration_cutoff_value "$target")
       assert_from_before_cutoff "$target" "$cutoff"
+      expected_rows=$(migration_remaining_rows "$target"); expected_spec=$(migration_remaining_spec "$target")
       f=$(migration_preview_one "migrate-authorize-$target-$attempt" "$target" "$FROM_VERSION" "$TO_VERSION")
-      gate_migration_preview "$f" "$(migration_prereg_spec "$target")" "$target"
-      rows=$(awk -F= -v k="${target}_rows" '$1==k{print $2}' "$E/migrate-stable-population.txt")
-      [[ "$(jsonq "$f" preview.scanned)" == "$rows" ]] || die "$target bounded FROM population changed before apply authorization"
+      observed_rows=$(jsonq "$f" preview.scanned); observed_spec=$(migration_cells "$f" "$FROM_VERSION" "$TO_VERSION")
+      [[ "$observed_rows" =~ ^[0-9]+$ ]] || die "$target preview scanned missing or malformed"
+      gate_migration_preview "$f" "$observed_spec" "$target authorization observed population" "$FROM_VERSION" "$TO_VERSION"
+      assert_active_catalog_version "$TO_VERSION"
+      assert_from_before_cutoff "$target" "$cutoff"
+      assert_no_late_v2_rows "$target"
+      emit_forward_convergence "$target" "authorize-$attempt" "$expected_spec" "$observed_spec" "$expected_rows" "$observed_rows"
+      gate_migration_preview "$f" "$(migration_remaining_spec "$target")" "$target authorization remaining" "$FROM_VERSION" "$TO_VERSION"
+      rows=$(migration_remaining_rows "$target")
+      [[ "$(jsonq "$f" preview.scanned)" == "$rows" ]] || die "$target bounded FROM population differs from stable denominator minus receipts"
     done
     { echo "attempt=$attempt"; echo "stable_marker_sha256=$(sha256sum "$E/migrate-stable-population.txt" | cut -d' ' -f1)"; } | emit migrate-apply-authorized.txt
   fi
   [[ $(awk -F= '$1=="stable_marker_sha256"{print $2}' "$E/migrate-apply-authorized.txt") == "$(sha256sum "$E/migrate-stable-population.txt" | cut -d' ' -f1)" ]] || die 'apply authorization does not bind the stable population'
   for target in $(migration_targets); do
+    assert_no_cas_conflicts migrate "$target"
+    assert_no_late_v2_rows "$target"
     cutoff=$(migration_cutoff_value "$target")
     assert_from_before_cutoff "$target" "$cutoff"
+    expected_rows=$(migration_remaining_rows "$target"); expected_spec=$(migration_remaining_spec "$target")
     f=$(migration_preview_one "migrate-$target-preview-before-$label" "$target" "$FROM_VERSION" "$TO_VERSION")
+    observed_rows=$(jsonq "$f" preview.scanned); observed_spec=$(migration_cells "$f" "$FROM_VERSION" "$TO_VERSION")
+    [[ "$observed_rows" =~ ^[0-9]+$ ]] || die "$target preview scanned missing or malformed"
+    gate_migration_preview "$f" "$observed_spec" "$target apply observed population" "$FROM_VERSION" "$TO_VERSION"
+    assert_active_catalog_version "$TO_VERSION"
+    assert_from_before_cutoff "$target" "$cutoff"
+    assert_no_late_v2_rows "$target"
+    emit_forward_convergence "$target" "$label" "$expected_spec" "$observed_spec" "$expected_rows" "$observed_rows"
     spec=$(migration_remaining_spec "$target"); gate_migration_preview "$f" "$spec" "$target"
     rows=$(migration_remaining_rows "$target")
     [[ "$(jsonq "$f" preview.scanned)" == "$rows" ]] || die "$target remaining bounded FROM population differs from stable denominator minus prior receipts"
-    migration_apply_one "$target" "$label" "$FROM_VERSION" "$TO_VERSION" migrate "$maxb"
+    if (( rows > 0 )); then
+      migration_apply_one "$target" "$label" "$FROM_VERSION" "$TO_VERSION" migrate "$maxb"
+      [[ $(jsonq "$E/migrate-$target-apply-$label.json" revalidation.complete) == true ]] || return 3
+      assert_no_cas_conflicts migrate "$target"
+    fi
   done
 }
 cmd_migrate_readback() {
-  local target table since cutoff f rows updated skipped before_in after_in attempt=1 key expected actual
+  local target table since cutoff f rows updated converged skipped before_in after_in attempt=1 key expected actual expected_rows expected_spec observed_rows observed_spec candidate candidate_rows candidate_cell
+  assert_tree; assert_active_catalog_version "$TO_VERSION"; assert_stable_population_bound
   while [[ -e "$E/migrate-post-preview-after-$attempt.json" || -e "$E/migrate-post-preview-after-$attempt.err" ]]; do attempt=$((attempt+1)); done
   for target in $(migration_targets); do
+    assert_no_cas_conflicts migrate "$target"
+    assert_no_late_v2_rows "$target"
     table=$(migration_target_table "$target"); since=$(migration_target_since "$target")
+    expected_rows=$(migration_remaining_rows "$target"); expected_spec=$(migration_remaining_spec "$target")
     f=$(migration_preview_one "migrate-$target-preview-after-$attempt" "$target" "$FROM_VERSION" "$TO_VERSION")
-    gate_migration_preview "$f" "$(migration_remaining_spec "$target")" "$target residual"
-    [[ "$(jsonq "$f" preview.scanned)" == 0 ]] || die "$target still has bounded $FROM_VERSION semantic-delta rows"
+    observed_rows=$(jsonq "$f" preview.scanned); observed_spec=$(migration_cells "$f" "$FROM_VERSION" "$TO_VERSION")
+    gate_migration_preview "$f" "$observed_spec" "$target residual observed population"
+    [[ "$observed_rows" == 0 ]] || die "$target still has bounded $FROM_VERSION semantic-delta rows"
+    candidate=$(forward_convergence_receipt "$target" "$expected_spec" "$observed_spec" "$expected_rows" "$observed_rows") || return $?
+    candidate_rows=$(awk -F= '$1=="producer_converged_rows"{print $2}' <<<"$candidate")
     rows=$(awk -F= -v k="${target}_rows" '$1==k{print $2}' "$E/migrate-stable-population.txt")
-    updated=$(for f in "$E"/migrate-$target-apply-*.json; do jsonq "$f" revalidation.updated; done | awk '{s+=$1}END{print s+0}')
-    [[ "$updated" == "$rows" ]] || die "$target apply updated=$updated but prestate denominator=$rows"
-    skipped=$(for f in "$E"/migrate-$target-apply-*.json; do jsonq "$f" revalidation.skipped_cas; done | awk '{s+=$1}END{print s+0}')
+    [[ "$rows" =~ ^[0-9]+$ ]] || die "$target stable denominator missing or malformed"
+    updated=$(migration_applied_value "$target" revalidation.updated); converged=$(migration_converged_value migrate "$target" producer_converged_rows)
+    [[ $((updated+converged+candidate_rows)) == "$rows" ]] || die "$target apply updated=$updated + producer_converged=$converged + pending_converged=$candidate_rows but prestate denominator=$rows"
+    skipped=$(migration_applied_value "$target" revalidation.skipped_cas)
     [[ "$skipped" == 0 ]] || die "$target apply recorded skipped_cas=$skipped"
     for key in $(migration_outcomes "$FROM_VERSION" "$TO_VERSION"); do
       expected=$(prereg_spec_value "$(migration_prereg_spec "$target")" "$key")
-      actual=$(for f in "$E"/migrate-$target-apply-*.json; do jsonq "$f" "revalidation.counts.$key"; done | awk '{s+=$1}END{print s+0}')
-      [[ "$actual" == "$expected" ]] || die "$target realized $key=$actual but preregistered=$expected"
+      actual=$(migration_applied_value "$target" "revalidation.counts.$key")
+      converged=$(migration_converged_value migrate "$target" "${key}_producer_converged")
+      candidate_cell=$(awk -F= -v k="${key}_producer_converged" '$1==k{print $2}' <<<"$candidate")
+      [[ $((actual+converged+candidate_cell)) == "$expected" ]] || die "$target realized $key=$actual + producer_converged=$converged + pending_converged=$candidate_cell but preregistered=$expected"
     done
     cutoff=$(migration_cutoff_value "$target"); before_in=$(awk -F'|' '$1=="from_in_horizon"{print $2}' "$(migration_scope_file "$target")")
+    [[ "$before_in" =~ ^[0-9]+$ ]] || die "$target scope from_in_horizon missing or malformed"
     after_in=$(psql_ro -t -c "SELECT count(*) FROM public.$table WHERE content_time_validator_version='$FROM_VERSION' AND \"indexedAt\">='$since' AND \"indexedAt\"<'$cutoff';")
+    [[ "$after_in" =~ ^[0-9]+$ ]] || die "$target after_in count missing or malformed"
     [[ $((before_in-after_in)) == "$rows" ]] || die "$target migration changed a row outside the exact in-horizon snapshot"
+    assert_active_catalog_version "$TO_VERSION"
+    assert_no_late_v2_rows "$target"
+    if grep -Eq '=[1-9][0-9]*$' <<<"$candidate"; then printf '%s\n' "$candidate" | emit "migrate-$target-convergence-readback-$attempt.txt"; fi
   done
-  { echo "transition=$FROM_VERSION->$TO_VERSION"; for target in $(migration_targets); do echo "$target rows=$(awk -F= -v k="${target}_rows" '$1==k{print $2}' "$E/migrate-stable-population.txt")"; done; echo "ir_semantic_changed=$(awk -F= '$1=="ir_semantic_changed"{print $2}' "$E/migrate-stable-population.txt")"; echo "ir_restored_valid=$(awk -F= '$1=="ir_restored_valid"{print $2}' "$E/migrate-stable-population.txt")"; echo "ir_total_denominator=$(awk -F= '$1=="ir_total_denominator"{print $2}' "$E/migrate-stable-population.txt")"; } | emit "migrate-readback-$attempt.txt"
+  { echo 'status=complete'; echo "transition=$FROM_VERSION->$TO_VERSION"; echo "stable_marker_sha256=$(sha256sum "$E/migrate-stable-population.txt" | cut -d' ' -f1)"; for target in $(migration_targets); do echo "$target rows=$(awk -F= -v k="${target}_rows" '$1==k{print $2}' "$E/migrate-stable-population.txt")"; done; echo "ir_semantic_changed=$(awk -F= '$1=="ir_semantic_changed"{print $2}' "$E/migrate-stable-population.txt")"; echo "ir_restored_valid=$(awk -F= '$1=="ir_restored_valid"{print $2}' "$E/migrate-stable-population.txt")"; echo "ir_total_denominator=$(awk -F= '$1=="ir_total_denominator"{print $2}' "$E/migrate-stable-population.txt")"; } | emit "migrate-readback-$attempt.txt"
 }
 cmd_migrate_rollback() { # dry-run | apply <label> [max-batches]
   local mode=${1:?dry-run|apply} label=${2:-rollback} maxb=${3:-} target f spec rows updated skipped key expected actual cutoff before_in after_in incomplete=0 attempt=1

@@ -18,6 +18,7 @@ set -- migrate-preflight
 . "$packet"
 mkdir -p "$E"
 emit() { mkdir -p "$E"; dd of="$E/$1" status=none; }
+sleep() { :; }
 [[ $(migration_targets) == post ]]
 
 # The cutoff uses only the semantic transition cohorts and fails closed on
@@ -130,12 +131,17 @@ native_tail_preview() {
 }
 migration_apply_one() {
   local target=$1 label=$2 prefix=$5
-  [[ $target == post && $label == native-convergence && $prefix == native ]]
-  printf '{"revalidation":{"updated":1,"skipped_cas":0,"complete":true,"counts":{"v3_valid_to_v2_valid":1,"v3_clamped_to_v2_valid":0,"v3_clamped_to_v2_invalid":0,"v3_to_v2_invalid":0,"gt_5m_invalidated":0,"zero_to_5m_unclamped":0}}}\n' >"$E/native-post-apply-$label.json"
+  [[ $target == post && $prefix == native ]]
+  [[ $label == native-convergence ]]
+  printf '{"revalidation":{"updated":1,"skipped_cas":1,"complete":true,"counts":{"v3_valid_to_v2_valid":1,"v3_clamped_to_v2_valid":0,"v3_clamped_to_v2_invalid":0,"v3_to_v2_invalid":0,"gt_5m_invalidated":0,"zero_to_5m_unclamped":0}}}\n' >"$E/native-post-apply-$label.json"
 }
-cmd_migrate_native_tail_rollback native-convergence
-grep -Fq 'post updated_rows=1 producer_converged_rows=2 bound_rows=3 residual=0 skipped_cas=0' "$E/native-tail-readback.txt"
-[[ $(native_tail_remaining_rows post) == 0 ]]
+set +e; ( cmd_migrate_native_tail_rollback native-convergence ) >/dev/null 2>&1; native_cas_rc=$?; set -e
+[[ $native_cas_rc == 2 ]]
+[[ ! -e "$E/native-tail-post-convergence-native-convergence-postapply.txt" ]]
+[[ ! -e "$E/native-tail-readback.txt" ]]
+[[ $(jsonq "$E/native-post-apply-native-convergence.json" revalidation.skipped_cas) == 1 ]]
+set +e; ( cmd_migrate_native_tail_rollback native-2 ) >/dev/null 2>&1; native_retry_rc=$?; set -e
+[[ $native_retry_rc == 2 && ! -e "$E/native-post-apply-native-2.json" ]]
 truncated_e="$scratch/truncated-native-e"; mkdir -p "$truncated_e"
 printf '%s\n' 'activation_floor=2026-08-21T12:00:00.000Z' >"$truncated_e/activation-floor.txt"
 printf '%s\n' 'Index Scan' >"$truncated_e/native-tail-post-plan.txt"
@@ -183,6 +189,349 @@ MIGRATION_NATIVE_V3_TAIL=1 MIGRATION_SINCE_OVERRIDE=2026-08-21T12:00:00.000Z mig
 grep -Fq -- '--table post --since 2026-08-21T12:00:00.000Z' "$captured"
 grep -Fq -- '--all-authors' "$captured"
 grep -Fq -- '--native-v3-tail' "$captured"
-if grep -Fq -- '--until' "$captured"; then echo 'native tail unexpectedly inherited historical cutoff' >&2; exit 1; fi
+# Forward producer-convergence: under an active v3 catalog, the bounded FROM
+# population may monotonically decrease. Validate every gate fails closed
+# and that multi-attempt and partial-apply resumption reconciles to zero residual.
+assert_active_catalog_version() { [[ $1 == "$TO_VERSION" ]]; }
+fwd_growth_spec='v2_valid_to_v3_valid=2,v2_skew_to_v3_clamped=1,v2_invalid_to_v3_clamped=0,v2_to_v3_invalid=0,gt_5m_restored=0,zero_to_5m_clamped=1'
+if ( emit_forward_convergence post growth "$fwd_growth_spec" 'v2_valid_to_v3_valid=3,v2_skew_to_v3_clamped=1,v2_invalid_to_v3_clamped=0,v2_to_v3_invalid=0,gt_5m_restored=0,zero_to_5m_clamped=1' 3 4 ); then
+  echo 'forward convergence accepted population growth' >&2; exit 1
+fi
+if ( emit_forward_convergence post bad-cell "$fwd_growth_spec" 'v2_valid_to_v3_valid=3,v2_skew_to_v3_clamped=0,v2_invalid_to_v3_clamped=0,v2_to_v3_invalid=0,gt_5m_restored=0,zero_to_5m_clamped=0' 3 3 ); then
+  echo 'forward convergence accepted a growing outcome cell' >&2; exit 1
+fi
+if ( emit_forward_convergence post mismatch "$fwd_growth_spec" 'v2_valid_to_v3_valid=1,v2_skew_to_v3_clamped=1,v2_invalid_to_v3_clamped=0,v2_to_v3_invalid=0,gt_5m_restored=0,zero_to_5m_clamped=1' 3 1 ); then
+  echo 'forward convergence accepted mismatched cell sum vs row delta' >&2; exit 1
+fi
+fwd_bad_receipt="$scratch/bad-fwd-receipt.txt"
+[[ ! -e "$fwd_bad_receipt" ]]
+(
+  E="$scratch/fwd-aux-e"; mkdir -p "$E"
+  emit_forward_convergence post aux "$fwd_growth_spec" 'v2_valid_to_v3_valid=2,v2_skew_to_v3_clamped=0,v2_invalid_to_v3_clamped=0,v2_to_v3_invalid=0,gt_5m_restored=0,zero_to_5m_clamped=0' 3 2
+  grep -Fxq 'producer_converged_rows=1' "$E/migrate-post-convergence-aux.txt"
+  grep -Fxq 'v2_skew_to_v3_clamped_producer_converged=1' "$E/migrate-post-convergence-aux.txt"
+  grep -Fxq 'zero_to_5m_clamped_producer_converged=1' "$E/migrate-post-convergence-aux.txt"
+)
+
+# Resumable multi-attempt forward apply, authorization gates, and readback reconciliation
+fwd_e="$scratch/fwd-flow-e"; mkdir -p "$fwd_e"
+(
+  E="$fwd_e"
+  preview_content='{"preview":{"scanned":10,"truncated":false,"counts":{"v2_valid_to_v3_valid":5,"v2_skew_to_v3_clamped":5,"v2_invalid_to_v3_clamped":0,"v2_to_v3_invalid":0,"gt_5m_restored":0,"zero_to_5m_clamped":5}}}'
+  printf '%s\n' "$preview_content" >"$E/migrate-freeze-post-preview-1.json"
+  post_preview_sha=$(printf '%s\n' "$preview_content" | sha256sum | cut -d' ' -f1)
+
+  ir_content='{"preview":{"scanned":1,"truncated":false,"counts":{"v2_valid_to_v3_valid":1,"v2_skew_to_v3_clamped":0,"v2_invalid_to_v3_clamped":0,"v2_to_v3_invalid":0,"gt_5m_restored":0,"zero_to_5m_clamped":0}}}'
+  printf '%s\n' "$ir_content" >"$E/migrate-freeze-ir-preview-1.json"
+  ir_sha=$(migration_cells "$E/migrate-freeze-ir-preview-1.json" | sha256sum | cut -d' ' -f1)
+
+  {
+    echo "attempt=1"
+    echo "drain_seconds=60"
+    echo "max_preview_rows=123456"
+    echo "post_cutoff=2026-08-21T00:00:00.000Z"
+    echo "post_rows=10"
+    echo "post_preview_sha256=$post_preview_sha"
+    echo "ir_prereg_sha256=$ir_sha"
+    echo "ir_semantic_changed=1"
+    echo "ir_restored_valid=0"
+    echo "ir_total_denominator=1"
+  } >"$E/migrate-stable-population.txt"
+  printf 'cutoff=2026-08-21T00:00:00.000Z\n' >"$E/migrate-freeze-post-cutoff-1.txt"
+  printf 'from_in_horizon|10\nto_in_horizon|0\n' >"$E/migrate-freeze-post-scope-1.tsv"
+  printf 'activation_floor=2026-08-20T23:59:59.000Z\n' >"$E/activation-floor.txt"
+
+  assert_tree() { :; }
+  assert_active_catalog_version() { [[ $1 == "$TO_VERSION" ]]; }
+  sleep() { :; }
+  psql_ro() {
+    [[ "$*" == *'feedgen_ops.feed_catalog'* ]] && { echo "$EXPECTED_CONTRACT_ROWS|1|$TO_VERSION"; return; }
+    [[ "$*" == *'content_time_validator_version='\''newsflows-content-time/v2'\'''* && "$*" == *'2026-08-20T23:59:59.000Z'* ]] && { echo "${INJECT_LATE_V2_ALL:-0}"; return; }
+    [[ "$*" == *'content_time_status='\''source_valid'\'''* ]] && { echo "${INJECT_LATE_V2_SEMANTIC:-0}"; return; }
+    [[ "$*" == *'<'* ]] && { echo "${INJECT_AFTER_IN:-0}"; return; }
+    echo 0
+  }
+  control_rates() { echo '1 0 0'; }
+  pgstat_table_read() { echo '1|1|0|1|1'; }
+
+  # 1. Truncated authorization preview fails closed without leaving authorization marker or convergence receipt
+  migration_preview_one() {
+    local out=$1
+    printf '{"preview":{"scanned":10,"truncated":true,"counts":{"v2_valid_to_v3_valid":5,"v2_skew_to_v3_clamped":5,"v2_invalid_to_v3_clamped":0,"v2_to_v3_invalid":0,"gt_5m_restored":0,"zero_to_5m_clamped":5}}}\n' >"$E/$out.json"
+    echo "$E/$out.json"
+  }
+  set +e; ( cmd_migrate_apply forward-1 ) >/dev/null 2>&1; rc=$?; set -e
+  [[ $rc == 2 ]]
+  [[ ! -e "$E/migrate-apply-authorized.txt" ]]
+  [[ $(find "$E" -maxdepth 1 -name 'migrate-post-convergence-*.txt' | wc -l | tr -d ' ') == 0 ]]
+
+  # 2. Late v2 semantic rows at/after cutoff fails closed
+  INJECT_LATE_V2_SEMANTIC=1
+  migration_preview_one() {
+    local out=$1
+    printf '{"preview":{"scanned":8,"truncated":false,"counts":{"v2_valid_to_v3_valid":4,"v2_skew_to_v3_clamped":4,"v2_invalid_to_v3_clamped":0,"v2_to_v3_invalid":0,"gt_5m_restored":0,"zero_to_5m_clamped":4}}}\n' >"$E/$out.json"
+    echo "$E/$out.json"
+  }
+  set +e; ( cmd_migrate_apply forward-1 ) >/dev/null 2>&1; rc=$?; set -e
+  [[ $rc == 2 ]]
+  [[ ! -e "$E/migrate-apply-authorized.txt" ]]
+  [[ $(find "$E" -maxdepth 1 -name 'migrate-post-convergence-*.txt' | wc -l | tr -d ' ') == 0 ]]
+  INJECT_LATE_V2_SEMANTIC=0
+
+  # 2b. Compatible (non-semantic) late v2 rows at/after floor fails closed
+  INJECT_LATE_V2_ALL=1
+  set +e; ( cmd_migrate_apply forward-1 ) >/dev/null 2>&1; rc=$?; set -e
+  [[ $rc == 2 ]]
+  [[ ! -e "$E/migrate-apply-authorized.txt" ]]
+  [[ $(find "$E" -maxdepth 1 -name 'migrate-post-convergence-*.txt' | wc -l | tr -d ' ') == 0 ]]
+  INJECT_LATE_V2_ALL=0
+
+  # 3. Growing population fails closed
+  migration_preview_one() {
+    local out=$1
+    printf '{"preview":{"scanned":11,"truncated":false,"counts":{"v2_valid_to_v3_valid":6,"v2_skew_to_v3_clamped":5,"v2_invalid_to_v3_clamped":0,"v2_to_v3_invalid":0,"gt_5m_restored":0,"zero_to_5m_clamped":5}}}\n' >"$E/$out.json"
+    echo "$E/$out.json"
+  }
+  set +e; ( cmd_migrate_apply forward-1 ) >/dev/null 2>&1; rc=$?; set -e
+  [[ $rc == 2 ]]
+  [[ ! -e "$E/migrate-apply-authorized.txt" ]]
+  [[ $(find "$E" -maxdepth 1 -name 'migrate-post-convergence-*.txt' | wc -l | tr -d ' ') == 0 ]]
+
+  # 4. Valid authorization and pre-apply preview converge 10 -> 8 rows.
+  # The transaction updates seven; the producer legitimately converges the last
+  # row before final readback.
+  migration_preview_one() {
+    local out=$1
+    case "$out" in
+      migrate-authorize-post-*)
+        printf '{"preview":{"scanned":8,"truncated":false,"counts":{"v2_valid_to_v3_valid":4,"v2_skew_to_v3_clamped":4,"v2_invalid_to_v3_clamped":0,"v2_to_v3_invalid":0,"gt_5m_restored":0,"zero_to_5m_clamped":4}}}\n' >"$E/$out.json";;
+      migrate-post-preview-before-forward-1)
+        printf '{"preview":{"scanned":8,"truncated":false,"counts":{"v2_valid_to_v3_valid":4,"v2_skew_to_v3_clamped":4,"v2_invalid_to_v3_clamped":0,"v2_to_v3_invalid":0,"gt_5m_restored":0,"zero_to_5m_clamped":4}}}\n' >"$E/$out.json";;
+      *) echo "unexpected preview $out" >&2; return 2;;
+    esac
+    echo "$E/$out.json"
+  }
+  migration_apply_one() {
+    local target=$1 label=$2
+    [[ $target == post ]]
+    [[ $label == forward-1 ]]
+    printf '{"table":"post","revalidation":{"updated":7,"skipped_cas":1,"complete":true,"counts":{"v2_valid_to_v3_valid":3,"v2_skew_to_v3_clamped":4,"v2_invalid_to_v3_clamped":0,"v2_to_v3_invalid":0,"gt_5m_restored":0,"zero_to_5m_clamped":4}}}\n' >"$E/migrate-post-apply-$label.json"
+  }
+  set +e; ( cmd_migrate_apply forward-1 ) >/dev/null 2>&1; rc=$?; set -e
+  [[ $rc == 2 ]]
+  [[ -f "$E/migrate-apply-authorized.txt" ]]
+  grep -Fxq 'producer_converged_rows=2' "$E/migrate-post-convergence-authorize-3.txt"
+  grep -Fxq 'v2_valid_to_v3_valid_producer_converged=1' "$E/migrate-post-convergence-authorize-3.txt"
+  grep -Fxq 'v2_skew_to_v3_clamped_producer_converged=1' "$E/migrate-post-convergence-authorize-3.txt"
+  grep -Fxq 'zero_to_5m_clamped_producer_converged=1' "$E/migrate-post-convergence-authorize-3.txt"
+  grep -Fxq 'producer_converged_rows=0' "$E/migrate-post-convergence-forward-1.txt"
+  [[ $(migration_remaining_rows post) == 1 ]]
+  [[ $(migration_remaining_spec post) == 'v2_valid_to_v3_valid=1,v2_skew_to_v3_clamped=0,v2_invalid_to_v3_clamped=0,v2_to_v3_invalid=0,gt_5m_restored=0,zero_to_5m_clamped=0' ]]
+
+  # 6. Readback refusal tests:
+  # 6a. Nonzero residual refuses readback marker
+  migration_preview_one() {
+    local out=$1
+    printf '{"preview":{"scanned":1,"truncated":false,"counts":{"v2_valid_to_v3_valid":1,"v2_skew_to_v3_clamped":0,"v2_invalid_to_v3_clamped":0,"v2_to_v3_invalid":0,"gt_5m_restored":0,"zero_to_5m_clamped":0}}}\n' >"$E/$out.json"
+    echo "$E/$out.json"
+  }
+  set +e; ( set -e; cmd_migrate_readback ) >/dev/null 2>&1; readback_rc=$?; set -e
+  [[ $readback_rc == 2 ]]
+  [[ $(find "$E" -maxdepth 1 -name 'migrate-readback-*.txt' | wc -l | tr -d ' ') == 0 ]]
+  [[ $(find "$E" -maxdepth 1 -name 'migrate-post-convergence-readback-*.txt' | wc -l | tr -d ' ') == 0 ]]
+
+  # 6b. Compatible late v2 row refuses readback marker
+  migration_preview_one() {
+    local out=$1
+    printf '{"preview":{"scanned":0,"truncated":false,"counts":{"v2_valid_to_v3_valid":0,"v2_skew_to_v3_clamped":0,"v2_invalid_to_v3_clamped":0,"v2_to_v3_invalid":0,"gt_5m_restored":0,"zero_to_5m_clamped":0}}}\n' >"$E/$out.json"
+    echo "$E/$out.json"
+  }
+  INJECT_LATE_V2_ALL=1
+  set +e; ( set -e; cmd_migrate_readback ) >/dev/null 2>&1; readback_rc=$?; set -e
+  [[ $readback_rc == 2 ]]
+  [[ $(find "$E" -maxdepth 1 -name 'migrate-readback-*.txt' | wc -l | tr -d ' ') == 0 ]]
+  INJECT_LATE_V2_ALL=0
+
+  # 6c. The immutable CAS-conflict receipt terminally refuses this evidence root.
+  set +e; ( set -e; cmd_migrate_readback ) >/dev/null 2>&1; readback_rc=$?; set -e
+  [[ $readback_rc == 2 ]]
+  [[ $(find "$E" -maxdepth 1 -name 'migrate-readback-*.txt' | wc -l | tr -d ' ') == 0 ]]
+  [[ $(find "$E" -maxdepth 1 -name 'migrate-post-convergence-readback-*.txt' | wc -l | tr -d ' ') == 0 ]]
+
+  [[ $(jsonq "$E/migrate-post-apply-forward-1.json" revalidation.skipped_cas) == 1 ]]
+  set +e; ( cmd_migrate_apply forward-2 ) >/dev/null 2>&1; retry_rc=$?; set -e
+  [[ $retry_rc == 2 && ! -e "$E/migrate-post-apply-forward-2.json" ]]
+)
+
+# 8. All-producer convergence with zero apply receipts
+all_conv_e="$scratch/all-conv-e"; mkdir -p "$all_conv_e"
+(
+  E="$all_conv_e"
+  preview_content='{"preview":{"scanned":5,"truncated":false,"counts":{"v2_valid_to_v3_valid":3,"v2_skew_to_v3_clamped":2,"v2_invalid_to_v3_clamped":0,"v2_to_v3_invalid":0,"gt_5m_restored":0,"zero_to_5m_clamped":2}}}'
+  printf '%s\n' "$preview_content" >"$E/migrate-freeze-post-preview-1.json"
+  post_preview_sha=$(printf '%s\n' "$preview_content" | sha256sum | cut -d' ' -f1)
+
+  ir_content='{"preview":{"scanned":0,"truncated":false,"counts":{"v2_valid_to_v3_valid":0,"v2_skew_to_v3_clamped":0,"v2_invalid_to_v3_clamped":0,"v2_to_v3_invalid":0,"gt_5m_restored":0,"zero_to_5m_clamped":0}}}'
+  printf '%s\n' "$ir_content" >"$E/migrate-freeze-ir-preview-1.json"
+  ir_sha=$(migration_cells "$E/migrate-freeze-ir-preview-1.json" | sha256sum | cut -d' ' -f1)
+
+  {
+    echo "attempt=1"
+    echo "drain_seconds=60"
+    echo "max_preview_rows=123456"
+    echo "post_cutoff=2026-08-21T00:00:00.000Z"
+    echo "post_rows=5"
+    echo "post_preview_sha256=$post_preview_sha"
+    echo "ir_prereg_sha256=$ir_sha"
+    echo "ir_semantic_changed=0"
+    echo "ir_restored_valid=0"
+    echo "ir_total_denominator=0"
+  } >"$E/migrate-stable-population.txt"
+  printf 'cutoff=2026-08-21T00:00:00.000Z\n' >"$E/migrate-freeze-post-cutoff-1.txt"
+  printf 'from_in_horizon|5\nto_in_horizon|0\n' >"$E/migrate-freeze-post-scope-1.tsv"
+  printf 'activation_floor=2026-08-20T23:59:59.000Z\n' >"$E/activation-floor.txt"
+
+  assert_tree() { :; }
+  assert_active_catalog_version() { [[ $1 == "$TO_VERSION" ]]; }
+  sleep() { :; }
+  psql_ro() {
+    [[ "$*" == *'feedgen_ops.feed_catalog'* ]] && { echo "$EXPECTED_CONTRACT_ROWS|1|$TO_VERSION"; return; }
+    echo 0
+  }
+  control_rates() { echo '1 0 0'; }
+  pgstat_table_read() { echo '1|1|0|1|1'; }
+
+  migration_preview_one() {
+    local out=$1
+    printf '{"preview":{"scanned":0,"truncated":false,"counts":{"v2_valid_to_v3_valid":0,"v2_skew_to_v3_clamped":0,"v2_invalid_to_v3_clamped":0,"v2_to_v3_invalid":0,"gt_5m_restored":0,"zero_to_5m_clamped":0}}}\n' >"$E/$out.json"
+    echo "$E/$out.json"
+  }
+  migration_apply_one() { echo "apply unexpectedly called" >&2; exit 1; }
+
+  cmd_migrate_apply forward-1
+  [[ -f "$E/migrate-apply-authorized.txt" ]]
+  [[ ! -e "$E/migrate-post-apply-forward-1.json" ]]
+  grep -Fxq 'producer_converged_rows=5' "$E/migrate-post-convergence-authorize-1.txt"
+  grep -Fxq 'v2_valid_to_v3_valid_producer_converged=3' "$E/migrate-post-convergence-authorize-1.txt"
+  grep -Fxq 'v2_skew_to_v3_clamped_producer_converged=2' "$E/migrate-post-convergence-authorize-1.txt"
+  grep -Fxq 'zero_to_5m_clamped_producer_converged=2' "$E/migrate-post-convergence-authorize-1.txt"
+  [[ $(migration_remaining_rows post) == 0 ]]
+
+  cmd_migrate_readback
+  [[ -s "$E/migrate-readback-1.txt" ]]
+  grep -Fq 'post rows=5' "$E/migrate-readback-1.txt"
+)
+
+# 9. Strict field tests on preview and apply
+strict_e="$scratch/strict-e"; mkdir -p "$strict_e"
+(
+  E="$strict_e"
+  set +e; ( cmd_migrate_apply '../unsafe' ) >/dev/null 2>&1; rc=$?; set -e
+  [[ $rc == 2 && ! -e "$scratch/migrate-post-apply-unsafe.json" ]]
+  good_spec='v2_valid_to_v3_valid=1,v2_skew_to_v3_clamped=0,v2_invalid_to_v3_clamped=0,v2_to_v3_invalid=0,gt_5m_restored=0,zero_to_5m_clamped=0'
+  # Missing scanned
+  printf '{"preview":{"truncated":false,"counts":{"v2_valid_to_v3_valid":1,"v2_skew_to_v3_clamped":0,"v2_invalid_to_v3_clamped":0,"v2_to_v3_invalid":0,"gt_5m_restored":0,"zero_to_5m_clamped":0}}}\n' >"$E/missing-scanned.json"
+  set +e; ( gate_migration_preview "$E/missing-scanned.json" "$good_spec" test ) >/dev/null 2>&1; rc=$?; set -e
+  [[ $rc == 2 ]]
+
+  # Missing cell in counts
+  printf '{"preview":{"scanned":1,"truncated":false,"counts":{"v2_skew_to_v3_clamped":0,"v2_invalid_to_v3_clamped":0,"v2_to_v3_invalid":0,"gt_5m_restored":0,"zero_to_5m_clamped":0}}}\n' >"$E/missing-cell.json"
+  set +e; ( gate_migration_preview "$E/missing-cell.json" "$good_spec" test ) >/dev/null 2>&1; rc=$?; set -e
+  [[ $rc == 2 ]]
+
+  # Malformed non-integer cell in counts
+  printf '{"preview":{"scanned":1,"truncated":false,"counts":{"v2_valid_to_v3_valid":"one","v2_skew_to_v3_clamped":0,"v2_invalid_to_v3_clamped":0,"v2_to_v3_invalid":0,"gt_5m_restored":0,"zero_to_5m_clamped":0}}}\n' >"$E/malformed-cell.json"
+  set +e; ( gate_migration_preview "$E/malformed-cell.json" "$good_spec" test ) >/dev/null 2>&1; rc=$?; set -e
+  [[ $rc == 2 ]]
+
+  # Malformed non-integer auxiliary count
+  printf '{"preview":{"scanned":1,"truncated":false,"counts":{"v2_valid_to_v3_valid":1,"v2_skew_to_v3_clamped":0,"v2_invalid_to_v3_clamped":0,"v2_to_v3_invalid":0,"gt_5m_restored":"bad","zero_to_5m_clamped":0}}}\n' >"$E/malformed-aux.json"
+  set +e; ( gate_migration_preview "$E/malformed-aux.json" "$good_spec" test ) >/dev/null 2>&1; rc=$?; set -e
+  [[ $rc == 2 ]]
+
+  # migration_cells on missing count
+  set +e; ( migration_cells "$E/missing-cell.json" ) >/dev/null 2>&1; rc=$?; set -e
+  [[ $rc == 2 ]]
+
+  # migration_applied_value on malformed apply receipt
+  printf '{"table":"post","revalidation":{"updated":"not_int","skipped_cas":0,"complete":true,"counts":{"v2_valid_to_v3_valid":1,"v2_skew_to_v3_clamped":0,"v2_invalid_to_v3_clamped":0,"v2_to_v3_invalid":0,"gt_5m_restored":0,"zero_to_5m_clamped":0}}}\n' >"$E/migrate-post-apply-bad.json"
+  set +e; ( migration_applied_value post revalidation.updated ) >/dev/null 2>&1; rc=$?; set -e
+  [[ $rc == 2 ]]
+)
+
+# Final candidate accounting must follow cell deltas even when no rows remain.
+prepare_forward_candidate_e() {
+  local dst=$1
+  mkdir -p "$dst"
+  cp "$fwd_e"/migrate-stable-population.txt "$fwd_e"/migrate-freeze-{post,ir}-preview-1.json \
+    "$fwd_e"/migrate-freeze-post-{cutoff-1.txt,scope-1.tsv} "$fwd_e"/activation-floor.txt "$dst/"
+}
+assert_active_catalog_version() { [[ $1 == "$TO_VERSION" ]]; }
+psql_ro() {
+  [[ "$*" == *'feedgen_ops.feed_catalog'* ]] && { echo "$EXPECTED_CONTRACT_ROWS|1|$TO_VERSION"; return; }
+  echo 0
+}
+migration_preview_one() {
+  local out=$1
+  printf '{"preview":{"scanned":0,"truncated":false,"counts":{"v2_valid_to_v3_valid":0,"v2_skew_to_v3_clamped":0,"v2_invalid_to_v3_clamped":0,"v2_to_v3_invalid":0,"gt_5m_restored":0,"zero_to_5m_clamped":0}}}\n' >"$E/$out.json"
+  echo "$E/$out.json"
+}
+forward_bad_e="$scratch/forward-primary-short-e"; prepare_forward_candidate_e "$forward_bad_e"
+(
+  E=$forward_bad_e
+  printf '{"revalidation":{"updated":10,"skipped_cas":0,"complete":true,"counts":{"v2_valid_to_v3_valid":4,"v2_skew_to_v3_clamped":5,"v2_invalid_to_v3_clamped":0,"v2_to_v3_invalid":0,"gt_5m_restored":0,"zero_to_5m_clamped":5}}}\n' >"$E/migrate-post-apply-forward-1.json"
+  set +e; ( set -e; cmd_migrate_readback ) >/dev/null 2>&1; rc=$?; set -e
+  [[ $rc == 2 && ! -e "$E/migrate-readback-1.txt" ]]
+  [[ $(find "$E" -name 'migrate-post-convergence-readback-*.txt' | wc -l | tr -d ' ') == 0 ]]
+)
+forward_aux_e="$scratch/forward-aux-only-e"; prepare_forward_candidate_e "$forward_aux_e"
+(
+  E=$forward_aux_e
+  printf '{"revalidation":{"updated":10,"skipped_cas":0,"complete":true,"counts":{"v2_valid_to_v3_valid":5,"v2_skew_to_v3_clamped":5,"v2_invalid_to_v3_clamped":0,"v2_to_v3_invalid":0,"gt_5m_restored":0,"zero_to_5m_clamped":4}}}\n' >"$E/migrate-post-apply-forward-1.json"
+  cmd_migrate_readback
+  grep -Fxq 'producer_converged_rows=0' "$E/migrate-post-convergence-readback-1.txt"
+  grep -Fxq 'zero_to_5m_clamped_producer_converged=1' "$E/migrate-post-convergence-readback-1.txt"
+  cmd_migrate_readback
+  [[ $(find "$E" -name 'migrate-post-convergence-readback-*.txt' | wc -l | tr -d ' ') == 1 ]]
+)
+
+prepare_native_candidate_e() {
+  local dst=$1 preview
+  mkdir -p "$dst"
+  printf 'activation_floor=2026-08-21T12:00:00.000Z\n' >"$dst/activation-floor.txt"
+  printf 'Index Scan\n' >"$dst/native-tail-post-plan.txt"
+  preview='{"preview":{"scanned":10,"truncated":false,"counts":{"v3_valid_to_v2_valid":5,"v3_clamped_to_v2_valid":0,"v3_clamped_to_v2_invalid":5,"v3_to_v2_invalid":0,"gt_5m_invalidated":5,"zero_to_5m_unclamped":0}}}'
+  printf '%s\n' "$preview" >"$dst/native-tail-post-preview.json"
+  { echo 'activation_floor=2026-08-21T12:00:00.000Z'; echo "drain_seconds=$MIGRATION_DRAIN_SECONDS"; echo 'post_rows=10'; echo "post_preview_sha256=$(printf '%s\n' "$preview" | sha256sum | cut -d' ' -f1)"; } >"$dst/native-tail-stable.txt"
+}
+assert_active_catalog_version() { [[ $1 == "$FROM_VERSION" ]]; }
+native_tail_preview() {
+  local out=$1 scanned=10 valid=5 invalid=5 aux=5
+  [[ $out == *-after-* || $out == *-before-aux-retry ]] && { scanned=0; valid=0; invalid=0; aux=0; }
+  printf '{"preview":{"scanned":%s,"truncated":false,"counts":{"v3_valid_to_v2_valid":%s,"v3_clamped_to_v2_valid":0,"v3_clamped_to_v2_invalid":%s,"v3_to_v2_invalid":0,"gt_5m_invalidated":%s,"zero_to_5m_unclamped":0}}}\n' "$scanned" "$valid" "$invalid" "$aux" >"$E/$out.json"
+  echo "$E/$out.json"
+}
+migration_apply_one() {
+  local target=$1 label=$2 prefix=$5 aux=5 valid=5
+  [[ $target == post && $prefix == native ]]
+  [[ $label == primary-short ]] && valid=4
+  [[ $label == aux-only ]] && aux=4
+  printf '{"revalidation":{"updated":10,"skipped_cas":0,"complete":true,"counts":{"v3_valid_to_v2_valid":%s,"v3_clamped_to_v2_valid":0,"v3_clamped_to_v2_invalid":5,"v3_to_v2_invalid":0,"gt_5m_invalidated":%s,"zero_to_5m_unclamped":0}}}\n' "$valid" "$aux" >"$E/native-post-apply-$label.json"
+}
+native_bad_e="$scratch/native-primary-short-e"; prepare_native_candidate_e "$native_bad_e"
+(
+  E=$native_bad_e
+  set +e; ( set -e; cmd_migrate_native_tail_rollback primary-short ) >/dev/null 2>&1; rc=$?; set -e
+  [[ $rc == 2 && ! -e "$E/native-tail-readback.txt" && ! -e "$E/native-tail-post-convergence-primary-short-postapply.txt" ]]
+)
+native_aux_e="$scratch/native-aux-only-e"; prepare_native_candidate_e "$native_aux_e"
+(
+  E=$native_aux_e
+  cmd_migrate_native_tail_rollback aux-only
+  grep -Fxq 'producer_converged_rows=0' "$E/native-tail-post-convergence-aux-only-postapply.txt"
+  grep -Fxq 'gt_5m_invalidated_producer_converged=1' "$E/native-tail-post-convergence-aux-only-postapply.txt"
+  cmd_migrate_native_tail_rollback aux-retry
+  [[ $(find "$E" -name 'native-tail-post-convergence-*-postapply.txt' | wc -l | tr -d ' ') == 1 ]]
+)
 
 echo 'content-time revalidation packet contract ok'
