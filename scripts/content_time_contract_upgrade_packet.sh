@@ -90,7 +90,7 @@ if [[ $COMMAND == test-runtime-provenance && ${FTFU1_TEST_MODE:-0} == 1 ]]; then
   : "${E:?}" "${EXPECTED_IMAGE:?}" "${FEEDGEN_SHA:?}"; assert_runtime_provenance; exit 0
 fi
 
-for v in E SOURCE_ROOT SOURCE_SHA SOURCE_CATALOG_SHA ROLLBACK_SOURCE_ROOT ROLLBACK_SOURCE_SHA ROLLBACK_CATALOG_SHA TREE PACKET_SOURCE_SHA FEEDGEN_SHA EXPECTED_DIST_SHA EXPECTED_CT_SHA EXPECTED_IMAGE_CT_SHA EXPECTED_IMAGE EXPECTED_TOOL_REFS EXPECTED_RUNNER_SHA EXPECTED_REVALIDATE_RUNNER_SHA PACKET_PATH PACKET_SHA SINCE_MAIN SINCE_BE SINCE_ENGAGEMENT; do
+for v in E SOURCE_ROOT SOURCE_SHA SOURCE_CATALOG_SHA ROLLBACK_SOURCE_ROOT ROLLBACK_SOURCE_SHA ROLLBACK_CATALOG_SHA TREE PACKET_SOURCE_SHA FEEDGEN_SHA EXPECTED_DIST_SHA EXPECTED_CT_SHA EXPECTED_IMAGE_CT_SHA EXPECTED_IMAGE EXPECTED_TOOL_REFS EXPECTED_RUNNER_SHA EXPECTED_REVALIDATE_RUNNER_SHA PACKET_PATH PACKET_SHA BSR_EFFECTIVE_CONFIG_JSON SINCE_MAIN SINCE_BE SINCE_ENGAGEMENT; do
   [[ -n ${!v:-} ]] || die "$v is required"
 done
 [[ $E == /* ]] || die 'E must be an absolute evidence root'
@@ -135,7 +135,7 @@ assert_bindings() {
   done
 }
 catalog_packet() {
-  bskyops_env "$BSKYOPS" ecosystem desired-state feedgen-sync-packet --active-only --catalog-yaml "${1:-$DEPLOYED_CATALOG_ROOT/publishers.yml}" --feedgen-url "$FEEDGEN_URL" --json
+  bskyops_env "$BSKYOPS" ecosystem desired-state feedgen-sync-packet --active-only --catalog-yaml "${1:-$DEPLOYED_CATALOG_ROOT/publishers.yml}" --bsr-effective-config-json "$BSR_EFFECTIVE_CONFIG_JSON" --feedgen-url "$FEEDGEN_URL" --json
 }
 gate_body() {
   node - "$1" "$2" "$3" "$RKEYS" <<'NODE'

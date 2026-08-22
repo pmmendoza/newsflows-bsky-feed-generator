@@ -9,6 +9,7 @@ must "fields.length!==1||fields[0]!=='content_time_contract_version'"
 must 'check(j.atomic_change_set.request_body,from,to);check(j.atomic_change_set.rollback_request_body,to,from)'
 must 'catalog_sync_apply "$SOURCE_ROOT"'
 must '--source-root "$1/config/newsflows/catalogs"'
+must '--bsr-effective-config-json "$BSR_EFFECTIVE_CONFIG_JSON"'
 must 'post_bulk "$E/feedgen-forward.json" 03-feedgen-forward-apply'
 must 'revalidate_runner migrate-prepare'
 must 'revalidate_runner migrate-freeze'
@@ -91,7 +92,7 @@ PATH="$tmp/runtime-mock:$PATH" FTFU1_TEST_MODE=1 E="$tmp/resume-evidence" \
   ROLLBACK_SOURCE_ROOT="$tmp/packet-tree" ROLLBACK_SOURCE_SHA="$packet_tree_sha" ROLLBACK_CATALOG_SHA="$hex64" \
   TREE="$tmp/resume-tree" PACKET_SOURCE_SHA="$resume_tree_sha" FEEDGEN_SHA="$runtime_sha" \
   EXPECTED_DIST_SHA="$hex64" EXPECTED_CT_SHA="$hex64" EXPECTED_IMAGE_CT_SHA="$hex64" EXPECTED_IMAGE=fixture \
-  EXPECTED_TOOL_REFS=x EXPECTED_RUNNER_SHA="$hex64" EXPECTED_REVALIDATE_RUNNER_SHA="$hex64" \
+  EXPECTED_TOOL_REFS=x EXPECTED_RUNNER_SHA="$hex64" EXPECTED_REVALIDATE_RUNNER_SHA="$hex64" BSR_EFFECTIVE_CONFIG_JSON=x \
   PACKET_PATH="$packet" PACKET_SHA="$hex64" SINCE_MAIN=2026-08-18T00:00:00.000Z \
   SINCE_BE=2026-08-11T00:00:00.000Z SINCE_ENGAGEMENT=2026-08-11T00:00:00.000Z \
   bash "$packet" test-forward-resume
