@@ -180,8 +180,9 @@ grep -Fxq 'native-2' "$tmp/resume-evidence/native-coordinator-labels.txt"
     [[ "$*" == *'WITH bounds'* ]] && { printf 'max_from=2026-08-20T00:00:00.000Z|min_to=2026-08-21T00:00:00.000Z|cutoff=2026-08-21T00:00:00.000Z\n'; return; }
     [[ "$*" == *'created_at_source_raw IS NULL'* ]] && { echo 0; return; }
     [[ "$*" == *"WHERE author='$IR_DID'"* ]] && { echo 1; return; }
+    [[ "$*" == *'SELECT count(*) FROM public.'* && "$*" == *"content_time_validator_version='$FROM_VERSION'"* && "$*" == *'"indexedAt">='* && "$*" == *'"indexedAt"<'* ]] && { echo 1; return; }
     [[ "$*" == *'SELECT count(*) FROM public.'* ]] && { echo 0; return; }
-    printf 'from_in_horizon|1\nfrom_outside_horizon|0\nfrom_total|1\nto_in_horizon|0\n'
+    printf 'from_in_horizon|1\nto_in_horizon|0\n'
   }
   migration_preview_one() {
     local out=$1 target=$2 actors=${5:-} n=1 truncated=${INJECT_TRUNCATED:-false}

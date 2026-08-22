@@ -37,6 +37,10 @@ printf 'activation_floor=2026-08-21T12:00:00.000Z\n' >"$E/activation-floor.txt"
 cutoff_bounds='max_from=2026-08-21T11:59:59.999Z|min_to=2026-08-21T12:00:00.000Z|cutoff=2026-08-21T12:00:00.000Z'
 migration_derive_cutoff post 3
 grep -Fxq 'cutoff=2026-08-21T12:00:00.000Z' "$E/migrate-freeze-post-cutoff-3.txt"
+scope_sql=$(migration_scope_sql post 2026-08-21T12:00:00.000Z)
+[[ "$scope_sql" == *'"indexedAt">='\''2026-08-11T00:00:00.000Z'\'''* ]]
+[[ "$scope_sql" == *'"indexedAt"<'\''2026-08-21T12:00:00.000Z'\'''* ]]
+[[ "$scope_sql" != *from_outside_horizon* && "$scope_sql" != *from_total* ]]
 
 # The explicit overlap-normalization path binds its reverse preview, resumes
 # from receipts, and publishes a zero-residual readback without changing the
@@ -76,6 +80,80 @@ assert_active_catalog_version() { [[ $1 == "$TO_VERSION" ]]; }
 psql_ro() { printf '%s\n' 'Index Scan using ftfu1_post_contract_indexedat_tmp' '  Index Cond: ("indexedAt" >= '\''2026-08-21T12:00:00.000Z'\''::text)'; }
 cmd_migrate_native_tail_plan
 grep -Fq 'Index Cond:' "$E/native-tail-post-plan.txt"
+
+# Recovery never copies old receipts. It imports only a typed activation-floor
+# fact after explicit source hashes match, and regenerates the plan under v2.
+prior_e="$scratch/prior-e"; mkdir -p "$prior_e"
+printf '%s\n' 'activation_floor=2026-08-21T12:00:00.000Z' >"$prior_e/activation-floor.txt"
+printf '%s\n' "migration_transition=$FROM_VERSION->$TO_VERSION" \
+  'source_sha=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' \
+  'packet_sha256=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' >"$prior_e/migrate-source-set.txt"
+export RECOVERY_SOURCE_E="$prior_e" \
+  RECOVERY_SOURCE_SET_SHA256="$(sha256sum "$prior_e/migrate-source-set.txt" | cut -d' ' -f1)" \
+  RECOVERY_ACTIVATION_FLOOR_SHA256="$(sha256sum "$prior_e/activation-floor.txt" | cut -d' ' -f1)"
+main_e=$E
+E="$scratch/recovery-e"; mkdir -p "$E"
+assert_active_catalog_version() { [[ $1 == "$FROM_VERSION" ]]; }
+cmd_migrate_native_tail_recovery_bind
+grep -Fxq 'activation_floor=2026-08-21T12:00:00.000Z' "$E/activation-floor.txt"
+grep -Fxq "source_set_sha256=$RECOVERY_SOURCE_SET_SHA256" "$E/native-tail-recovery-binding.txt"
+grep -Fxq "recovery_packet_sha256=$PACKET_SHA" "$E/native-tail-recovery-binding.txt"
+grep -Fq 'Index Cond:' "$E/native-tail-post-plan.txt"
+if ( E="$scratch/bad-recovery-e"; mkdir -p "$E"; RECOVERY_ACTIVATION_FLOOR_SHA256=ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff cmd_migrate_native_tail_recovery_bind ); then
+  echo 'recovery accepted a mismatched activation-floor hash' >&2; exit 1
+fi
+
+# Under an active v2 producer the native-v3 tail may only shrink. Account both
+# pre-apply and late convergence explicitly; never weaken the residual/CAS gate.
+assert_active_catalog_version() { [[ $1 == "$FROM_VERSION" ]]; }
+growth_spec='v3_valid_to_v2_valid=1,v3_clamped_to_v2_valid=0,v3_clamped_to_v2_invalid=0,v3_to_v2_invalid=0,gt_5m_invalidated=0,zero_to_5m_unclamped=0'
+if ( emit_native_tail_convergence post growth "$growth_spec" 'v3_valid_to_v2_valid=2,v3_clamped_to_v2_valid=0,v3_clamped_to_v2_invalid=0,v3_to_v2_invalid=0,gt_5m_invalidated=0,zero_to_5m_unclamped=0' 1 2 ); then
+  echo 'native-tail convergence accepted population growth' >&2; exit 1
+fi
+aux_spec='v3_valid_to_v2_valid=0,v3_clamped_to_v2_valid=0,v3_clamped_to_v2_invalid=1,v3_to_v2_invalid=0,gt_5m_invalidated=1,zero_to_5m_unclamped=0'
+( E="$scratch/aux-e"; mkdir -p "$E"; emit_native_tail_convergence post aux "$aux_spec" 'v3_valid_to_v2_valid=0,v3_clamped_to_v2_valid=0,v3_clamped_to_v2_invalid=0,v3_to_v2_invalid=0,gt_5m_invalidated=0,zero_to_5m_unclamped=0' 1 0; grep -Fxq 'gt_5m_invalidated_producer_converged=1' "$E/native-tail-post-convergence-aux.txt" )
+bad_receipt="$scratch/bad-convergence-e/native-tail-post-convergence-bad-cell.txt"
+if ( E="$(dirname "$bad_receipt")"; mkdir -p "$E"; emit_native_tail_convergence post bad-cell "$growth_spec" 'v3_valid_to_v2_valid=2,v3_clamped_to_v2_valid=0,v3_clamped_to_v2_invalid=0,v3_to_v2_invalid=0,gt_5m_invalidated=0,zero_to_5m_unclamped=0' 1 1 ); then
+  echo 'native-tail convergence accepted a growing outcome cell' >&2; exit 1
+fi
+[[ ! -e "$bad_receipt" ]]
+native_tail_preview() {
+  local out=$1 scanned valid
+  case "$out" in
+    native-tail-post-preview) scanned=3; valid=3;;
+    native-tail-post-preview-before-native-convergence) scanned=2; valid=2;;
+    native-tail-post-preview-after-native-convergence) scanned=0; valid=0;;
+    *) echo "unexpected native preview $out" >&2; return 2;;
+  esac
+  printf '{"preview":{"scanned":%s,"truncated":false,"counts":{"v3_valid_to_v2_valid":%s,"v3_clamped_to_v2_valid":0,"v3_clamped_to_v2_invalid":0,"v3_to_v2_invalid":0,"gt_5m_invalidated":0,"zero_to_5m_unclamped":0}}}\n' "$scanned" "$valid" >"$E/$out.json"
+  echo "$E/$out.json"
+}
+migration_apply_one() {
+  local target=$1 label=$2 prefix=$5
+  [[ $target == post && $label == native-convergence && $prefix == native ]]
+  printf '{"revalidation":{"updated":1,"skipped_cas":0,"complete":true,"counts":{"v3_valid_to_v2_valid":1,"v3_clamped_to_v2_valid":0,"v3_clamped_to_v2_invalid":0,"v3_to_v2_invalid":0,"gt_5m_invalidated":0,"zero_to_5m_unclamped":0}}}\n' >"$E/native-post-apply-$label.json"
+}
+cmd_migrate_native_tail_rollback native-convergence
+grep -Fq 'post updated_rows=1 producer_converged_rows=2 bound_rows=3 residual=0 skipped_cas=0' "$E/native-tail-readback.txt"
+[[ $(native_tail_remaining_rows post) == 0 ]]
+truncated_e="$scratch/truncated-native-e"; mkdir -p "$truncated_e"
+printf '%s\n' 'activation_floor=2026-08-21T12:00:00.000Z' >"$truncated_e/activation-floor.txt"
+printf '%s\n' 'Index Scan' >"$truncated_e/native-tail-post-plan.txt"
+set +e
+(
+  E=$truncated_e
+  native_tail_preview() {
+    local out=$1 truncated=false
+    [[ $out == native-tail-post-preview-before-truncated ]] && truncated=true
+    printf '{"preview":{"scanned":1,"truncated":%s,"counts":{"v3_valid_to_v2_valid":1,"v3_clamped_to_v2_valid":0,"v3_clamped_to_v2_invalid":0,"v3_to_v2_invalid":0,"gt_5m_invalidated":0,"zero_to_5m_unclamped":0}}}\n' "$truncated" >"$E/$out.json"
+    echo "$E/$out.json"
+  }
+  cmd_migrate_native_tail_rollback truncated
+)
+truncated_rc=$?; set -e
+[[ $truncated_rc == 2 ]]
+[[ ! -e "$truncated_e/native-tail-post-convergence-truncated.txt" ]]
+E=$main_e
 
 # Complete previews pass; truncated previews fail before outcome cells can authorize work.
 good="$scratch/good.json"

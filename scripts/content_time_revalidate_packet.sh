@@ -37,6 +37,9 @@
 #                        SHA256SUMS over every file (recursive), RESULT.txt last
 #   migrate-prereg | migrate-prepare | migrate-preflight | migrate-freeze
 #   migrate-normalize-overlap <label> [max_batches]  explicit continuation-only
+#   migrate-native-tail-recovery-bind  import a prior failed activation floor as
+#                        typed, hash-bound provenance into fresh evidence; regenerate
+#                        the bounded post-tail plan under the restored v2 catalog
 #   migrate-preview | migrate-apply <label>
 #   migrate-readback | migrate-rollback <dry-run|apply> | migrate-secret-scan
 #   migrate-finalize <start> <end>
@@ -578,10 +581,11 @@ assert_from_before_cutoff() { # <target> <cutoff>
   rows=$(psql_ro -t -c "SELECT count(*) FROM public.$table WHERE $predicate AND \"indexedAt\">='$since' AND \"indexedAt\">='$cutoff';")
   [[ "$rows" == 0 ]] || die "$target gained $rows in-horizon $FROM_VERSION semantic-delta rows at/after exclusive cutoff"
 }
-migration_scope_sql() { # <target>
-  local target=$1 table since
+migration_scope_sql() { # <target> [exclusive cutoff]
+  local target=$1 cutoff=${2:-} table since upper=""
   table=$(migration_target_table "$target"); since=$(migration_target_since "$target")
-  echo "SELECT 'from_in_horizon',count(*) FROM public.$table WHERE content_time_validator_version='$FROM_VERSION' AND \"indexedAt\">='$since' UNION ALL SELECT 'from_outside_horizon',count(*) FROM public.$table WHERE content_time_validator_version='$FROM_VERSION' AND \"indexedAt\"<'$since' UNION ALL SELECT 'from_total',count(*) FROM public.$table WHERE content_time_validator_version='$FROM_VERSION' UNION ALL SELECT 'to_in_horizon',count(*) FROM public.$table WHERE content_time_validator_version='$TO_VERSION' AND \"indexedAt\">='$since' ORDER BY 1"
+  [[ -z "$cutoff" ]] || upper=" AND \"indexedAt\"<'$cutoff'"
+  echo "SELECT 'from_in_horizon',count(*) FROM public.$table WHERE content_time_validator_version='$FROM_VERSION' AND \"indexedAt\">='$since'$upper UNION ALL SELECT 'to_in_horizon',count(*) FROM public.$table WHERE content_time_validator_version='$TO_VERSION' AND \"indexedAt\">='$since'$upper ORDER BY 1"
 }
 pgstat_table_read() { # wal_bytes|relation_bytes|dead|live|epoch
   psql_ro -t -c "SELECT (SELECT wal_bytes FROM pg_stat_wal), pg_total_relation_size('public.$1'), n_dead_tup, n_live_tup, extract(epoch FROM now())::bigint FROM pg_stat_user_tables WHERE relname='$1';"
@@ -730,7 +734,7 @@ cmd_migrate_freeze() {
   for target in $(migration_targets); do
     table=$(migration_target_table "$target"); since=$(migration_target_since "$target")
     cutoff=$(migration_cutoff_field "$(migration_cutoff_file "$target" "$attempt")" cutoff); f="$E/migrate-freeze-$target-preview-$attempt.json"
-    psql_ro -c "$(migration_scope_sql "$target")" | emit "migrate-freeze-$target-scope-$attempt.tsv" || die "$target scope snapshot failed"
+    psql_ro -c "$(migration_scope_sql "$target" "$cutoff")" | emit "migrate-freeze-$target-scope-$attempt.tsv" || die "$target scope snapshot failed"
     [[ -s "$E/migrate-freeze-$target-scope-$attempt.tsv" ]] || die "$target scope snapshot is empty"
   done
   for target in $(migration_targets); do
@@ -890,25 +894,49 @@ native_tail_preview() { # <artifact> <target>
   echo "$E/$out.json"
 }
 native_tail_spec() { migration_cells "$E/native-tail-$1-preview.json" "$TO_VERSION" "$FROM_VERSION"; }
+native_tail_converged_value() { # <target> <field>
+  local target=$1 field=$2 f value sum=0
+  for f in "$E"/native-tail-"$target"-convergence-*.txt; do
+    [[ -e "$f" ]] || continue
+    value=$(awk -F= -v k="$field" '$1==k{print $2}' "$f")
+    [[ "$value" =~ ^[0-9]+$ ]] || die "$target native-tail convergence receipt has malformed $field"
+    sum=$((sum+value))
+  done
+  echo "$sum"
+}
 native_tail_remaining_spec() {
-  local target=$1 key total applied cells=""
+  local target=$1 key total applied converged cells=""
   for key in $(migration_outcomes "$TO_VERSION" "$FROM_VERSION"); do
     total=$(prereg_spec_value "$(native_tail_spec "$target")" "$key"); applied=$(migration_receipt_value native "$target" "revalidation.counts.$key")
-    (( applied <= total )) || die "$target native-tail receipts exceed bound $key"
-    cells+="$key=$((total-applied)),"
+    converged=$(native_tail_converged_value "$target" "${key}_producer_converged")
+    (( applied + converged <= total )) || die "$target native-tail receipts exceed bound $key"
+    cells+="$key=$((total-applied-converged)),"
   done
   echo "${cells%,}"
 }
 native_tail_remaining_rows() {
-  local target=$1 total applied
+  local target=$1 total applied converged
   total=$(awk -F= -v k="${target}_rows" '$1==k{print $2}' "$E/native-tail-stable.txt"); applied=$(migration_receipt_value native "$target" revalidation.updated)
+  converged=$(native_tail_converged_value "$target" producer_converged_rows)
   [[ "$total" =~ ^[0-9]+$ ]] || die "$target native-tail denominator missing"
-  (( applied <= total )) || die "$target native-tail receipts exceed bound denominator"
-  echo $((total-applied))
+  (( applied + converged <= total )) || die "$target native-tail receipts exceed bound denominator"
+  echo $((total-applied-converged))
 }
-cmd_migrate_native_tail_plan() {
-  local floor target table order
-  validate_migration_inputs; assert_tree; assert_active_catalog_version "$TO_VERSION"; floor=$(activation_floor)
+emit_native_tail_convergence() { # <target> <label> <expected spec> <observed spec> <expected rows> <observed rows>
+  local target=$1 label=$2 expected_spec=$3 observed_spec=$4 expected_rows=$5 observed_rows=$6 key expected observed delta sum=0 auxiliary=0 row_delta receipt
+  (( observed_rows <= expected_rows )) || die "$target native-tail population increased after v2 drain"
+  row_delta=$((expected_rows-observed_rows)); receipt="producer_converged_rows=$row_delta"$'\n'
+  for key in $(migration_outcomes "$TO_VERSION" "$FROM_VERSION"); do
+    expected=$(prereg_spec_value "$expected_spec" "$key"); observed=$(prereg_spec_value "$observed_spec" "$key")
+    (( observed <= expected )) || die "$target native-tail $key increased after v2 drain"
+    delta=$((expected-observed)); sum=$((sum+delta)); receipt+="${key}_producer_converged=$delta"$'\n'
+    [[ $key == gt_5m_invalidated || $key == zero_to_5m_unclamped ]] && auxiliary=$((auxiliary+delta))
+  done
+  (( sum - auxiliary == row_delta )) || die "$target native-tail convergence primary cells do not sum to row delta"
+  printf '%s' "$receipt" | emit "native-tail-$target-convergence-$label.txt"
+}
+emit_native_tail_plans() {
+  local floor=$1 target table order
   for target in $(native_tail_targets); do
     table=$(migration_target_table "$target"); [[ $target == post ]] && order='author,uri' || order='uri'
     psql_ro -c "EXPLAIN SELECT uri FROM public.$table WHERE \"indexedAt\">='$floor' AND content_time_validator_version='$TO_VERSION' ORDER BY $order LIMIT 500;" | emit "native-tail-$target-plan.txt"
@@ -916,8 +944,35 @@ cmd_migrate_native_tail_plan() {
     grep -F 'Index Cond:' "$E/native-tail-$target-plan.txt" | grep -Fq 'indexedAt' || die "$target native-tail plan does not index-bound activation_floor"
   done
 }
+cmd_migrate_native_tail_plan() {
+  local floor
+  validate_migration_inputs; assert_tree; assert_active_catalog_version "$TO_VERSION"; floor=$(activation_floor)
+  emit_native_tail_plans "$floor"
+}
+cmd_migrate_native_tail_recovery_bind() {
+  local source_e source_set floor_file floor source_sha packet_sha
+  : "${RECOVERY_SOURCE_E:?RECOVERY_SOURCE_E is required}"
+  : "${RECOVERY_SOURCE_SET_SHA256:?RECOVERY_SOURCE_SET_SHA256 is required}"
+  : "${RECOVERY_ACTIVATION_FLOOR_SHA256:?RECOVERY_ACTIVATION_FLOOR_SHA256 is required}"
+  [[ "$RECOVERY_SOURCE_SET_SHA256" =~ ^[0-9a-f]{64}$ && "$RECOVERY_ACTIVATION_FLOOR_SHA256" =~ ^[0-9a-f]{64}$ ]] || die 'recovery source hashes must be 64 lowercase hex'
+  validate_migration_inputs; assert_tree; assert_active_catalog_version "$FROM_VERSION"
+  [[ "$RECOVERY_SOURCE_E" == /* && -d "$RECOVERY_SOURCE_E" ]] || die 'recovery source evidence root is not an absolute directory'
+  source_e=$(cd -- "$RECOVERY_SOURCE_E" && pwd -P)
+  source_set="$source_e/migrate-source-set.txt"; floor_file="$source_e/activation-floor.txt"
+  [[ -f "$source_set" && ! -L "$source_set" && -f "$floor_file" && ! -L "$floor_file" ]] || die 'recovery source facts are missing or symlinked'
+  [[ $(sha256sum "$source_set" | cut -d' ' -f1) == "$RECOVERY_SOURCE_SET_SHA256" ]] || die 'recovery source-set hash differs'
+  [[ $(sha256sum "$floor_file" | cut -d' ' -f1) == "$RECOVERY_ACTIVATION_FLOOR_SHA256" ]] || die 'recovery activation-floor hash differs'
+  grep -Fxq "migration_transition=$FROM_VERSION->$TO_VERSION" "$source_set" || die 'recovery source transition differs'
+  floor=$(awk -F= '$1=="activation_floor"{print $2}' "$floor_file")
+  [[ "$floor" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{3}Z$ ]] || die 'recovery activation floor is malformed'
+  source_sha=$(awk -F= '$1=="source_sha"{print $2}' "$source_set"); packet_sha=$(awk -F= '$1=="packet_sha256"{print $2}' "$source_set")
+  [[ "$source_sha" =~ ^[0-9a-f]{40}$ && "$packet_sha" =~ ^[0-9a-f]{64}$ ]] || die 'recovery source identity is malformed'
+  printf 'activation_floor=%s\n' "$floor" | emit activation-floor.txt
+  { echo "bound_at=$(ts)"; echo "source_evidence_root=$source_e"; echo "source_set_sha256=$RECOVERY_SOURCE_SET_SHA256"; echo "activation_floor_sha256=$RECOVERY_ACTIVATION_FLOOR_SHA256"; echo "source_sha=$source_sha"; echo "source_packet_sha256=$packet_sha"; echo "recovery_sha=$EXPECTED_SHA"; echo "recovery_packet_sha256=$PACKET_SHA"; echo "catalog_version=$FROM_VERSION"; } | emit native-tail-recovery-binding.txt
+  emit_native_tail_plans "$floor"
+}
 cmd_migrate_native_tail_rollback() { # <unique label> [max-batches]
-  local label=${1:?label} maxb=${2:-} floor target f rows updated skipped key expected actual
+  local label=${1:?label} maxb=${2:-} floor target f rows observed_rows updated converged skipped key expected actual expected_spec observed_spec zero_spec
   [[ "$label" =~ ^[a-zA-Z0-9][a-zA-Z0-9._-]*$ ]] || die 'native-tail label is unsafe'
   validate_migration_inputs; assert_tree; assert_active_catalog_version "$FROM_VERSION"; floor=$(activation_floor)
   if [[ ! -e "$E/native-tail-stable.txt" ]]; then
@@ -933,9 +988,14 @@ cmd_migrate_native_tail_rollback() { # <unique label> [max-batches]
   grep -Fxq "drain_seconds=$MIGRATION_DRAIN_SECONDS" "$E/native-tail-stable.txt" || die 'native-tail drain binding differs'
   for target in $(native_tail_targets); do
     [[ $(awk -F= -v k="${target}_preview_sha256" '$1==k{print $2}' "$E/native-tail-stable.txt") == "$(sha256sum "$E/native-tail-$target-preview.json" | cut -d' ' -f1)" ]] || die "$target native-tail preview hash differs"
-    rows=$(native_tail_remaining_rows "$target")
+    rows=$(native_tail_remaining_rows "$target"); expected_spec=$(native_tail_remaining_spec "$target")
     f=$(native_tail_preview "native-tail-$target-preview-before-$label" "$target")
+    observed_rows=$(jsonq "$f" preview.scanned); observed_spec=$(migration_cells "$f" "$TO_VERSION" "$FROM_VERSION")
+    gate_migration_preview "$f" "$observed_spec" "$target native-tail observed population" "$TO_VERSION" "$FROM_VERSION"
+    assert_active_catalog_version "$FROM_VERSION"
+    emit_native_tail_convergence "$target" "$label" "$expected_spec" "$observed_spec" "$rows" "$observed_rows"
     gate_migration_preview "$f" "$(native_tail_remaining_spec "$target")" "$target native-tail remaining" "$TO_VERSION" "$FROM_VERSION"
+    rows=$(native_tail_remaining_rows "$target")
     [[ $(jsonq "$f" preview.scanned) == "$rows" ]] || die "$target native-tail population differs from bound denominator minus receipts"
     if (( rows > 0 )); then
       MIGRATION_NATIVE_V3_TAIL=1 MIGRATION_SINCE_OVERRIDE="$floor" migration_apply_one "$target" "$label" "$TO_VERSION" "$FROM_VERSION" native "$maxb"
@@ -945,11 +1005,17 @@ cmd_migrate_native_tail_rollback() { # <unique label> [max-batches]
   for target in $(native_tail_targets); do
     f=$(native_tail_preview "native-tail-$target-preview-after-$label" "$target")
     [[ $(jsonq "$f" preview.truncated) == false && $(jsonq "$f" preview.scanned) == 0 ]] || die "$target native-tail rollback is incomplete"
-    rows=$(awk -F= -v k="${target}_rows" '$1==k{print $2}' "$E/native-tail-stable.txt"); updated=$(migration_receipt_value native "$target" revalidation.updated); [[ "$updated" == "$rows" ]] || die "$target native-tail updated=$updated but bound=$rows"
+    rows=$(native_tail_remaining_rows "$target"); expected_spec=$(native_tail_remaining_spec "$target")
+    if (( rows > 0 )); then
+      zero_spec=""; for key in $(migration_outcomes "$TO_VERSION" "$FROM_VERSION"); do zero_spec+="$key=0,"; done; zero_spec=${zero_spec%,}
+      assert_active_catalog_version "$FROM_VERSION"
+      emit_native_tail_convergence "$target" "$label-postapply" "$expected_spec" "$zero_spec" "$rows" 0
+    fi
+    rows=$(awk -F= -v k="${target}_rows" '$1==k{print $2}' "$E/native-tail-stable.txt"); updated=$(migration_receipt_value native "$target" revalidation.updated); converged=$(native_tail_converged_value "$target" producer_converged_rows); [[ $((updated+converged)) == "$rows" ]] || die "$target native-tail updated=$updated + producer_converged=$converged but bound=$rows"
     skipped=$(migration_receipt_value native "$target" revalidation.skipped_cas); [[ "$skipped" == 0 ]] || die "$target native-tail skipped_cas=$skipped"
-    for key in $(migration_outcomes "$TO_VERSION" "$FROM_VERSION"); do expected=$(prereg_spec_value "$(native_tail_spec "$target")" "$key"); actual=$(migration_receipt_value native "$target" "revalidation.counts.$key"); [[ "$actual" == "$expected" ]] || die "$target native-tail $key=$actual but bound=$expected"; done
+    for key in $(migration_outcomes "$TO_VERSION" "$FROM_VERSION"); do expected=$(prereg_spec_value "$(native_tail_spec "$target")" "$key"); actual=$(migration_receipt_value native "$target" "revalidation.counts.$key"); converged=$(native_tail_converged_value "$target" "${key}_producer_converged"); [[ $((actual+converged)) == "$expected" ]] || die "$target native-tail $key updated=$actual + producer_converged=$converged but bound=$expected"; done
   done
-  { echo "activation_floor=$floor"; for target in $(native_tail_targets); do echo "$target restored_rows=$(awk -F= -v k="${target}_rows" '$1==k{print $2}' "$E/native-tail-stable.txt") residual=0 skipped_cas=0"; done; echo 'historical_v3_before_floor_out_of_scope=true'; } | emit native-tail-readback.txt
+  { echo "activation_floor=$floor"; for target in $(native_tail_targets); do echo "$target updated_rows=$(migration_receipt_value native "$target" revalidation.updated) producer_converged_rows=$(native_tail_converged_value "$target" producer_converged_rows) bound_rows=$(awk -F= -v k="${target}_rows" '$1==k{print $2}' "$E/native-tail-stable.txt") residual=0 skipped_cas=0"; done; echo 'historical_v3_before_floor_out_of_scope=true'; } | emit native-tail-readback.txt
 }
 cmd_migrate_apply() {
   local label=${1:?label} maxb=${2:-} target f rows spec cutoff attempt=1
@@ -978,7 +1044,7 @@ cmd_migrate_apply() {
   done
 }
 cmd_migrate_readback() {
-  local target table since f rows updated skipped before_out after_out before_total after_total attempt=1 key expected actual
+  local target table since cutoff f rows updated skipped before_in after_in attempt=1 key expected actual
   while [[ -e "$E/migrate-post-preview-after-$attempt.json" || -e "$E/migrate-post-preview-after-$attempt.err" ]]; do attempt=$((attempt+1)); done
   for target in $(migration_targets); do
     table=$(migration_target_table "$target"); since=$(migration_target_since "$target")
@@ -995,14 +1061,14 @@ cmd_migrate_readback() {
       actual=$(for f in "$E"/migrate-$target-apply-*.json; do jsonq "$f" "revalidation.counts.$key"; done | awk '{s+=$1}END{print s+0}')
       [[ "$actual" == "$expected" ]] || die "$target realized $key=$actual but preregistered=$expected"
     done
-    before_out=$(awk -F'|' '$1=="from_outside_horizon"{print $2}' "$(migration_scope_file "$target")"); before_total=$(awk -F'|' '$1=="from_total"{print $2}' "$(migration_scope_file "$target")")
-    after_out=$(psql_ro -t -c "SELECT count(*) FROM public.$table WHERE content_time_validator_version='$FROM_VERSION' AND \"indexedAt\"<'$since';"); after_total=$(psql_ro -t -c "SELECT count(*) FROM public.$table WHERE content_time_validator_version='$FROM_VERSION';")
-    [[ "$before_out" == "$after_out" && $((before_total-after_total)) == "$rows" ]] || die "$target migration escaped the in-horizon snapshot"
+    cutoff=$(migration_cutoff_value "$target"); before_in=$(awk -F'|' '$1=="from_in_horizon"{print $2}' "$(migration_scope_file "$target")")
+    after_in=$(psql_ro -t -c "SELECT count(*) FROM public.$table WHERE content_time_validator_version='$FROM_VERSION' AND \"indexedAt\">='$since' AND \"indexedAt\"<'$cutoff';")
+    [[ $((before_in-after_in)) == "$rows" ]] || die "$target migration changed a row outside the exact in-horizon snapshot"
   done
   { echo "transition=$FROM_VERSION->$TO_VERSION"; for target in $(migration_targets); do echo "$target rows=$(awk -F= -v k="${target}_rows" '$1==k{print $2}' "$E/migrate-stable-population.txt")"; done; echo "ir_semantic_changed=$(awk -F= '$1=="ir_semantic_changed"{print $2}' "$E/migrate-stable-population.txt")"; echo "ir_restored_valid=$(awk -F= '$1=="ir_restored_valid"{print $2}' "$E/migrate-stable-population.txt")"; echo "ir_total_denominator=$(awk -F= '$1=="ir_total_denominator"{print $2}' "$E/migrate-stable-population.txt")"; } | emit "migrate-readback-$attempt.txt"
 }
 cmd_migrate_rollback() { # dry-run | apply <label> [max-batches]
-  local mode=${1:?dry-run|apply} label=${2:-rollback} maxb=${3:-} target f spec rows updated skipped key expected actual before_out after_out incomplete=0 attempt=1
+  local mode=${1:?dry-run|apply} label=${2:-rollback} maxb=${3:-} target f spec rows updated skipped key expected actual cutoff before_in after_in incomplete=0 attempt=1
   assert_migration_transition
   case "$mode" in
     dry-run)
@@ -1041,9 +1107,9 @@ cmd_migrate_rollback() { # dry-run | apply <label> [max-batches]
         f=$(migration_preview_one "rollback-$target-restored-$attempt" "$target" "$FROM_VERSION" "$TO_VERSION")
         gate_migration_preview "$f" "$(migration_prereg_spec "$target")" "$target restored cohort"
         [[ "$(jsonq "$f" preview.scanned)" == "$rows" ]] || die "$target restored cohort denominator differs"
-        before_out=$(awk -F'|' '$1=="from_outside_horizon"{print $2}' "$(migration_scope_file "$target")")
-        after_out=$(psql_ro -t -c "SELECT count(*) FROM public.$(migration_target_table "$target") WHERE content_time_validator_version='$FROM_VERSION' AND \"indexedAt\"<'$(migration_target_since "$target")';")
-        [[ "$before_out" == "$after_out" ]] || die "$target rollback changed outside-horizon rows"
+        cutoff=$(migration_cutoff_value "$target"); before_in=$(awk -F'|' '$1=="from_in_horizon"{print $2}' "$(migration_scope_file "$target")")
+        after_in=$(psql_ro -t -c "SELECT count(*) FROM public.$(migration_target_table "$target") WHERE content_time_validator_version='$FROM_VERSION' AND \"indexedAt\">='$(migration_target_since "$target")' AND \"indexedAt\"<'$cutoff';")
+        [[ "$before_in" == "$after_in" ]] || die "$target rollback did not restore the exact in-horizon snapshot"
         { echo "restored_rows=$rows"; echo "bounded_to_residual=0"; echo "skipped_cas=0"; } | emit "rollback-$target-diff-$attempt.txt"
       done;;
     *) die 'migrate-rollback mode must be dry-run or apply';;
@@ -1077,6 +1143,7 @@ case "${1:-}" in
   migrate-stable-check) cmd_migrate_stable_check;;
   migrate-normalize-overlap) cmd_migrate_normalize_overlap "${2:?label}" "${3:-}";;
   migrate-native-tail-plan) cmd_migrate_native_tail_plan;;
+  migrate-native-tail-recovery-bind) cmd_migrate_native_tail_recovery_bind;;
   migrate-native-tail-rollback) cmd_migrate_native_tail_rollback "${2:?label}" "${3:-}";;
   migrate-preview) cmd_migrate_preview;;
   migrate-apply) cmd_migrate_apply "${2:?label}" "${3:-}";;
@@ -1084,5 +1151,5 @@ case "${1:-}" in
   migrate-rollback) cmd_migrate_rollback "${2:?dry-run|apply}" "${3:-}" "${4:-}";;
   migrate-secret-scan) cmd_secret_scan;;
   migrate-finalize) cmd_migrate_finalize "${2:-}" "${3:-}";;
-  *) echo "usage: $0 prereg|preflight|control|preview <group>|apply <group> <label> [max_batches]|readback|restore <group>|secret-scan|finalize <start> <end>|migrate-prereg|migrate-prepare|migrate-preflight|migrate-freeze|migrate-stable-check|migrate-normalize-overlap <label> [max_batches]|migrate-native-tail-rollback <label> [max_batches]|migrate-preview|migrate-apply <label> [max_batches]|migrate-readback|migrate-rollback <dry-run|apply> [label] [max_batches]|migrate-secret-scan|migrate-finalize <start> <end>" >&2; exit 2;;
+  *) echo "usage: $0 prereg|preflight|control|preview <group>|apply <group> <label> [max_batches]|readback|restore <group>|secret-scan|finalize <start> <end>|migrate-prereg|migrate-prepare|migrate-preflight|migrate-freeze|migrate-stable-check|migrate-normalize-overlap <label> [max_batches]|migrate-native-tail-recovery-bind|migrate-native-tail-rollback <label> [max_batches]|migrate-preview|migrate-apply <label> [max_batches]|migrate-readback|migrate-rollback <dry-run|apply> [label] [max_batches]|migrate-secret-scan|migrate-finalize <start> <end>" >&2; exit 2;;
 esac
