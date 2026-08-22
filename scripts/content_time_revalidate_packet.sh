@@ -194,7 +194,7 @@ run_tool() {  # run_tool <outname> <tool args...>  -> $E/<outname>.json + .err ;
     # explicit entrypoint; DSN composed in-container by the committed helper (no shell expansion of secrets)
     "${DOCKER[@]}" run --rm --network "$NETWORK" --env-file "$ENV_FILE" \
       -v "$TREE:/src:ro" -v "$E:/evidence" -w /src --entrypoint sh "$IMG" \
-      -c 'export FEEDGEN_POSTGRES_URL="$(node /src/scripts/compose_feedgen_dsn.js)" || exit 97; exec node /src/dist/tools/backfill-publisher-posts.js "$@"' sh "$@" \
+      -c 'export NODE_PATH=/app/node_modules; export FEEDGEN_POSTGRES_URL="$(node /src/scripts/compose_feedgen_dsn.js)" || exit 97; exec node /src/dist/tools/backfill-publisher-posts.js "$@"' sh "$@" \
       >"$so" 2>"$se" || rc=$?
   fi
   emit "$out.json" <"$so"; emit "$out.err" <"$se"; rm -f "$so" "$se"

@@ -3,6 +3,7 @@ set -euo pipefail
 
 packet="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/content_time_revalidate_packet.sh"
 bash -n "$packet"
+grep -Fq 'export NODE_PATH=/app/node_modules' "$packet"
 
 scratch=$(mktemp -d)
 trap 'rm -rf "$scratch"' EXIT
